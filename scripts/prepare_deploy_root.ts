@@ -32,7 +32,6 @@ export async function prepareDeployRoot(options: PrepareOptions = {}): Promise<s
   await copyFileIfExists(joinPath(repoRoot, "deno.lock"), joinPath(root, "deno.lock"), false);
   await copyDirectory(joinPath(repoRoot, "public"), joinPath(root, "public"));
   await copyDirectory(joinPath(repoRoot, "src"), joinPath(root, "src"));
-  await copyDirectory(joinPath(repoRoot, "scripts"), joinPath(root, "scripts"));
 
   await Deno.writeTextFile(
     joinPath(root, "deploy-metadata.json"),

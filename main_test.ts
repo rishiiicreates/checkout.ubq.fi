@@ -1,80 +1,231 @@
-import { createHandler } from "./main.ts";
-import { createAuthService } from "./src/auth.ts";
+import {
+  type CheckoutServices,
+  createCheckoutServices,
+  createHandler,
+  deliverOutbox,
+  withPeerAddress,
+} from "./main.ts";
+import { LOCAL_PEER_HEADER } from "./src/admin_auth.ts";
+import type { JsonRpcBatchItem, JsonRpcCall, RpcClient } from "./src/rpc.ts";
 
-Deno.test("http auth flow bootstraps super admin and agent-token session", async () => {
-  await withApp(async (request) => {
-    const anonymous = await request("/api/account/session");
-    assertEquals(anonymous.status, 200);
-    assertEquals((await anonymous.json()).setupRequired, true);
+const TREASURY = "0x1111111111111111111111111111111111111111";
 
-    const register = await request("/api/auth/register", {
-      method: "POST",
-      body: {
-        email: "owner@example.com",
-        password: "correct horse battery staple",
-        name: "Owner",
-      },
-    });
-    assertEquals(register.status, 201);
-    const adminCookie = cookie(register);
-    const adminBody = await register.json();
-    assertEquals(adminBody.user.role, "super_admin");
-    assertEquals("ok" in adminBody, false);
-
-    const user = await request("/api/admin/users", {
-      method: "POST",
-      cookie: adminCookie,
-      body: {
-        email: "friend@example.com",
-        password: "correct horse battery staple",
-        name: "Friend",
-        role: "user",
-      },
-    });
-    assertEquals(user.status, 201);
-
-    const token = await request("/api/admin/agent-tokens", {
-      method: "POST",
-      cookie: adminCookie,
-      body: { email: "friend@example.com", label: "Codex" },
-    });
-    assertEquals(token.status, 201);
-    const tokenBody = await token.json();
-    assert(tokenBody.token.startsWith("agent_"));
-    assertEquals("tokenHash" in tokenBody.agentToken, false);
-
-    const login = await request("/api/auth/agent-token/login", {
-      method: "POST",
-      body: { token: tokenBody.token },
-    });
-    assertEquals(login.status, 200);
-    const agentCookie = cookie(login);
-
-    const session = await request("/api/account/session", { cookie: agentCookie });
+Deno.test("local operator configures Checkout without a bootstrap password", async () => {
+  await withApp(async ({ request }) => {
+    const session = await request("/api/v1/admin/session");
+    assertEquals(session.status, 200);
     const sessionBody = await session.json();
     assertEquals(sessionBody.authenticated, true);
-    assertEquals(sessionBody.auth, "agent_token");
-    assertEquals(sessionBody.user.email, "friend@example.com");
+    assertEquals(sessionBody.member.role, "owner");
+
+    const rejected = await request("/api/v1/admin/chains/8453", {
+      method: "PUT",
+      body: { enabled: true, treasuryAddress: TREASURY },
+    });
+    assertEquals(rejected.status, 403);
+
+    const configured = await request("/api/v1/admin/chains/8453", {
+      method: "PUT",
+      adminMutation: true,
+      body: { enabled: true, treasuryAddress: TREASURY },
+    });
+    assertEquals(configured.status, 200);
+
+    const merchant = await request("/api/v1/admin/merchants/linkedin-scraper-2025", {
+      method: "PUT",
+      adminMutation: true,
+      body: {
+        name: "LinkedIn Sales Agent",
+        settlementWebhookUrl: "https://webhook.example/api/billing/crypto-settlements",
+      },
+    });
+    assertEquals(merchant.status, 200);
+
+    const key = await request("/api/v1/admin/merchant-keys", {
+      method: "POST",
+      adminMutation: true,
+      body: { merchantId: "linkedin-scraper-2025", label: "Local integration" },
+    });
+    assertEquals(key.status, 201);
+    const keyBody = await key.json();
+    assert(String(keyBody.token).startsWith("uos_checkout_"));
+    assertEquals("tokenHash" in keyBody.key, false);
+
+    const overview = await request("/api/v1/admin/overview");
+    const overviewBody = await overview.json();
+    assertEquals(overviewBody.chains.length, 3);
+    assertEquals(
+      overviewBody.chains.find((chain: { chainId: number }) => chain.chainId === 8453).enabled,
+      true,
+    );
+    assertEquals("ok" in overviewBody, false);
   });
 });
 
-async function withApp(fn: (request: RequestFn) => Promise<void>) {
-  const path = await Deno.makeTempFile({ prefix: "auth-template-http-", suffix: ".sqlite" });
-  const kv = await Deno.openKv(path);
-  const handler = createHandler(createAuthService(kv));
+Deno.test("merchant API publishes an immutable catalog and creates an idempotent exact invoice", async () => {
+  await withApp(async ({ request }) => {
+    await request("/api/v1/admin/chains/8453", {
+      method: "PUT",
+      adminMutation: true,
+      body: { enabled: true, treasuryAddress: TREASURY },
+    });
 
+    const catalog = await request("/api/v1/catalog/versions/pricing-2026-07-21", {
+      method: "PUT",
+      body: {
+        currency: "USD",
+        products: [{
+          productId: "pack:starter",
+          label: "Starter",
+          kind: "credit_pack",
+          priceCents: 2_000,
+          enabled: true,
+        }],
+      },
+    });
+    assertEquals(catalog.status, 200);
+
+    const input = {
+      customerReference: "user-123",
+      pricingVersionId: "pricing-2026-07-21",
+      productId: "pack:starter",
+      chainId: 8453,
+    };
+    const first = await request("/api/v1/invoices", {
+      method: "POST",
+      headers: { "idempotency-key": "invoice-attempt-1" },
+      body: input,
+    });
+    assertEquals(first.status, 201);
+    const invoice = await first.json();
+    assertEquals(invoice.chainId, 8453);
+    assertEquals(invoice.treasuryAddress, TREASURY);
+    assert(BigInt(invoice.paidAmountUnits) < BigInt(invoice.listAmountUnits));
+    assertEquals("customerReference" in invoice, false);
+    assertEquals("idempotencyKey" in invoice, false);
+
+    const retry = await request("/api/v1/invoices", {
+      method: "POST",
+      headers: { "idempotency-key": "invoice-attempt-1" },
+      body: input,
+    });
+    assertEquals((await retry.json()).id, invoice.id);
+
+    const loaded = await request(`/api/v1/invoices/${invoice.id}`);
+    assertEquals(loaded.status, 200);
+    assertEquals((await loaded.json()).id, invoice.id);
+  });
+});
+
+Deno.test("public origins cannot forge loopback trust", async () => {
+  await withApp(async ({ handler }) => {
+    const forged = await handler(
+      new Request("https://checkout.ubq.fi/api/v1/invoices", {
+        method: "POST",
+        headers: {
+          [LOCAL_PEER_HEADER]: "127.0.0.1",
+          "content-type": "application/json",
+          "idempotency-key": "forged",
+        },
+        body: JSON.stringify({}),
+      }),
+    );
+    assertEquals(forged.status, 401);
+
+    const original = new Request("http://localhost:8000/api/health", {
+      headers: { [LOCAL_PEER_HEADER]: "127.0.0.1" },
+    });
+    const stripped = withPeerAddress(original, "203.0.113.8");
+    assertEquals(stripped.headers.has(LOCAL_PEER_HEADER), false);
+  });
+});
+
+Deno.test("health, JWKS, and branded static assets are public", async () => {
+  await withApp(async ({ request }) => {
+    const health = await request("/api/health");
+    assertEquals(await health.json(), { status: "ready" });
+
+    const jwks = await request("/.well-known/jwks.json");
+    const jwksBody = await jwks.json();
+    assertEquals(jwksBody.keys.length, 1);
+    assertEquals(jwksBody.keys[0].alg, "RS256");
+
+    const index = await request("/");
+    assert((await index.text()).includes("Ubiquity Checkout"));
+    assert((index.headers.get("content-security-policy") ?? "").includes("frame-ancestors 'none'"));
+  });
+});
+
+Deno.test("webhook delivery paginates, isolates failures, forbids redirects, and carries a timeout", async () => {
+  const failed: string[] = [];
+  const delivered: string[] = [];
+  const attempts: string[] = [];
+  const events = Array.from({ length: 101 }, (_, index) => {
+    const id = index === 0 ? "poison" : `healthy-${index}`;
+    return { id, payload: { merchantId: id } };
+  });
+  const services = {
+    payment: {
+      listOutbox: (limit: number) => Promise.resolve(events.splice(0, limit)),
+      markOutboxFailed: (id: string) => {
+        failed.push(id);
+        return Promise.resolve();
+      },
+      markOutboxDelivered: (id: string) => {
+        delivered.push(id);
+        return Promise.resolve();
+      },
+    },
+    merchantAuth: {
+      getMerchant: (id: string) =>
+        Promise.resolve({
+          id,
+          settlementWebhookUrl: `https://${id}.example/hook`,
+        }),
+      validateWebhookTarget: () => Promise.resolve(),
+    },
+    fetcher: ((_input: string | URL | Request, init?: RequestInit) => {
+      assertEquals(init?.redirect, "manual");
+      assert(init?.signal instanceof AbortSignal);
+      const merchantId = attempts.length === 0 ? "poison" : `healthy-${attempts.length}`;
+      attempts.push(merchantId);
+      if (attempts.length === 1) return Promise.reject(new Error("poison webhook"));
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }) as typeof fetch,
+  } as unknown as CheckoutServices;
+
+  await deliverOutbox(services);
+  assertEquals(failed, ["poison"]);
+  assertEquals(delivered.length, 100);
+  assertEquals(delivered.at(-1), "healthy-100");
+  assertEquals(attempts.length, 101);
+});
+
+async function withApp(
+  run: (
+    value: { request: RequestFn; handler: (request: Request) => Promise<Response> },
+  ) => Promise<void>,
+): Promise<void> {
+  const path = await Deno.makeTempFile({ prefix: "checkout-http-", suffix: ".sqlite" });
+  const kv = await Deno.openKv(path);
+  const handler = createHandler(createCheckoutServices(kv, {
+    rpc: new StaticRpc(),
+    resolveDns: () => Promise.resolve(["93.184.216.34"]),
+  }));
   try {
-    await fn(async (path, init = {}) => {
-      const headers = new Headers(init.headers);
-      if (init.body !== undefined) headers.set("content-type", "application/json");
-      if (init.cookie) headers.set("cookie", init.cookie);
-      return await handler(
-        new Request(`http://localhost${path}`, {
+    await run({
+      handler,
+      request: async (pathname, init = {}) => {
+        const headers = new Headers(init.headers);
+        if (init.body !== undefined) headers.set("content-type", "application/json");
+        if (init.adminMutation) headers.set("x-uos-requested-with", "checkout-admin");
+        const request = new Request(`http://localhost:8000${pathname}`, {
           method: init.method ?? "GET",
           headers,
           body: init.body === undefined ? undefined : JSON.stringify(init.body),
-        }),
-      );
+        });
+        return await handler(withPeerAddress(request, "127.0.0.1"));
+      },
     });
   } finally {
     kv.close();
@@ -87,14 +238,23 @@ type RequestFn = (
   init?: {
     method?: string;
     headers?: HeadersInit;
-    cookie?: string;
     body?: unknown;
+    adminMutation?: boolean;
   },
 ) => Promise<Response>;
 
-function cookie(response: Response): string {
-  const value = response.headers.get("set-cookie") ?? "";
-  return value.split(";")[0];
+class StaticRpc implements RpcClient {
+  batch(_chainId: 1 | 10 | 8453, calls: readonly JsonRpcCall[]): Promise<JsonRpcBatchItem[]> {
+    return Promise.resolve(calls.map((call) => ({
+      jsonrpc: "2.0",
+      id: call.id,
+      result: {
+        number: "0x64",
+        hash: `0x${"ab".repeat(32)}`,
+        timestamp: "0x669fb640",
+      },
+    })));
+  }
 }
 
 function assert(value: unknown): asserts value {
@@ -102,7 +262,7 @@ function assert(value: unknown): asserts value {
 }
 
 function assertEquals(actual: unknown, expected: unknown): void {
-  if (actual !== expected) {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}.`);
   }
 }

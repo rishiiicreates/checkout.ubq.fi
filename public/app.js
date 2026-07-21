@@ -1,149 +1,214 @@
 const state = {
-  mode: "register",
   session: null,
+  overview: null,
 };
 
-const statusEl = document.querySelector("[data-status]");
-const authPanel = document.querySelector('[data-panel="auth"]');
-const accountPanel = document.querySelector('[data-panel="account"]');
-const adminPanel = document.querySelector('[data-panel="admin"]');
-const authForm = document.querySelector("[data-auth-form]");
-const agentTokenForm = document.querySelector("[data-agent-token-form]");
-const tokenOutput = document.querySelector("[data-agent-token-output]");
-
-document.querySelectorAll("[data-mode]").forEach((button) => {
-  button.addEventListener("click", () => setMode(button.dataset.mode));
-});
-
-authForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const data = Object.fromEntries(new FormData(authForm).entries());
-  const path = state.mode === "login" ? "/api/auth/login" : "/api/auth/register";
-  const response = await postJson(path, data);
-  if (!response.ok) {
-    return setStatus(await errorText(response), "error");
-  }
-  await refreshSession();
-});
+const signInPanel = document.querySelector('[data-panel="signin"]');
+const consolePanel = document.querySelector('[data-panel="console"]');
+const sessionSummary = document.querySelector("[data-session-summary]");
+const statusElement = document.querySelector("[data-status]");
 
 document.querySelector("[data-logout]")?.addEventListener("click", async () => {
-  await fetch("/api/auth/logout", { method: "POST" });
-  await refreshSession();
+  await fetch("/api/auth/logout", { method: "POST", headers: mutationHeaders() });
+  location.reload();
 });
 
-document.querySelector("[data-copy-referral]")?.addEventListener("click", async () => {
-  const code = state.session?.user?.referralCode;
-  if (!code) return;
-  const url = new URL(window.location.href);
-  url.search = "";
-  url.hash = "";
-  url.searchParams.set("ref", code);
-  await navigator.clipboard?.writeText(url.toString());
-  setStatus("Copied.");
+document.querySelectorAll("[data-chain-id]").forEach((card) => {
+  card.querySelector('[name="treasuryAddress"]')?.addEventListener("change", () => saveChain(card));
+  card.querySelector('[name="enabled"]')?.addEventListener("change", () => saveChain(card));
 });
 
-agentTokenForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const data = Object.fromEntries(new FormData(agentTokenForm).entries());
-  const response = await postJson("/api/admin/agent-tokens", data);
+document.querySelector("[data-webhook-url]")?.addEventListener("change", saveMerchant);
+document.querySelector("[data-create-key]")?.addEventListener("click", createMerchantKey);
+document.querySelector("[data-copy-key]")?.addEventListener("click", async () => {
+  const value = document.querySelector("[data-key-value]")?.textContent ?? "";
+  await navigator.clipboard.writeText(value);
+  setStatus("Merchant key copied.");
+});
+
+await refresh();
+
+async function refresh() {
+  const sessionResponse = await fetch("/api/v1/admin/session");
+  state.session = sessionResponse.ok ? await sessionResponse.json() : { authenticated: false };
+  const authenticated = state.session.authenticated === true;
+  const role = state.session.member?.role ?? "guest";
+  document.body.dataset.role = role;
+  signInPanel.hidden = authenticated;
+  consolePanel.hidden = !authenticated;
+  sessionSummary.hidden = !authenticated;
+  if (!authenticated) return;
+
+  applyPermissions(role);
+
+  document.querySelector("[data-session-handle]").textContent = state.session.member.handle;
+  const response = await fetch("/api/v1/admin/overview");
+  if (!response.ok) return setStatus(await errorText(response), "error");
+  state.overview = await response.json();
+  renderOverview();
+}
+
+function applyPermissions(role) {
+  const canConfigure = role === "owner" || role === "admin";
+  document.querySelectorAll("[data-chain-id] input, [data-webhook-url]").forEach((control) => {
+    control.disabled = !canConfigure;
+  });
+  const keyButton = document.querySelector("[data-create-key]");
+  if (keyButton) keyButton.hidden = role !== "owner";
+}
+
+function renderOverview() {
+  const overview = state.overview ?? {};
+  const health = document.querySelector("[data-health-state]");
+  health.textContent = overview.health ?? "Ready";
+  health.dataset.state = "ready";
+
+  for (const [name, value] of Object.entries(overview.metrics ?? {})) {
+    const element = document.querySelector(`[data-metric="${name}"]`);
+    if (element) element.textContent = String(value);
+  }
+
+  for (const chain of overview.chains ?? []) {
+    const card = document.querySelector(`[data-chain-id="${chain.chainId}"]`);
+    if (!card) continue;
+    card.querySelector('[name="treasuryAddress"]').value = chain.treasuryAddress ?? "";
+    card.querySelector('[name="enabled"]').checked = chain.enabled === true;
+  }
+
+  if (overview.merchant?.settlementWebhookUrl) {
+    document.querySelector("[data-webhook-url]").value = overview.merchant.settlementWebhookUrl;
+  }
+  renderKeys(overview.keys ?? []);
+  renderInvoices(overview.invoices ?? []);
+}
+
+async function saveChain(card) {
+  const chainId = Number(card.dataset.chainId);
+  const body = {
+    treasuryAddress: card.querySelector('[name="treasuryAddress"]').value.trim(),
+    enabled: card.querySelector('[name="enabled"]').checked,
+  };
+  const response = await requestJson(`/api/v1/admin/chains/${chainId}`, "PUT", body);
+  if (!response.ok) return setStatus(await errorText(response), "error");
+  setStatus(`${card.querySelector("strong").textContent} configuration saved.`);
+  await refresh();
+}
+
+async function saveMerchant() {
+  const settlementWebhookUrl = document.querySelector("[data-webhook-url]").value.trim();
+  const response = await requestJson(
+    "/api/v1/admin/merchants/linkedin-scraper-2025",
+    "PUT",
+    { name: "LinkedIn Sales Agent", settlementWebhookUrl },
+  );
   if (!response.ok) {
-    return setStatus(await errorText(response), "error");
+    setStatus(await errorText(response), "error");
+    return false;
   }
-  const body = await response.json();
-  tokenOutput.hidden = false;
-  tokenOutput.textContent = body.token;
-  await loadAdmin();
-});
-
-async function refreshSession() {
-  const response = await fetch("/api/account/session");
-  state.session = await response.json();
-  render();
+  setStatus("Settlement webhook saved.");
+  await refresh();
+  return true;
 }
 
-function render() {
-  const authed = state.session?.authenticated === true;
-  document.body.dataset.role = state.session?.user?.role ?? "guest";
-  authPanel.hidden = authed;
-  accountPanel.hidden = !authed;
-  adminPanel.hidden = !authed || !["admin", "super_admin"].includes(state.session.user.role);
-
-  if (!authed) {
-    setMode(state.session?.setupRequired ? "register" : state.mode);
-    setStatus(state.session?.setupRequired ? "Create the first account." : "");
-    return;
-  }
-
-  document.querySelector("[data-account-name]").textContent = state.session.user.name;
-  document.querySelector("[data-account-role]").textContent = state.session.user.role;
-  document.querySelector("[data-account-referral]").textContent = state.session.user.referralCode;
-  setStatus("");
-  if (!adminPanel.hidden) {
-    loadAdmin();
+async function createMerchantKey() {
+  const button = document.querySelector("[data-create-key]");
+  button.disabled = true;
+  try {
+    if (!(await saveMerchant())) return;
+    const response = await requestJson("/api/v1/admin/merchant-keys", "POST", {
+      merchantId: "linkedin-scraper-2025",
+      label: `LinkedIn production ${new Date().toISOString().slice(0, 10)}`,
+    });
+    if (!response.ok) return setStatus(await errorText(response), "error");
+    const body = await response.json();
+    document.querySelector("[data-key-value]").textContent = body.token;
+    document.querySelector("[data-key-reveal]").hidden = false;
+    setStatus("Merchant key generated. It will not be shown again.");
+    await refresh();
+  } finally {
+    button.disabled = false;
   }
 }
 
-async function loadAdmin() {
-  const response = await fetch("/api/admin/users");
-  if (!response.ok) return;
-  const body = await response.json();
-  const root = document.querySelector("[data-users]");
-  root.innerHTML = body.users.map((user) => `
-    <article data-user-id="${escapeHtml(user.id)}">
+function renderKeys(keys) {
+  const root = document.querySelector("[data-key-list]");
+  root.innerHTML = keys.length
+    ? keys.map((key) => `
+    <article data-key-id="${escapeHtml(key.id)}">
       <header>
-        <strong>${escapeHtml(user.email)}</strong>
-        <select data-role-select ${state.session.user.role !== "super_admin" ? "disabled" : ""}>
-          ${
-    ["user", "admin", "super_admin"].map((role) =>
-      `<option value="${role}" ${user.role === role ? "selected" : ""}>${role}</option>`
-    ).join("")
-  }
-        </select>
+        <div><strong>${escapeHtml(key.label)}</strong><p>${
+      escapeHtml(key.scopes.join(" · "))
+    }</p></div>
+        <button type="button" aria-label="Revoke ${
+      escapeHtml(key.label)
+    }" title="Revoke key">×</button>
       </header>
-      <p>${escapeHtml(user.name)} · ${escapeHtml(user.referralCode)}</p>
+      <small>Created ${formatDate(key.createdAt)}${
+      key.lastUsedAt ? ` · used ${formatDate(key.lastUsedAt)}` : ""
+    }</small>
     </article>
-  `).join("");
-
-  root.querySelectorAll("[data-role-select]").forEach((select) => {
-    select.addEventListener("change", async () => {
-      const id = select.closest("[data-user-id]").dataset.userId;
-      const response = await fetch(`/api/admin/users/${id}/role`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ role: select.value }),
+  `).join("")
+    : "<p>No merchant keys yet.</p>";
+  root.querySelectorAll("[data-key-id] button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const id = button.closest("[data-key-id]").dataset.keyId;
+      const response = await fetch(`/api/v1/admin/merchant-keys/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        headers: mutationHeaders(),
       });
-      if (!response.ok) setStatus(await errorText(response), "error");
-      await refreshSession();
+      if (!response.ok) return setStatus(await errorText(response), "error");
+      setStatus("Merchant key revoked.");
+      await refresh();
     });
   });
+  if (document.body.dataset.role !== "owner") {
+    root.querySelectorAll("button").forEach((button) => button.remove());
+  }
 }
 
-function setMode(mode) {
-  state.mode = mode === "login" ? "login" : "register";
-  document.querySelectorAll("[data-mode]").forEach((button) => {
-    button.setAttribute("aria-current", button.dataset.mode === state.mode ? "true" : "false");
-  });
-  document.querySelector("[data-name-row]").hidden = state.mode === "login";
-  document.querySelector("[data-ref-row]").hidden = state.mode === "login";
+function renderInvoices(invoices) {
+  const root = document.querySelector("[data-invoice-list]");
+  root.innerHTML = invoices.length
+    ? invoices.map((invoice) => `
+    <article>
+      <header><strong>${escapeHtml(invoice.productId)}</strong><small>${
+      escapeHtml(invoice.status)
+    }</small></header>
+      <p>${escapeHtml(invoice.paidAmountUnits)} USDC units · chain ${
+      escapeHtml(invoice.chainId)
+    }</p>
+      <small>${formatDate(invoice.createdAt)} · ${escapeHtml(invoice.id)}</small>
+    </article>
+  `).join("")
+    : "<p>No invoices yet.</p>";
 }
 
-async function postJson(path, body) {
+async function requestJson(path, method, body) {
   return await fetch(path, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
+    method,
+    headers: { ...mutationHeaders(), "content-type": "application/json" },
     body: JSON.stringify(body),
   });
 }
 
+function mutationHeaders() {
+  return { "x-uos-requested-with": "checkout-admin" };
+}
+
 async function errorText(response) {
   const body = await response.json().catch(() => ({}));
-  return body.error || `${response.status}`;
+  return body.error ?? `${response.status}`;
 }
 
 function setStatus(message, stateName = "") {
-  statusEl.textContent = message;
-  if (stateName) statusEl.dataset.state = stateName;
-  else delete statusEl.dataset.state;
+  statusElement.textContent = message;
+  if (stateName) statusElement.dataset.state = stateName;
+  else delete statusElement.dataset.state;
+}
+
+function formatDate(value) {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString() : "Unknown time";
 }
 
 function escapeHtml(value) {
@@ -153,12 +218,3 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
 }
-
-const incomingRef = new URLSearchParams(window.location.search).get("ref");
-if (incomingRef) {
-  const input = document.querySelector('input[name="referralCode"]');
-  if (input) input.value = incomingRef;
-}
-
-setMode("register");
-refreshSession();
