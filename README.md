@@ -64,7 +64,9 @@ Auth Hub agent tokens are rejected.
 
 In the operator console:
 
-1. Set and enable a treasury for each desired chain.
+1. Set and enable the initial Ether.fi USDC treasury `0x5DD4d53Df5d2F578c613D09525dE1A7352250143` on
+   Base (`8453`), Optimism (`10`), and Ethereum (`1`). The same EVM deposit address is used on all
+   three networks.
 2. Set the LinkedIn Sales Agent settlement webhook.
 3. Generate a merchant key and copy the one-time value into the LinkedIn deployment secret named
    `CHECKOUT_API_KEY`.
