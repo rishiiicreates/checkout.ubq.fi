@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ubiquity Checkout</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body data-page="auth" data-role="guest">
+    <main>
+      <header>
+        <p>Auth Template</p>
+        <h1>Ubiquity Checkout</h1>
+      </header>
+
+      <section data-panel="auth">
+        <nav aria-label="Authentication">
+          <button data-mode="register" aria-current="true">Register</button>
+          <button data-mode="login">Sign In</button>
+        </nav>
+
+        <form data-auth-form>
+          <label>
+            Email
+            <input name="email" type="email" autocomplete="email" required>
+          </label>
+          <label data-name-row>
+            Name
+            <input name="name" autocomplete="name">
+          </label>
+          <label>
+            Password
+            <input name="password" type="password" autocomplete="current-password" required>
+          </label>
+          <label data-ref-row>
+            Referral code
+            <input name="referralCode" autocomplete="off">
+          </label>
+          <button type="submit">Continue</button>
+        </form>
+      </section>
+
+      <section data-panel="account" hidden>
+        <header>
+          <p data-account-kicker>Account</p>
+          <h2 data-account-name></h2>
+        </header>
+        <dl>
+          <div>
+            <dt>Role</dt>
+            <dd data-account-role></dd>
+          </div>
+          <div>
+            <dt>Referral</dt>
+            <dd data-account-referral></dd>
+          </div>
+        </dl>
+        <button data-copy-referral type="button">Copy referral link</button>
+        <button data-logout type="button">Sign Out</button>
+      </section>
+
+      <section data-panel="admin" hidden>
+        <header>
+          <p>Admin</p>
+          <h2>Users</h2>
+        </header>
+        <div data-users></div>
+        <form data-agent-token-form>
+          <label>
+            User email
+            <input name="email" type="email" autocomplete="off">
+          </label>
+          <label>
+            Label
+            <input name="label" autocomplete="off" value="Codex">
+          </label>
+          <button type="submit">Mint agent token</button>
+        </form>
+        <pre data-agent-token-output hidden></pre>
+      </section>
+
+      <p data-status></p>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
