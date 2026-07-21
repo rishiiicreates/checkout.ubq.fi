@@ -12,12 +12,15 @@ Deno.test("prepareDeployRoot packages only runtime source and assets", async () 
     await Deno.writeTextFile(`${root}/src/admin_auth.ts`, "export {};\n");
     await Deno.mkdir(`${root}/scripts`);
     await Deno.writeTextFile(`${root}/scripts/deploy_deno_api.ts`, "export {};\n");
+    await Deno.mkdir(`${root}/demo`);
+    await Deno.writeTextFile(`${root}/demo/main.ts`, "export {};\n");
 
     const deployRoot = await prepareDeployRoot({ repoRoot: root, requestedRoot: ".deploy-root" });
     await assertFile(`${deployRoot}/main.ts`);
     await assertFile(`${deployRoot}/src/admin_auth.ts`);
     await assertFile(`${deployRoot}/public/index.html`);
     await assertMissing(`${deployRoot}/scripts/deploy_deno_api.ts`);
+    await assertMissing(`${deployRoot}/demo/main.ts`);
     await assertFile(`${deployRoot}/deploy-metadata.json`);
   } finally {
     await Deno.remove(root, { recursive: true }).catch(() => {});

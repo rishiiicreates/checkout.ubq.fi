@@ -56,6 +56,33 @@ Run the complete offline suite:
 deno task check
 ```
 
+## Anvil checkout demo
+
+With [Foundry](https://getfoundry.sh/) installed, start the localhost-only customer demo:
+
+```bash
+deno task demo
+```
+
+Open [http://127.0.0.1:8010](http://127.0.0.1:8010). The demo forks Base at pinned block `48933428`,
+executes Circle's deployed USDC contract, impersonates a funded holder only inside Anvil, and sends
+each invoice's exact amount to the configured Ether.fi treasury. The interface lets you advance the
+invoice through transfer inclusion, three sealed blocks, safe settlement, and finalization. No
+wallet, signature, or mainnet funds are used.
+
+Anvil does not model Base's safe and finalized heads for locally mined blocks. The demo RPC adapter
+advances those two tags explicitly after Checkout has verified the real receipt and ERC-20 Transfer
+log. The fork uses Base's public RPC because Anvil needs pinned historical state; production payment
+verification continues to use `rpc.ubq.fi`.
+
+Run the same complete flow as an automated end-to-end test:
+
+```bash
+deno task test:anvil
+```
+
+The demo directory is intentionally excluded from the Deno Deploy artifact.
+
 ## Operator setup
 
 Production operators sign in through Auth Hub. The first Auth Hub administrator to complete Checkout
