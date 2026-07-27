@@ -1,2 +1,5 @@
 .env
 coverage/
+.deploy-root/
+.deno-kv/
+.codex-worktrees/

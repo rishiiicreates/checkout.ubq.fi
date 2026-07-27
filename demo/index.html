@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta
+      name="description"
+      content="Run the Ubiquity Checkout payment lifecycle against a local Anvil Base fork."
+    >
+    <title>Ubiquity Checkout · Anvil demo</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body data-page="anvil-demo" data-state="ready">
+    <header>
+      <a href="https://checkout.ubq.fi" aria-label="Ubiquity Checkout home">
+        <span aria-hidden="true">U</span>
+        <strong>Ubiquity Checkout</strong>
+      </a>
+      <p><i aria-hidden="true"></i> Local Anvil fork</p>
+    </header>
+
+    <main>
+      <section aria-labelledby="demo-title">
+        <p>Anvil Base fork · No mainnet funds</p>
+        <h1 id="demo-title">Take a crypto checkout from invoice to finality.</h1>
+        <p>
+          This local merchant uses Circle's real Base USDC contract at a pinned block. Anvil
+          impersonates a funded holder, while Checkout verifies the resulting receipt, log, amount,
+          recipient, and block.
+        </p>
+      </section>
+
+      <section data-checkout aria-labelledby="checkout-title">
+        <article>
+          <header>
+            <div>
+              <p>Demo subscription</p>
+              <h2 id="checkout-title">Solo test plan</h2>
+            </div>
+            <p><strong>$5</strong><span> / 30 days</span></p>
+          </header>
+
+          <div data-empty>
+            <p>Create a real Checkout invoice backed by the local Base fork.</p>
+            <button type="button" data-create>Create test invoice</button>
+          </div>
+
+          <div data-invoice hidden>
+            <section aria-label="Payment instructions">
+              <p>Send exactly</p>
+              <p><strong data-amount>—</strong> <span>USDC</span></p>
+              <dl>
+                <div>
+                  <dt>Network</dt>
+                  <dd data-network>Base</dd>
+                </div>
+                <div>
+                  <dt>Recipient</dt>
+                  <dd>
+                    <code data-treasury>—</code>
+                    <button type="button" data-copy aria-label="Copy recipient address">
+                      <svg aria-hidden="true" viewBox="0 0 24 24">
+                        <path d="M8 8h11v11H8z"></path>
+                        <path d="M5 16V5h11"></path>
+                      </svg>
+                    </button>
+                  </dd>
+                </div>
+                <div data-transaction-row hidden>
+                  <dt>Transaction</dt>
+                  <dd><code data-transaction>—</code></dd>
+                </div>
+              </dl>
+            </section>
+
+            <ol data-progress aria-label="Payment progress">
+              <li data-status="awaiting_payment"><span>1</span><p>Invoice ready</p></li>
+              <li data-status="confirming"><span>2</span><p>Transfer included</p></li>
+              <li data-status="provisionally_paid"><span>3</span><p>3 blocks sealed</p></li>
+              <li data-status="settled"><span>4</span><p>Safe settlement</p></li>
+              <li data-status="finalized"><span>5</span><p>Finalized</p></li>
+            </ol>
+
+            <footer>
+              <p data-message aria-live="polite">Invoice created. No transaction has been sent.</p>
+              <button type="button" data-advance>Send exact USDC on Anvil</button>
+            </footer>
+          </div>
+        </article>
+
+        <aside>
+          <p>What is real here?</p>
+          <ul>
+            <li>Circle's deployed Base USDC bytecode and storage</li>
+            <li>An EVM transaction with a genuine ERC-20 Transfer log</li>
+            <li>Checkout's canonical verification and lifecycle state</li>
+          </ul>
+          <p>
+            Anvil does not model Base's safe and finalized heads, so the final two buttons advance
+            those tags explicitly after the real transfer is confirmed.
+          </p>
+        </aside>
+      </section>
+    </main>
+
+    <footer>
+      <p>Bound to <code>127.0.0.1</code>. The demo is excluded from the production deploy artifact.</p>
+    </footer>
+  </body>
+</html>

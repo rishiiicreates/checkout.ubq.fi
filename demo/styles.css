@@ -1,0 +1,506 @@
+:root {
+  color-scheme: dark;
+  --background: #070809;
+  --surface: #111315;
+  --surface-raised: #181b1e;
+  --surface-soft: #202429;
+  --text: #f7f7f5;
+  --muted: #9da3aa;
+  --quiet: #696f76;
+  --accent: #d8ff72;
+  --accent-text: #111606;
+  --danger: #ff9d8f;
+  --radius-large: 28px;
+  --radius-medium: 18px;
+  --shadow: 0 28px 80px rgb(0 0 0 / 45%);
+  font-family:
+    Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body[data-page="anvil-demo"] {
+  min-width: 0;
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(circle at 18% 0%, rgb(216 255 114 / 10%), transparent 34rem),
+    var(--background);
+  color: var(--text);
+}
+
+body[data-page="anvil-demo"] [hidden] {
+  display: none !important;
+}
+
+body[data-page="anvil-demo"] button,
+body[data-page="anvil-demo"] a {
+  font: inherit;
+}
+
+body[data-page="anvil-demo"] button {
+  border: 0;
+  cursor: pointer;
+}
+
+body[data-page="anvil-demo"] button:focus-visible,
+body[data-page="anvil-demo"] a:focus-visible {
+  outline: 3px solid rgb(216 255 114 / 45%);
+  outline-offset: 3px;
+}
+
+body[data-page="anvil-demo"] > header,
+body[data-page="anvil-demo"] > footer,
+body[data-page="anvil-demo"] main {
+  width: min(1120px, calc(100% - 40px));
+  margin-inline: auto;
+}
+
+body[data-page="anvil-demo"] > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 84px;
+}
+
+body[data-page="anvil-demo"] > header a {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+body[data-page="anvil-demo"] > header a span {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--text);
+  color: var(--background);
+  font-weight: 850;
+}
+
+body[data-page="anvil-demo"] > header > p {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+body[data-page="anvil-demo"] > header i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 16px rgb(216 255 114 / 70%);
+}
+
+body[data-page="anvil-demo"] main {
+  display: grid;
+  gap: 52px;
+  padding: clamp(48px, 8vw, 96px) 0 80px;
+}
+
+body[data-page="anvil-demo"] main > section:first-child {
+  display: grid;
+  max-width: 800px;
+  gap: 18px;
+}
+
+body[data-page="anvil-demo"] main > section:first-child > p:first-child,
+body[data-page="anvil-demo"] article header > div p,
+body[data-page="anvil-demo"] aside > p:first-child {
+  margin: 0;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 760;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+body[data-page="anvil-demo"] h1 {
+  max-width: 760px;
+  margin: 0;
+  font-size: clamp(42px, 7vw, 78px);
+  font-weight: 720;
+  letter-spacing: -0.055em;
+  line-height: 0.98;
+}
+
+body[data-page="anvil-demo"] main > section:first-child > p:last-child {
+  max-width: 660px;
+  margin: 0;
+  color: var(--muted);
+  font-size: clamp(16px, 2vw, 19px);
+  line-height: 1.6;
+}
+
+body[data-page="anvil-demo"] [data-checkout] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  align-items: start;
+  gap: 20px;
+}
+
+body[data-page="anvil-demo"] article,
+body[data-page="anvil-demo"] aside {
+  border-radius: var(--radius-large);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+body[data-page="anvil-demo"] article {
+  min-width: 0;
+  overflow: hidden;
+}
+
+body[data-page="anvil-demo"] article > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 28px 30px;
+  background: var(--surface-raised);
+}
+
+body[data-page="anvil-demo"] article h2 {
+  margin: 6px 0 0;
+  font-size: 25px;
+  letter-spacing: -0.035em;
+}
+
+body[data-page="anvil-demo"] article header > p {
+  margin: 0;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+body[data-page="anvil-demo"] article header > p strong {
+  color: var(--text);
+  font-size: 28px;
+}
+
+body[data-page="anvil-demo"] [data-empty] {
+  display: grid;
+  justify-items: start;
+  gap: 24px;
+  padding: 44px 30px 30px;
+}
+
+body[data-page="anvil-demo"] [data-empty] p {
+  max-width: 440px;
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+body[data-page="anvil-demo"] [data-create],
+body[data-page="anvil-demo"] [data-advance] {
+  min-height: 52px;
+  padding: 0 22px;
+  border-radius: 15px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 760;
+  transition: transform 140ms ease, opacity 140ms ease;
+}
+
+body[data-page="anvil-demo"] [data-create]:hover,
+body[data-page="anvil-demo"] [data-advance]:hover {
+  transform: translateY(-1px);
+}
+
+body[data-page="anvil-demo"] button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+  transform: none;
+}
+
+body[data-page="anvil-demo"] [data-invoice] > section {
+  display: grid;
+  gap: 22px;
+  padding: 30px;
+}
+
+body[data-page="anvil-demo"] [data-invoice] > section > p {
+  margin: 0;
+  color: var(--muted);
+}
+
+body[data-page="anvil-demo"] [data-invoice] > section > p:nth-child(2) {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--text);
+}
+
+body[data-page="anvil-demo"] [data-amount] {
+  font-size: clamp(36px, 6vw, 58px);
+  letter-spacing: -0.055em;
+}
+
+body[data-page="anvil-demo"] [data-invoice] > section > p:nth-child(2) span {
+  color: var(--accent);
+  font-weight: 760;
+}
+
+body[data-page="anvil-demo"] dl {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  overflow: hidden;
+  border-radius: var(--radius-medium);
+  background: var(--background);
+}
+
+body[data-page="anvil-demo"] dl > div {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: center;
+  min-width: 0;
+  min-height: 52px;
+  padding: 10px 14px;
+  background: var(--surface-soft);
+}
+
+body[data-page="anvil-demo"] dt {
+  color: var(--quiet);
+  font-size: 13px;
+}
+
+body[data-page="anvil-demo"] dd {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0;
+}
+
+body[data-page="anvil-demo"] code {
+  min-width: 0;
+  color: var(--text);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+body[data-page="anvil-demo"] [data-copy] {
+  display: grid;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 10px;
+  background: rgb(255 255 255 / 7%);
+  color: var(--muted);
+}
+
+body[data-page="anvil-demo"] [data-copy] svg {
+  width: 16px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+body[data-page="anvil-demo"] [data-progress] {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0;
+  padding: 0 30px 30px;
+  list-style: none;
+}
+
+body[data-page="anvil-demo"] [data-progress] li {
+  display: grid;
+  align-content: start;
+  gap: 9px;
+  min-width: 0;
+  color: var(--quiet);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+body[data-page="anvil-demo"] [data-progress] span {
+  display: grid;
+  width: 27px;
+  height: 27px;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--surface-soft);
+  color: inherit;
+  font-weight: 760;
+}
+
+body[data-page="anvil-demo"] [data-progress] p {
+  margin: 0;
+}
+
+body[data-page="anvil-demo"] [data-progress] li[data-complete="true"] {
+  color: var(--text);
+}
+
+body[data-page="anvil-demo"] [data-progress] li[aria-current="step"] {
+  color: var(--accent);
+}
+
+body[data-page="anvil-demo"] [data-progress] li[data-complete="true"] span,
+body[data-page="anvil-demo"] [data-progress] li[aria-current="step"] span {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+body[data-page="anvil-demo"] article > [data-invoice] > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 22px 30px;
+  background: var(--surface-raised);
+}
+
+body[data-page="anvil-demo"] [data-message] {
+  max-width: 390px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+body[data-page="anvil-demo"] [data-message][data-tone="error"] {
+  color: var(--danger);
+}
+
+body[data-page="anvil-demo"] aside {
+  display: grid;
+  gap: 20px;
+  padding: 26px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+body[data-page="anvil-demo"] aside ul {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+body[data-page="anvil-demo"] aside li {
+  position: relative;
+  padding-left: 20px;
+}
+
+body[data-page="anvil-demo"] aside li::before {
+  position: absolute;
+  top: 0.5em;
+  left: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  content: "";
+}
+
+body[data-page="anvil-demo"] aside > p:last-child {
+  margin: 0;
+  color: var(--quiet);
+}
+
+body[data-page="anvil-demo"] > footer {
+  padding: 0 0 calc(30px + env(safe-area-inset-bottom));
+  color: var(--quiet);
+  font-size: 12px;
+}
+
+body[data-page="anvil-demo"] > footer p {
+  margin: 0;
+}
+
+@media (max-width: 800px) {
+  body[data-page="anvil-demo"] [data-checkout] {
+    grid-template-columns: 1fr;
+  }
+
+  body[data-page="anvil-demo"] aside {
+    box-shadow: none;
+  }
+}
+
+@media (max-width: 600px) {
+  body[data-page="anvil-demo"] > header,
+  body[data-page="anvil-demo"] > footer,
+  body[data-page="anvil-demo"] main {
+    width: min(100% - 24px, 1120px);
+  }
+
+  body[data-page="anvil-demo"] > header {
+    min-height: 70px;
+  }
+
+  body[data-page="anvil-demo"] > header > p {
+    font-size: 0;
+  }
+
+  body[data-page="anvil-demo"] main {
+    gap: 34px;
+    padding-top: 38px;
+  }
+
+  body[data-page="anvil-demo"] h1 {
+    font-size: clamp(40px, 14vw, 58px);
+  }
+
+  body[data-page="anvil-demo"] article > header,
+  body[data-page="anvil-demo"] [data-empty],
+  body[data-page="anvil-demo"] [data-invoice] > section {
+    padding-inline: 20px;
+  }
+
+  body[data-page="anvil-demo"] article > header {
+    padding-block: 22px;
+  }
+
+  body[data-page="anvil-demo"] dl > div {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  body[data-page="anvil-demo"] [data-progress] {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    padding-inline: 20px;
+  }
+
+  body[data-page="anvil-demo"] [data-progress] li {
+    grid-template-columns: 27px 1fr;
+    align-items: center;
+  }
+
+  body[data-page="anvil-demo"] article > [data-invoice] > footer {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 20px;
+  }
+
+  body[data-page="anvil-demo"] [data-advance] {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body[data-page="anvil-demo"] button {
+    transition: none;
+  }
+}

@@ -48,17 +48,11 @@ if (!provision.success) {
   const output = `${provision.stdout}\n${provision.stderr}`;
   if (/already|exist/i.test(output)) {
     database = desiredDatabase;
-  } else if (/limit/i.test(output)) {
-    const list = await runDenoDeploy(["database", "list", "--token", token, "--org", org]);
-    if (!list.success) {
-      throw new Error(`Could not list Deno Deploy databases:\n${list.stdout}\n${list.stderr}`);
-    }
-    database = firstDenoKvDatabase(list.stdout) ?? firstDenoKvDatabase(list.stderr) ?? "";
-    if (!database) {
-      throw new Error(`No existing Deno KV database found after provision failed:\n${output}`);
-    }
   } else {
-    throw new Error(`Could not provision Deno KV database:\n${output}`);
+    throw new Error(
+      `Could not provision the dedicated ${desiredDatabase} database. ` +
+        `Checkout must never share another application's KV database:\n${output}`,
+    );
   }
 }
 
@@ -153,23 +147,6 @@ function authHeaders(): Record<string, string> {
   return {
     authorization: `Bearer ${token}`,
   };
-}
-
-function firstDenoKvDatabase(output: string): string | null {
-  for (const line of output.split("\n")) {
-    if (!/denokv/i.test(line)) continue;
-    if (line.includes("│")) {
-      const cells = line.split("│").map((cell) => cell.trim()).filter(Boolean);
-      const name = cells.find((cell) =>
-        cell && !/denokv/i.test(cell) && !/created|updated/i.test(cell)
-      );
-      if (name) return name;
-    }
-    const words = line.trim().split(/\s+/).filter(Boolean);
-    const name = words.find((word) => !/denokv/i.test(word) && !/[│┌┐└┘─]/.test(word));
-    if (name) return name;
-  }
-  return null;
 }
 
 function required(value: string | undefined, name: string): string {
