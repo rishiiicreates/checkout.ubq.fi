@@ -116,7 +116,9 @@ Deno.test("merchant webhooks reject local targets and DNS answers in private ran
       resolveDns: (_hostname, recordType) =>
         Promise.resolve(recordType === "A" ? ["93.184.216.34"] : []),
     });
-    await publicDns.validateWebhookTarget("https://merchant.example/hook");
+    const resolved = await publicDns.resolveWebhookTarget("https://merchant.example/hook");
+    assertEquals(resolved.url.toString(), "https://merchant.example/hook");
+    assertEquals(resolved.addresses.join(","), "93.184.216.34");
   });
 });
 

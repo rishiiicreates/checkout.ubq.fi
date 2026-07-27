@@ -49,7 +49,7 @@ Deno.test("catalog versions are canonical, merchant-scoped, immutable, and idemp
   });
 });
 
-Deno.test("invoice allocation resolves overlapping amount bands and permanently reserves expired slots", async () => {
+Deno.test("invoice allocation resolves overlapping amount bands and preserves expired slots", async () => {
   const starts = [1n, 10_001n, 1n];
   await withService(async ({ service, clock }) => {
     await service.publishCatalogVersion(
@@ -89,6 +89,56 @@ Deno.test("invoice allocation resolves overlapping amount bands and permanently 
     assertEquals(afterExpiry.paidAmountUnits, "999997");
     assertEquals(afterExpiry.discountUnits, "3");
   }, { discountStart: () => starts.shift() ?? 1n });
+});
+
+Deno.test("finalized amount reservations become reusable only after the quarantine window", async () => {
+  await withService(async ({ service, rpc, clock }) => {
+    await service.publishCatalogVersion(
+      { merchantId: MERCHANT },
+      "prices",
+      catalog([product("pack", 100)]),
+    );
+    const first = await service.createInvoice(context("first-finalized"), {
+      customerReference: "first-finalized",
+      pricingVersionId: "prices",
+      productId: "pack",
+      chainId: 8453,
+    });
+    rpc.addTransfer(await service.getInvoiceRecord(first.id), {
+      transactionHash: hash(1),
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    await service.claimPayment(first.id, claim(hash(1), 100n));
+    rpc.setHeads(103n, 100n, null);
+    await service.refreshInvoice(first.id);
+    rpc.setHeads(103n, 100n, 100n);
+    assertEquals((await service.refreshInvoice(first.id)).invoice.status, "finalized");
+
+    const quarantined = await service.createInvoice(context("during-quarantine"), {
+      customerReference: "during-quarantine",
+      pricingVersionId: "prices",
+      productId: "pack",
+      chainId: 8453,
+    });
+    assertEquals(quarantined.discountUnits, "2");
+
+    clock.advance(24 * 60 * 60 * 1000 + 1);
+    const reused = await service.createInvoice(context("after-quarantine"), {
+      customerReference: "after-quarantine",
+      pricingVersionId: "prices",
+      productId: "pack",
+      chainId: 8453,
+    });
+    assertEquals(reused.discountUnits, "1");
+    assertEquals(reused.paidAmountUnits, first.paidAmountUnits);
+    assert(BigInt(reused.minimumBlock) > 100n);
+    await assertDomainError(
+      () => service.claimPayment(reused.id, claim(hash(1), 100n)),
+      "payment_locator_already_claimed",
+    );
+  });
 });
 
 Deno.test("concurrent creation is idempotent and enforces one open tuple", async () => {
@@ -422,8 +472,10 @@ Deno.test("a reverted locator can reappear canonically and emit a new acceptance
 
     rpc.reincludeTransfer(transactionHash, 101n);
     rpc.setHeads(104n, null, null);
+    const watch = await service.reconcileHourly(8453, 104n);
+    assertEquals(watch.invoices.map((candidate) => candidate.id), [invoice.id]);
+    assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
     const reaccepted = await service.claimPayment(invoice.id, claim(transactionHash, 101n));
-    assertEquals(reaccepted.invoice.status, "provisionally_paid");
     const reacceptedClaims = (await verifyCompactJws(reaccepted.eventJws!, await service.jwks()))
       .payload as Record<string, unknown>;
     assert(reacceptedClaims.jti !== firstClaims.jti);

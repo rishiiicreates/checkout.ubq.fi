@@ -143,6 +143,15 @@ export class AnvilBaseFork {
     await rpcRequest("anvil_mine", [`0x${blocks.toString(16)}`]);
   }
 
+  async snapshot(): Promise<string> {
+    return await rpcRequest<string>("evm_snapshot", []);
+  }
+
+  async revert(snapshotId: string): Promise<void> {
+    const reverted = await rpcRequest<boolean>("evm_revert", [snapshotId]);
+    if (!reverted) throw new Error("anvil_snapshot_revert_failed");
+  }
+
   async sendExactUsdc(recipientInput: string, amountUnits: bigint): Promise<AnvilTransfer> {
     const recipient = normalizeAddress(recipientInput);
     if (amountUnits <= 0n) throw new Error("invalid_demo_transfer_amount");

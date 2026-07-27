@@ -13,6 +13,11 @@ import { type CompactJwsSigner, createPersistentJwsSigner, JwsError } from "./sr
 import { createPaymentService, type PaymentService } from "./src/payment_service.ts";
 import { type InvoiceJson, PaymentDomainError } from "./src/payment_types.ts";
 import { HttpRpcClient, type RpcClient, RpcError, RpcVerificationError } from "./src/rpc.ts";
+import {
+  postPinnedWebhook,
+  type ResolvedWebhookTarget,
+  type WebhookDeliveryResponse,
+} from "./src/webhook.ts";
 
 const STATIC_ROOT = new URL("./public/", import.meta.url);
 const LINKEDIN_MERCHANT_ID = "linkedin-scraper-2025";
@@ -31,6 +36,11 @@ export type CheckoutServices = {
   merchantAuth: MerchantAuthService;
   payment: PaymentService;
   fetcher: typeof fetch;
+  webhookSender: (
+    target: ResolvedWebhookTarget,
+    body: string,
+    signal: AbortSignal,
+  ) => Promise<WebhookDeliveryResponse>;
 };
 
 type CheckoutServiceOptions = {
@@ -38,6 +48,7 @@ type CheckoutServiceOptions = {
   rpc?: RpcClient;
   signer?: CompactJwsSigner;
   resolveDns?: (hostname: string, recordType: "A" | "AAAA") => Promise<string[]>;
+  webhookSender?: CheckoutServices["webhookSender"];
 };
 
 export function createCheckoutServices(
@@ -56,6 +67,7 @@ export function createCheckoutServices(
       signer,
     }),
     fetcher,
+    webhookSender: options.webhookSender ?? postPinnedWebhook,
   };
 }
 
@@ -105,6 +117,26 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
   if (url.pathname === "/api/v1/admin/overview" && request.method === "GET") {
     await services.adminAuth.requireRole(request, ["owner", "admin", "viewer"]);
     return json(await adminOverview(services));
+  }
+
+  if (url.pathname === "/api/v1/admin/members" && request.method === "GET") {
+    return json({
+      members: await services.adminAuth.listMembers(request),
+      invitations: await services.adminAuth.listInvitations(request),
+    });
+  }
+
+  const adminMemberMatch = url.pathname.match(/^\/api\/v1\/admin\/members\/([^/]+)$/);
+  if (adminMemberMatch && request.method === "PUT") {
+    requireAdminMutation(request);
+    const body = await requestJson(request);
+    return json(
+      await services.adminAuth.upsertMember(
+        request,
+        decodeURIComponent(adminMemberMatch[1]),
+        memberRole(body.role),
+      ),
+    );
   }
 
   const adminChainMatch = url.pathname.match(/^\/api\/v1\/admin\/chains\/(\d+)$/);
@@ -196,7 +228,7 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
     const principal = await services.merchantAuth.authenticate(request, ["invoice:read"]);
     const invoiceId = decodeURIComponent(invoiceMatch[1]);
     await requireMerchantInvoice(services, principal.merchant.id, invoiceId);
-    return json(await services.payment.expireInvoice(invoiceId));
+    return json(await services.payment.getInvoice(invoiceId));
   }
 
   const claimMatch = url.pathname.match(/^\/api\/v1\/invoices\/([^/]+)\/claims$/);
@@ -285,25 +317,22 @@ export async function deliverOutbox(services: CheckoutServices): Promise<void> {
         continue;
       }
       try {
-        await services.merchantAuth.validateWebhookTarget(merchant.settlementWebhookUrl);
-        const response = await services.fetcher(merchant.settlementWebhookUrl, {
-          method: "POST",
-          redirect: "manual",
-          signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
-          headers: {
-            accept: "application/json",
-            "content-type": "application/json",
-            "user-agent": "Ubiquity-Checkout/1.0",
-          },
-          body: JSON.stringify({ eventJws: event.compactJws }),
-        });
+        const target = await services.merchantAuth.resolveWebhookTarget(
+          merchant.settlementWebhookUrl,
+        );
+        const response = await services.webhookSender(
+          target,
+          JSON.stringify({ eventJws: event.compactJws }),
+          AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+        );
         if (response.ok) {
           await services.payment.markOutboxDelivered(event.id);
         } else {
           await services.payment.markOutboxFailed(event.id, `webhook_http_${response.status}`);
         }
       } catch (error) {
-        await services.payment.markOutboxFailed(event.id, error);
+        const reason = error instanceof Error ? error.message : String(error);
+        await services.payment.markOutboxFailed(event.id, reason);
         console.error("checkout_settlement_webhook_failed", event.id, error);
       }
     }
@@ -364,6 +393,11 @@ function optionalScopes(value: unknown): MerchantScope[] | undefined {
     throw new HttpError(400, "invalid_scopes");
   }
   return value as MerchantScope[];
+}
+
+function memberRole(value: unknown): "admin" | "viewer" {
+  if (value === "admin" || value === "viewer") return value;
+  throw new HttpError(400, "invalid_member_role");
 }
 
 function maybeStatic(request: Request, url: URL): Response | Promise<Response> | null {

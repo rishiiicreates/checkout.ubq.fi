@@ -73,7 +73,8 @@ dt {
 
 button,
 a,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -104,7 +105,8 @@ button:disabled {
   opacity: 0.55;
 }
 
-input {
+input,
+select {
   width: 100%;
   min-height: 44px;
   border: 0;
@@ -115,7 +117,8 @@ input {
   color: var(--foreground);
 }
 
-input:focus {
+input:focus,
+select:focus {
   outline-color: var(--accent);
 }
 
@@ -127,7 +130,7 @@ label {
 
 code,
 pre {
-  font-family: "SFMono-Regular", Consolas, monospace;
+  font-family: SFMono-Regular, Consolas, monospace;
 }
 
 body > main > header[data-brand] {
@@ -238,6 +241,7 @@ section {
 [data-metrics] > div,
 [data-network-list] > article,
 [data-key-list] > article,
+[data-member-list] > article,
 [data-invoice-list] > article {
   border-radius: 14px;
   background: var(--surface-raised);
@@ -267,6 +271,7 @@ dd {
 
 [data-network-list] > article,
 [data-key-list] > article,
+[data-member-list] > article,
 [data-invoice-list] > article {
   padding: 17px;
   display: grid;
@@ -275,6 +280,7 @@ dd {
 
 [data-network-list] article > header,
 [data-key-list] article > header,
+[data-member-list] article,
 [data-invoice-list] article > header {
   display: flex;
   justify-content: space-between;
@@ -331,6 +337,7 @@ dd {
 }
 
 [data-key-list],
+[data-member-list],
 [data-invoice-list] {
   display: grid;
   gap: 9px;
@@ -344,8 +351,28 @@ dd {
   color: var(--danger);
 }
 
+[data-member-form] {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(130px, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+[data-member-list] article {
+  align-items: center;
+}
+
+[data-member-list] article > div {
+  display: grid;
+  gap: 5px;
+}
+
+[data-member-list] select {
+  width: min(150px, 100%);
+}
+
 [data-invoice-list] article p {
-  font-family: "SFMono-Regular", Consolas, monospace;
+  font-family: SFMono-Regular, Consolas, monospace;
   font-size: 0.78rem;
   overflow-wrap: anywhere;
 }
@@ -369,9 +396,14 @@ dd {
   }
 
   [data-section-header],
-  [data-key-actions] {
+  [data-key-actions],
+  [data-member-form] {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  [data-member-form] {
+    grid-template-columns: 1fr;
   }
 
   [data-section-header] > span {

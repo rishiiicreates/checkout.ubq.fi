@@ -1,4 +1,5 @@
 import { LOCAL_PEER_HEADER } from "./admin_auth.ts";
+import type { ResolvedWebhookTarget } from "./webhook.ts";
 
 export type MerchantScope =
   | "catalog:write"
@@ -58,14 +59,16 @@ export function createMerchantAuthService(kv: Deno.Kv, options: MerchantAuthOpti
   const resolveDns = options.resolveDns ??
     ((hostname, recordType) => Deno.resolveDns(hostname, recordType) as Promise<string[]>);
 
-  const validateWebhookTarget = async (settlementWebhookUrl: string): Promise<void> => {
+  const resolveWebhookTarget = async (
+    settlementWebhookUrl: string,
+  ): Promise<ResolvedWebhookTarget> => {
     const url = new URL(webhookUrl(settlementWebhookUrl));
     const hostname = normalizedHostname(url.hostname);
     if (isIpAddress(hostname)) {
       if (!isPublicIpAddress(hostname)) {
         throw new MerchantAuthError(400, "unsafe_webhook_url");
       }
-      return;
+      return { url, addresses: [hostname] };
     }
     const answers = await Promise.allSettled([
       resolveDns(hostname, "A"),
@@ -85,6 +88,11 @@ export function createMerchantAuthService(kv: Deno.Kv, options: MerchantAuthOpti
     if (addresses.some((address) => !isPublicIpAddress(address))) {
       throw new MerchantAuthError(400, "unsafe_webhook_url");
     }
+    return { url, addresses: [...new Set(addresses.map(normalizedHostname))] };
+  };
+
+  const validateWebhookTarget = async (settlementWebhookUrl: string): Promise<void> => {
+    await resolveWebhookTarget(settlementWebhookUrl);
   };
 
   return {
@@ -93,6 +101,7 @@ export function createMerchantAuthService(kv: Deno.Kv, options: MerchantAuthOpti
       return (await kv.get<MerchantRecord>(merchantKey(merchantId))).value;
     },
     validateWebhookTarget,
+    resolveWebhookTarget,
     async upsertMerchant(input: {
       id: string;
       name: string;

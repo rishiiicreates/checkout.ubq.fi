@@ -16,11 +16,18 @@ monthly withdrawals are intentionally outside the one-shot v1 contract.
   `https://rpc.ubq.fi/{chainId}`.
 - Checkout signs accepted, settled, and reverted events with a persistent KV-backed RS256 key.
 - The product verifies the compact JWS and applies fulfillment exactly once.
+- Webhook delivery resolves only public addresses, completes hostname-verified TLS, and compares the
+  connected remote address with that single DNS result set before writing the signed event.
 - All durable application state lives in Deno KV; the server does not rely on process memory.
 
-An invoice uses a permanently reserved six-decimal discount as its payment fingerprint. That gives
-each list-price/chain/treasury tuple 999,999 possible exact amounts. Reservations are not recycled,
-because recycling creates ambiguity when a customer pays an old invoice late.
+An invoice uses a reserved six-decimal discount as its payment fingerprint. That gives each
+list-price/chain/treasury tuple 999,999 possible exact amounts. Unpaid, late, disputed, and reverted
+fingerprints are never recycled, because doing so creates ambiguity when a customer pays an old
+invoice late. A successfully finalized fingerprint becomes reusable after a 24-hour quarantine;
+allocation also uses a bounded probe count so saturation fails quickly instead of causing a KV
+latency cliff. The replacement invoice starts after the old canonical payment's block, and the old
+transaction locator remains bound to the finalized invoice, so the original transfer cannot replay
+against the reused fingerprint.
 
 ## Payment states
 
@@ -97,8 +104,14 @@ In the operator console:
 2. Set the LinkedIn Sales Agent settlement webhook.
 3. Generate a merchant key and copy the one-time value into the LinkedIn deployment secret named
    `CHECKOUT_API_KEY`.
+4. Invite later operators by their normalized Auth Hub handle and choose `admin` or `viewer`. The
+   invitation is consumed atomically when that handle next completes Checkout SSO. Owners can also
+   update either role from the same console.
 
 Only the token hash is retained by Checkout. Revocation takes effect on the next API request.
+
+The owner-only membership API is `GET /api/v1/admin/members` and `PUT /api/v1/admin/members/:handle`
+with `{ "role": "admin" | "viewer" }`.
 
 ## Merchant API
 

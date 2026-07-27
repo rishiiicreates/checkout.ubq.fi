@@ -1,3 +1,4 @@
+import { assert, assertEquals } from "@std/assert";
 import { verifyCompactJws } from "../src/jws.ts";
 import { ANVIL_CHAIN_ID, DEMO_TREASURY_ADDRESS } from "./anvil.ts";
 import { createDemoEnvironment } from "./server.ts";
@@ -86,6 +87,49 @@ Deno.test({
   },
 });
 
+Deno.test({
+  name: "Anvil Base fork emits a signed reversion after provisional acceptance is reorged out",
+  fn: async () => {
+    const environment = await createDemoEnvironment();
+    try {
+      const origin = "http://127.0.0.1:8010";
+      const invoice = await requestHandlerJson<DemoInvoice>(
+        environment.handler,
+        `${origin}/api/demo/invoices`,
+        { method: "POST" },
+      );
+      const snapshotId = await environment.anvil.snapshot();
+      const confirming = await requestHandlerJson<DemoStep>(
+        environment.handler,
+        `${origin}/api/demo/invoices/${invoice.id}/steps/transfer`,
+        { method: "POST" },
+      );
+      assertEquals(confirming.invoice.status, "confirming");
+      const provisional = await requestHandlerJson<DemoStep>(
+        environment.handler,
+        `${origin}/api/demo/invoices/${invoice.id}/steps/confirm`,
+        { method: "POST" },
+      );
+      assertEquals(provisional.invoice.status, "provisionally_paid");
+
+      await environment.anvil.revert(snapshotId);
+      await environment.anvil.mine(1);
+      const reverted = await environment.services.payment.refreshInvoice(invoice.id);
+      assertEquals(reverted.invoice.status, "reverted");
+      assert(typeof reverted.eventJws === "string");
+      const payload = (await verifyCompactJws(
+        reverted.eventJws!,
+        await environment.services.payment.jwks(),
+      )).payload as Record<string, unknown>;
+      assertEquals(payload.type, "payment.reverted.v1");
+      assertEquals(payload.reason, "non_canonical_block");
+      assertEquals(payload.txHash, confirming.transactionHash);
+    } finally {
+      await environment.close();
+    }
+  },
+});
+
 async function requestJson<T>(url: string, init: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   const body = await response.json();
@@ -93,10 +137,13 @@ async function requestJson<T>(url: string, init: RequestInit): Promise<T> {
   return body as T;
 }
 
-function assert(value: unknown): asserts value {
-  if (!value) throw new Error("Expected value to be truthy.");
-}
-
-function assertEquals(actual: unknown, expected: unknown): void {
-  if (actual !== expected) throw new Error(`Expected ${String(expected)}, got ${String(actual)}.`);
+async function requestHandlerJson<T>(
+  handler: (request: Request) => Promise<Response>,
+  url: string,
+  init: RequestInit,
+): Promise<T> {
+  const response = await handler(new Request(url, init));
+  const body = await response.json();
+  if (!response.ok) throw new Error(`Request failed (${response.status}): ${JSON.stringify(body)}`);
+  return body as T;
 }

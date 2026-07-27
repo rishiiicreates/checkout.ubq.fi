@@ -64,6 +64,8 @@ const SEALED_BLOCKS_REQUIRED = 3n;
 const RECONCILIATION_OVERLAP_BLOCKS = 128n;
 const OUTBOX_INITIAL_BACKOFF_MS = 60_000;
 const OUTBOX_MAX_BACKOFF_MS = 24 * 60 * 60 * 1000;
+const AMOUNT_RESERVATION_REUSE_DELAY_MS = RECENTLY_EXPIRED_WINDOW_MS;
+const MAX_AMOUNT_RESERVATION_PROBES = 64;
 
 export type IdGenerator = { next(): string };
 
@@ -109,6 +111,11 @@ type OpenInvoiceIndex = {
 };
 
 type IdempotencyIndex = OpenInvoiceIndex;
+
+type AmountReservation = {
+  invoiceId: string;
+  reservedAt: string;
+};
 
 type LocatorIndex = {
   invoiceId: string;
@@ -301,7 +308,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       const invoiceId = idGenerator.next();
       let candidate = normalizeDiscountStart(discountStart());
 
-      for (let attempts = 0n; attempts < MAX_DISCOUNT_UNITS; attempts++) {
+      for (let attempts = 0; attempts < MAX_AMOUNT_RESERVATION_PROBES; attempts++) {
         const paidAmountUnits = listUnits - candidate;
         const reservationKey = amountReservationKey(
           chainId,
@@ -310,14 +317,24 @@ export function createPaymentService(options: PaymentServiceOptions) {
           paidAmountUnits,
         );
         const [reservation, currentOpen, currentIdempotency] = await Promise.all([
-          kv.get(reservationKey),
+          kv.get<AmountReservation>(reservationKey),
           kv.get<OpenInvoiceIndex>(openKey),
           kv.get<IdempotencyIndex>(idempotencyKeyEntry),
         ]);
         if (currentIdempotency.value || currentOpen.value) break;
+        let reservedInvoice: Deno.KvEntryMaybe<InvoiceRecord> | null = null;
         if (reservation.value !== null) {
-          candidate = nextDiscount(candidate);
-          continue;
+          if (typeof reservation.value.invoiceId !== "string") {
+            candidate = nextDiscount(candidate);
+            continue;
+          }
+          reservedInvoice = await kv.get<InvoiceRecord>(
+            invoiceKey(reservation.value.invoiceId),
+          );
+          if (!reservationCanBeReused(reservedInvoice.value, now)) {
+            candidate = nextDiscount(candidate);
+            continue;
+          }
         }
 
         const timestamp = now.toISOString();
@@ -347,18 +364,19 @@ export function createPaymentService(options: PaymentServiceOptions) {
           updatedAt: timestamp,
         };
         const index: OpenInvoiceIndex = { invoiceId, requestFingerprint };
-        const committed = await kv.atomic()
+        let atomic = kv.atomic()
           .check(versionEntry)
           .check(chainSettingsEntry)
           .check(reservation)
           .check(currentOpen)
           .check(currentIdempotency)
-          .set(reservationKey, { invoiceId, reservedAt: timestamp })
+          .set(reservationKey, { invoiceId, reservedAt: timestamp } satisfies AmountReservation)
           .set(invoiceKey(invoiceId), record)
           .set(invoiceByChainKey(chainId, invoiceId), invoiceId)
           .set(openKey, index)
-          .set(idempotencyKeyEntry, index)
-          .commit();
+          .set(idempotencyKeyEntry, index);
+        if (reservedInvoice) atomic = atomic.check(reservedInvoice);
+        const committed = await atomic.commit();
         if (committed.ok) return invoiceJson(record);
         continue creationLoop;
       }
@@ -849,7 +867,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       kv.atomic().check(invoiceEntry).check(paymentEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
         .set(paymentKey(payment.id), nextPayment)
-        .delete(invoiceByChainKey(invoice.chainId, invoice.id)),
+        .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id),
       event,
     );
     if (openEntry.value?.invoiceId === invoice.id) atomic = atomic.check(openEntry).delete(openKey);
@@ -958,13 +976,13 @@ export function createPaymentService(options: PaymentServiceOptions) {
   }
 
   async function signedExistingEvent(invoiceId: string): Promise<string | undefined> {
-    for (
-      const type of [
-        "payment.reverted.v1",
-        "payment.settled.v1",
-        "payment.accepted.v1",
-      ] as const
-    ) {
+    const invoice = await invoiceRecord(kv, invoiceId);
+    const types: PaymentEventType[] = invoice.status === "reverted"
+      ? ["payment.reverted.v1"]
+      : invoice.status === "settled" || invoice.status === "finalized"
+      ? ["payment.settled.v1", "payment.accepted.v1"]
+      : ["payment.accepted.v1"];
+    for (const type of types) {
       const eventId = (await kv.get<string>(eventByInvoiceKey(invoiceId, type))).value;
       if (!eventId) continue;
       const event = (await kv.get<DeliveryEventRecord>(eventKey(eventId))).value;
@@ -1028,7 +1046,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
       ))).flat();
       for (const log of logs) {
         const invoice = watch.invoices.find((candidate) =>
-          !candidate.paymentId && candidate.minimumBlock <= log.blockNumber &&
+          (!candidate.paymentId || candidate.status === "reverted") &&
+          candidate.minimumBlock <= log.blockNumber &&
           candidate.tokenAddress.toLowerCase() === log.tokenAddress.toLowerCase() &&
           candidate.treasuryAddress.toLowerCase() === log.recipientAddress.toLowerCase() &&
           candidate.paidAmountUnits === log.amountUnits
@@ -1083,6 +1102,7 @@ export async function listReconciliationInvoices(
     }
     if (
       isOpenInvoiceStatus(invoice.status) || invoice.status === "confirming" ||
+      invoice.status === "reverted" ||
       (invoice.status === "expired" && Date.parse(invoice.expiredAt ?? invoice.updatedAt) >= cutoff)
     ) {
       invoices.push(invoice);
@@ -1320,6 +1340,12 @@ function nextDiscount(value: bigint): bigint {
 function randomDiscountStart(): bigint {
   const value = crypto.getRandomValues(new Uint32Array(1))[0];
   return BigInt(value % Number(MAX_DISCOUNT_UNITS)) + 1n;
+}
+
+function reservationCanBeReused(invoice: InvoiceRecord | null, now: Date): boolean {
+  if (!invoice) return true;
+  if (invoice.status !== "finalized" || !invoice.finalizedAt) return false;
+  return Date.parse(invoice.finalizedAt) + AMOUNT_RESERVATION_REUSE_DELAY_MS <= now.getTime();
 }
 
 function decimalBigint(value: unknown, code: string): bigint {

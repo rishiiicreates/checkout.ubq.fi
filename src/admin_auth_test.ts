@@ -49,6 +49,33 @@ Deno.test("first Auth Hub admin atomically claims the Checkout owner", async () 
   });
 });
 
+Deno.test("the owner can invite an Auth Hub handle that atomically becomes a member", async () => {
+  await withKv(async (kv) => {
+    await claimOrLoadMembership(
+      kv,
+      claims({ sub: "owner", handle: "owner", isAdmin: true }),
+      () => NOW,
+    );
+    const service = createAdminAuthService(kv, { now: () => NOW + 1_000 });
+    const ownerRequest = new Request("http://localhost:8000/api/v1/admin/members/invitee", {
+      headers: { [LOCAL_PEER_HEADER]: "127.0.0.1" },
+    });
+    const granted = await service.upsertMember(ownerRequest, "Invitee", "admin");
+    assertEquals("invitation" in granted, true);
+    assertEquals((await service.listInvitations(ownerRequest)).length, 1);
+
+    const member = await claimOrLoadMembership(
+      kv,
+      claims({ sub: "invited-user", handle: "invitee", isAdmin: false }),
+      () => NOW + 2_000,
+    );
+    assertEquals(member.role, "admin");
+    assertEquals(member.handle, "invitee");
+    assertEquals((await service.listInvitations(ownerRequest)).length, 0);
+    assertEquals((await service.listMembers(ownerRequest)).length, 2);
+  });
+});
+
 Deno.test("login redirects to the registered Checkout Auth Hub client", async () => {
   await withKv((kv) => {
     const service = createAdminAuthService(kv, {

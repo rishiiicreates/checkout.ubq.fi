@@ -23,6 +23,13 @@ export type AdminMember = {
   updatedAt: string;
 };
 
+export type AdminInvitation = {
+  handle: string;
+  role: Exclude<AdminRole, "owner">;
+  invitedAt: string;
+  updatedAt: string;
+};
+
 export type AdminSession = {
   claims: AuthHubClaims;
   member: AdminMember;
@@ -39,6 +46,7 @@ export const LOCAL_PEER_HEADER = "x-uos-checkout-peer-address";
 const PREFIX = ["uos_checkout", "v1", "admin"];
 const OWNER_KEY = [...PREFIX, "owner"];
 const memberKey = (userId: string) => [...PREFIX, "members", userId];
+const invitationKey = (handle: string) => [...PREFIX, "invitations", handle];
 const JWKS_KEY = [...PREFIX, "auth_hub_jwks"];
 const JWKS_REFRESH_COOLDOWN_KEY = [...PREFIX, "auth_hub_jwks_refresh_cooldown"];
 const unknownKidKey = (kid: string) => [...PREFIX, "auth_hub_unknown_kids", kid];
@@ -225,20 +233,46 @@ export function createAdminAuthService(kv: Deno.Kv, options: AdminAuthOptions = 
       }
       return members.sort((a, b) => a.claimedAt.localeCompare(b.claimedAt));
     },
-    async setMemberRole(
-      request: Request,
-      userId: string,
-      role: Exclude<AdminRole, "owner">,
-    ): Promise<AdminMember> {
+    async listInvitations(request: Request): Promise<AdminInvitation[]> {
       await this.requireRole(request, ["owner"]);
-      const entry = await kv.get<AdminMember>(memberKey(userId));
-      if (!entry.value || entry.value.role === "owner") {
-        throw new AdminAuthError(404, "member_not_found");
+      const invitations: AdminInvitation[] = [];
+      for await (
+        const entry of kv.list<AdminInvitation>({ prefix: [...PREFIX, "invitations"] })
+      ) {
+        invitations.push(entry.value);
       }
-      const member = { ...entry.value, role, updatedAt: nowIso(now()) };
-      const result = await kv.atomic().check(entry).set(memberKey(userId), member).commit();
-      if (!result.ok) throw new AdminAuthError(409, "member_changed");
-      return member;
+      return invitations.sort((a, b) => a.invitedAt.localeCompare(b.invitedAt));
+    },
+    async upsertMember(
+      request: Request,
+      handleInput: string,
+      role: Exclude<AdminRole, "owner">,
+    ): Promise<{ member: AdminMember } | { invitation: AdminInvitation }> {
+      await this.requireRole(request, ["owner"]);
+      if (role !== "admin" && role !== "viewer") {
+        throw new AdminAuthError(400, "invalid_member_role");
+      }
+      const handle = normalizeHandle(handleInput);
+      for await (const entry of kv.list<AdminMember>({ prefix: [...PREFIX, "members"] })) {
+        if (entry.value.handle !== handle) continue;
+        if (entry.value.role === "owner") throw new AdminAuthError(409, "owner_role_immutable");
+        const member = { ...entry.value, role, updatedAt: nowIso(now()) };
+        const result = await kv.atomic().check(entry).set(entry.key, member).commit();
+        if (!result.ok) throw new AdminAuthError(409, "member_changed");
+        return { member };
+      }
+
+      const entry = await kv.get<AdminInvitation>(invitationKey(handle));
+      const timestamp = nowIso(now());
+      const invitation: AdminInvitation = {
+        handle,
+        role,
+        invitedAt: entry.value?.invitedAt ?? timestamp,
+        updatedAt: timestamp,
+      };
+      const result = await kv.atomic().check(entry).set(entry.key, invitation).commit();
+      if (!result.ok) throw new AdminAuthError(409, "invitation_changed");
+      return { invitation };
     },
   };
 }
@@ -249,14 +283,37 @@ export async function claimOrLoadMembership(
   now: () => number = Date.now,
 ): Promise<AdminMember> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const [owner, member] = await kv.getMany<[string, AdminMember]>([
+    const handle = normalizeHandle(claims.handle);
+    const [owner, member, invitation] = await kv.getMany<
+      [string, AdminMember, AdminInvitation]
+    >([
       OWNER_KEY,
       memberKey(claims.sub),
+      invitationKey(handle),
     ]);
     if (owner.value) {
-      if (!member.value) throw new AdminAuthError(403, "not_a_checkout_member");
-      if (member.value.handle !== claims.handle) {
-        const updated = { ...member.value, handle: claims.handle, updatedAt: nowIso(now()) };
+      if (!member.value) {
+        if (!invitation.value) throw new AdminAuthError(403, "not_a_checkout_member");
+        const timestamp = nowIso(now());
+        const created: AdminMember = {
+          userId: claims.sub,
+          handle,
+          role: invitation.value.role,
+          claimedAt: timestamp,
+          updatedAt: timestamp,
+        };
+        const result = await kv.atomic()
+          .check(owner)
+          .check(member)
+          .check(invitation)
+          .set(memberKey(claims.sub), created)
+          .delete(invitationKey(handle))
+          .commit();
+        if (result.ok) return created;
+        continue;
+      }
+      if (member.value.handle !== handle) {
+        const updated = { ...member.value, handle, updatedAt: nowIso(now()) };
         const result = await kv.atomic().check(member).set(memberKey(claims.sub), updated).commit();
         if (result.ok) return updated;
         continue;
@@ -268,7 +325,7 @@ export async function claimOrLoadMembership(
     const timestamp = nowIso(now());
     const created: AdminMember = {
       userId: claims.sub,
-      handle: claims.handle,
+      handle,
       role: "owner",
       claimedAt: timestamp,
       updatedAt: timestamp,
@@ -395,6 +452,15 @@ function safeReturnTo(value: string | null, origin: string): string {
   } catch {
     return "/";
   }
+}
+
+function normalizeHandle(value: unknown): string {
+  if (typeof value !== "string") throw new AdminAuthError(400, "invalid_member_handle");
+  const handle = value.trim().toLowerCase();
+  if (!/^[a-z0-9._@-]{1,80}$/u.test(handle)) {
+    throw new AdminAuthError(400, "invalid_member_handle");
+  }
+  return handle;
 }
 
 function readAuthState(request: Request): { state: string; returnTo: string } | null {

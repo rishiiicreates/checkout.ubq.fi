@@ -27,15 +27,24 @@ export type DemoEnvironment = {
   close(): Promise<void>;
 };
 
-export async function createDemoEnvironment(): Promise<DemoEnvironment> {
-  const anvil = new AnvilBaseFork();
-  await anvil.start();
-  const kv = await Deno.openKv(":memory:");
-  const services = createCheckoutServices(kv, { rpc: anvil.rpc });
-  const checkoutHandler = createHandler(services);
-  const transfers = new Map<string, DemoTransferState>();
-  let closed = false;
+type DemoEnvironmentOptions = {
+  anvil?: AnvilBaseFork;
+  openKv?: () => Promise<Deno.Kv>;
+};
+
+export async function createDemoEnvironment(
+  options: DemoEnvironmentOptions = {},
+): Promise<DemoEnvironment> {
+  const anvil = options.anvil ?? new AnvilBaseFork();
+  let kv: Deno.Kv | undefined;
   try {
+    await anvil.start();
+    kv = await (options.openKv ?? (() => Deno.openKv(":memory:")))();
+    const openedKv = kv;
+    const services = createCheckoutServices(openedKv, { rpc: anvil.rpc });
+    const checkoutHandler = createHandler(services);
+    const transfers = new Map<string, DemoTransferState>();
+    let closed = false;
     await services.payment.configureChain(ANVIL_CHAIN_ID, {
       enabled: true,
       treasuryAddress: DEMO_TREASURY_ADDRESS,
@@ -54,61 +63,61 @@ export async function createDemoEnvironment(): Promise<DemoEnvironment> {
         }],
       },
     );
+
+    return {
+      anvil,
+      services,
+      handler: async (request) => {
+        try {
+          const url = new URL(request.url);
+          if (request.method === "GET" || request.method === "HEAD") {
+            const staticResponse = await demoStatic(request.method, url.pathname);
+            if (staticResponse) return staticResponse;
+          }
+          if (url.pathname === "/api/demo/invoices" && request.method === "POST") {
+            anvil.setFinality("network");
+            return await createInvoice(checkoutHandler, request.url);
+          }
+          const invoiceMatch = url.pathname.match(/^\/api\/demo\/invoices\/([^/]+)$/u);
+          if (invoiceMatch && request.method === "GET") {
+            return json(await services.payment.getInvoice(decodeURIComponent(invoiceMatch[1])));
+          }
+          const stepMatch = url.pathname.match(
+            /^\/api\/demo\/invoices\/([^/]+)\/steps\/(transfer|confirm|settle|finalize)$/u,
+          );
+          if (stepMatch && request.method === "POST") {
+            return await advanceInvoice(
+              services,
+              checkoutHandler,
+              anvil,
+              transfers,
+              decodeURIComponent(stepMatch[1]),
+              stepMatch[2],
+              request.url,
+            );
+          }
+          return json({ error: "not_found" }, { status: 404 });
+        } catch (error) {
+          const status = error instanceof DemoConflict ? 409 : 500;
+          if (status === 500) console.error("anvil_demo_request_failed", error);
+          return json(
+            { error: error instanceof Error ? error.message : "demo_internal_error" },
+            { status },
+          );
+        }
+      },
+      async close() {
+        if (closed) return;
+        closed = true;
+        openedKv.close();
+        await anvil.stop();
+      },
+    };
   } catch (error) {
-    kv.close();
+    kv?.close();
     await anvil.stop();
     throw error;
   }
-
-  return {
-    anvil,
-    services,
-    handler: async (request) => {
-      try {
-        const url = new URL(request.url);
-        if (request.method === "GET" || request.method === "HEAD") {
-          const staticResponse = await demoStatic(request.method, url.pathname);
-          if (staticResponse) return staticResponse;
-        }
-        if (url.pathname === "/api/demo/invoices" && request.method === "POST") {
-          anvil.setFinality("network");
-          return await createInvoice(checkoutHandler, request.url);
-        }
-        const invoiceMatch = url.pathname.match(/^\/api\/demo\/invoices\/([^/]+)$/u);
-        if (invoiceMatch && request.method === "GET") {
-          return json(await services.payment.getInvoice(decodeURIComponent(invoiceMatch[1])));
-        }
-        const stepMatch = url.pathname.match(
-          /^\/api\/demo\/invoices\/([^/]+)\/steps\/(transfer|confirm|settle|finalize)$/u,
-        );
-        if (stepMatch && request.method === "POST") {
-          return await advanceInvoice(
-            services,
-            checkoutHandler,
-            anvil,
-            transfers,
-            decodeURIComponent(stepMatch[1]),
-            stepMatch[2],
-            request.url,
-          );
-        }
-        return json({ error: "not_found" }, { status: 404 });
-      } catch (error) {
-        const status = error instanceof DemoConflict ? 409 : 500;
-        if (status === 500) console.error("anvil_demo_request_failed", error);
-        return json(
-          { error: error instanceof Error ? error.message : "demo_internal_error" },
-          { status },
-        );
-      }
-    },
-    async close() {
-      if (closed) return;
-      closed = true;
-      kv.close();
-      await anvil.stop();
-    },
-  };
 }
 
 async function createInvoice(

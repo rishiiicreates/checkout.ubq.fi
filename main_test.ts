@@ -51,6 +51,17 @@ Deno.test("local operator configures Checkout without a bootstrap password", asy
     assert(String(keyBody.token).startsWith("uos_checkout_"));
     assertEquals("tokenHash" in keyBody.key, false);
 
+    const invited = await request("/api/v1/admin/members/operator", {
+      method: "PUT",
+      adminMutation: true,
+      body: { role: "viewer" },
+    });
+    assertEquals(invited.status, 200);
+    assertEquals((await invited.json()).invitation.handle, "operator");
+    const access = await request("/api/v1/admin/members");
+    const accessBody = await access.json();
+    assertEquals(accessBody.invitations.length, 1);
+
     const overview = await request("/api/v1/admin/overview");
     const overviewBody = await overview.json();
     assertEquals(overviewBody.chains.length, 3);
@@ -115,6 +126,37 @@ Deno.test("merchant API publishes an immutable catalog and creates an idempotent
     assertEquals(loaded.status, 200);
     assertEquals((await loaded.json()).id, invoice.id);
   });
+});
+
+Deno.test("reading an invoice never performs expiration writes", async () => {
+  let reads = 0;
+  let expirations = 0;
+  const services = {
+    merchantAuth: {
+      authenticate: () =>
+        Promise.resolve({
+          merchant: { id: "merchant" },
+        }),
+    },
+    payment: {
+      getInvoiceRecord: () => Promise.resolve({ merchant: "merchant" }),
+      getInvoice: () => {
+        reads++;
+        return Promise.resolve({ id: "invoice", status: "awaiting_payment" });
+      },
+      expireInvoice: () => {
+        expirations++;
+        return Promise.resolve({ id: "invoice", status: "expired" });
+      },
+    },
+  } as unknown as CheckoutServices;
+  const response = await createHandler(services)(
+    new Request("https://checkout.ubq.fi/api/v1/invoices/invoice"),
+  );
+  assertEquals(response.status, 200);
+  assertEquals((await response.json()).status, "awaiting_payment");
+  assertEquals(reads, 1);
+  assertEquals(expirations, 0);
 });
 
 Deno.test("public origins cannot forge loopback trust", async () => {
@@ -182,16 +224,19 @@ Deno.test("webhook delivery paginates, isolates failures, forbids redirects, and
           id,
           settlementWebhookUrl: `https://${id}.example/hook`,
         }),
-      validateWebhookTarget: () => Promise.resolve(),
+      resolveWebhookTarget: (url: string) =>
+        Promise.resolve({
+          url: new URL(url),
+          addresses: ["93.184.216.34"],
+        }),
     },
-    fetcher: ((_input: string | URL | Request, init?: RequestInit) => {
-      assertEquals(init?.redirect, "manual");
-      assert(init?.signal instanceof AbortSignal);
+    webhookSender: ((_target, _body, signal) => {
+      assert(signal instanceof AbortSignal);
       const merchantId = attempts.length === 0 ? "poison" : `healthy-${attempts.length}`;
       attempts.push(merchantId);
       if (attempts.length === 1) return Promise.reject(new Error("poison webhook"));
-      return Promise.resolve(new Response(null, { status: 204 }));
-    }) as typeof fetch,
+      return Promise.resolve({ status: 204, ok: true });
+    }) as CheckoutServices["webhookSender"],
   } as unknown as CheckoutServices;
 
   await deliverOutbox(services);

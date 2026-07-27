@@ -1,6 +1,7 @@
 const state = {
   session: null,
   overview: null,
+  access: null,
 };
 
 const signInPanel = document.querySelector('[data-panel="signin"]');
@@ -25,6 +26,7 @@ document.querySelector("[data-copy-key]")?.addEventListener("click", async () =>
   await navigator.clipboard.writeText(value);
   setStatus("Merchant key copied.");
 });
+document.querySelector("[data-member-form]")?.addEventListener("submit", grantMemberAccess);
 
 await refresh();
 
@@ -46,6 +48,12 @@ async function refresh() {
   if (!response.ok) return setStatus(await errorText(response), "error");
   state.overview = await response.json();
   renderOverview();
+  if (role === "owner") {
+    const accessResponse = await fetch("/api/v1/admin/members");
+    if (!accessResponse.ok) return setStatus(await errorText(accessResponse), "error");
+    state.access = await accessResponse.json();
+    renderAccess();
+  }
 }
 
 function applyPermissions(role) {
@@ -55,6 +63,8 @@ function applyPermissions(role) {
   });
   const keyButton = document.querySelector("[data-create-key]");
   if (keyButton) keyButton.hidden = role !== "owner";
+  const membershipSection = document.querySelector("[data-membership-section]");
+  if (membershipSection) membershipSection.hidden = role !== "owner";
 }
 
 function renderOverview() {
@@ -183,6 +193,110 @@ function renderInvoices(invoices) {
     : "<p>No invoices yet.</p>";
 }
 
+async function grantMemberAccess(event) {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  const handleInput = document.querySelector("[data-member-handle]");
+  const handle = handleInput.value.trim();
+  const role = document.querySelector("[data-member-role]").value;
+  if (!handle) return;
+  button.disabled = true;
+  try {
+    let response;
+    try {
+      response = await requestJson(
+        `/api/v1/admin/members/${encodeURIComponent(handle)}`,
+        "PUT",
+        { role },
+      );
+    } catch (error) {
+      return setStatus(`Could not grant access: ${exceptionText(error)}`, "error");
+    }
+    if (!response.ok) return setStatus(await errorText(response), "error");
+    handleInput.value = "";
+    setStatus(`Access granted to ${handle.toLowerCase()}.`);
+    try {
+      await refresh();
+    } catch (error) {
+      setStatus(`Access granted, but refresh failed: ${exceptionText(error)}`, "error");
+    }
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderAccess() {
+  const members = state.access?.members ?? [];
+  const invitations = state.access?.invitations ?? [];
+  const rows = [
+    ...members.map((member) => ({
+      handle: member.handle,
+      role: member.role,
+      detail: member.role === "owner" ? "Initial owner" : "Active member",
+      mutable: member.role !== "owner",
+    })),
+    ...invitations.map((invitation) => ({
+      handle: invitation.handle,
+      role: invitation.role,
+      detail: "Invitation pending",
+      mutable: true,
+    })),
+  ];
+  const root = document.querySelector("[data-member-list]");
+  root.innerHTML = rows.length
+    ? rows.map((row) => `
+      <article data-member-handle="${escapeHtml(row.handle)}">
+        <div><strong>${escapeHtml(row.handle)}</strong><small>${
+      escapeHtml(row.detail)
+    }</small></div>
+        <select
+          aria-label="Role for ${escapeHtml(row.handle)}"
+          data-current-role="${escapeHtml(row.role)}"
+          ${row.mutable ? "" : "disabled"}
+        >
+          <option value="viewer" ${row.role === "viewer" ? "selected" : ""}>Viewer</option>
+          <option value="admin" ${row.role === "admin" ? "selected" : ""}>Admin</option>
+          ${row.role === "owner" ? '<option value="owner" selected>Owner</option>' : ""}
+        </select>
+      </article>
+    `).join("")
+    : "<p>No Checkout operators yet.</p>";
+  root.querySelectorAll("[data-member-handle] select:not(:disabled)").forEach((select) => {
+    select.addEventListener("change", async () => {
+      const handle = select.closest("[data-member-handle]").dataset.memberHandle;
+      const previousRole = select.dataset.currentRole;
+      const requestedRole = select.value;
+      select.disabled = true;
+      try {
+        let response;
+        try {
+          response = await requestJson(
+            `/api/v1/admin/members/${encodeURIComponent(handle)}`,
+            "PUT",
+            { role: requestedRole },
+          );
+        } catch (error) {
+          select.value = previousRole;
+          return setStatus(`Could not update ${handle}: ${exceptionText(error)}`, "error");
+        }
+        if (!response.ok) {
+          select.value = previousRole;
+          return setStatus(await errorText(response), "error");
+        }
+        select.dataset.currentRole = requestedRole;
+        setStatus(`${handle} is now a ${requestedRole}.`);
+        try {
+          await refresh();
+        } catch (error) {
+          setStatus(`${handle} updated, but refresh failed: ${exceptionText(error)}`, "error");
+        }
+      } finally {
+        select.disabled = false;
+      }
+    });
+  });
+}
+
 async function requestJson(path, method, body) {
   return await fetch(path, {
     method,
@@ -198,6 +312,10 @@ function mutationHeaders() {
 async function errorText(response) {
   const body = await response.json().catch(() => ({}));
   return body.error ?? `${response.status}`;
+}
+
+function exceptionText(error) {
+  return error instanceof Error ? error.message : "Request failed.";
 }
 
 function setStatus(message, stateName = "") {

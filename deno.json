@@ -1,4 +1,7 @@
 {
+  "imports": {
+    "@std/assert": "jsr:@std/assert@1.0.19"
+  },
   "tasks": {
     "dev": "deno run --watch --unstable-kv --allow-net --allow-read=public --allow-env=DENO_DEPLOYMENT_ID main.ts",
     "start": "deno run --unstable-kv --allow-net --allow-read=public --allow-env=DENO_DEPLOYMENT_ID main.ts",

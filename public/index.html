@@ -143,6 +143,37 @@
           <div data-key-list></div>
         </section>
 
+        <section data-membership-section aria-labelledby="members-title" hidden>
+          <header data-section-header>
+            <div>
+              <p>App-local access</p>
+              <h2 id="members-title">Checkout operators</h2>
+            </div>
+            <span>Owner managed</span>
+          </header>
+          <form data-member-form>
+            <label>
+              Auth Hub handle
+              <input
+                data-member-handle
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="operator"
+                required
+              >
+            </label>
+            <label>
+              Role
+              <select data-member-role>
+                <option value="viewer">Viewer</option>
+                <option value="admin">Admin</option>
+              </select>
+            </label>
+            <button type="submit">Grant access</button>
+          </form>
+          <div data-member-list></div>
+        </section>
+
         <section aria-labelledby="activity-title">
           <header data-section-header>
             <div>
