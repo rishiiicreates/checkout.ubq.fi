@@ -137,3 +137,16 @@ never falls back to an unrelated shared KV database.
 Canonical production origin: `https://checkout.ubq.fi`
 
 Direct Deno origin: `https://checkout-ubq-fi.ubiquity-dao.deno.net`
+
+## VPS hosting (2026-10-12)
+
+`checkout.ubq.fi` runs on the VPS (`ubiquity-checkout.service`, port 8021) and
+is routed VPS-first with a Deno Deploy fallback by the ubq.fi router. Its
+authoritative state is Deno-KV-shaped but now lives in the UBQ KV service on
+Cloudflare D1: set `CHECKOUT_KV_SERVICE_URL` + `CHECKOUT_KV_SERVICE_TOKEN`
+(hosted), or `CHECKOUT_KV_URL` for a sqlite path / remote KV URL; unset keeps
+the local default. The production signing key was exported intact, so
+previously signed checkout tokens still verify.
+
+VPS environment also sets `PORT=8021` and `CHECKOUT_MAINTENANCE_INTERVAL_MS`
+(3600000) because `Deno.cron` only exists under Deno Deploy.

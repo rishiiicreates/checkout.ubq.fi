@@ -10,6 +10,7 @@ import {
   type MerchantScope,
 } from "./src/merchant_auth.ts";
 import { type CompactJwsSigner, createPersistentJwsSigner, JwsError } from "./src/jws.ts";
+import { UbqKv } from "./src/ubq_kv.ts";
 import { createPaymentService, type PaymentService } from "./src/payment_service.ts";
 import { type InvoiceJson, PaymentDomainError } from "./src/payment_types.ts";
 import { HttpRpcClient, type RpcClient, RpcError, RpcVerificationError } from "./src/rpc.ts";
@@ -463,15 +464,53 @@ class HttpError extends Error {
 }
 
 if (import.meta.main) {
-  const kv = await Deno.openKv();
+  const kv = await openCheckoutKv();
   const services = createCheckoutServices(kv);
   const handler = createHandler(services);
+  const maintenanceIntervalMs = Number(readEnv("CHECKOUT_MAINTENANCE_INTERVAL_MS") ?? "");
   if (Deno.env.get("DENO_DEPLOYMENT_ID")) {
     Deno.cron("hourly checkout reconciliation", "0 * * * *", () => runHourlyMaintenance(services));
+  } else if (Number.isSafeInteger(maintenanceIntervalMs) && maintenanceIntervalMs > 0) {
+    // Hosted runs without Deno.cron (the VPS) keep the same hourly maintenance
+    // by setting CHECKOUT_MAINTENANCE_INTERVAL_MS.
+    setInterval(() => {
+      runHourlyMaintenance(services).catch((error) => {
+        console.error("checkout maintenance failed:", error);
+      });
+    }, maintenanceIntervalMs);
   }
-  Deno.serve((request, info) => {
+  Deno.serve({ port: parsePort(readEnv("PORT")) }, (request, info) => {
     const remoteAddress = info.remoteAddr;
     const peerAddress = "hostname" in remoteAddress ? remoteAddress.hostname : "";
     return handler(withPeerAddress(request, peerAddress));
   });
+}
+
+/**
+ * KV selection, in priority order:
+ * 1. CHECKOUT_KV_SERVICE_URL + CHECKOUT_KV_SERVICE_TOKEN -> the UBQ KV service
+ *    on Cloudflare D1 (the hosted canonical store).
+ * 2. CHECKOUT_KV_URL -> a local sqlite path or a remote Deno KV connect URL.
+ * 3. Unset -> the local Deno default (development and tests).
+ */
+export async function openCheckoutKv(): Promise<Deno.Kv> {
+  const serviceUrl = readEnv("CHECKOUT_KV_SERVICE_URL");
+  const serviceToken = readEnv("CHECKOUT_KV_SERVICE_TOKEN");
+  if (serviceUrl && serviceToken) {
+    return new UbqKv({ url: serviceUrl, token: serviceToken }) as unknown as Deno.Kv;
+  }
+  return await Deno.openKv(readEnv("CHECKOUT_KV_URL"));
+}
+
+function readEnv(name: string): string | undefined {
+  try {
+    return Deno.env.get(name)?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parsePort(raw: string | undefined): number {
+  const parsed = Number.parseInt(raw ?? "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : 8000;
 }
