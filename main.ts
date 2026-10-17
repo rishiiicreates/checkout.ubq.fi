@@ -238,6 +238,12 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
     const invoiceId = decodeURIComponent(claimMatch[1]);
     await requireMerchantInvoice(services, principal.merchant.id, invoiceId);
     const body = await requestJson(request);
+    const keys = Object.keys(body);
+    if (keys.length === 0) return json(await services.payment.discoverPayment(invoiceId));
+    const locatorKeys = ["transactionHash", "logIndex", "observedBlockNumber", "observedBlockHash"];
+    if (keys.length !== locatorKeys.length || keys.some((key) => !locatorKeys.includes(key))) {
+      throw new HttpError(400, "invalid_claim_input");
+    }
     return json(
       await services.payment.claimPayment(invoiceId, {
         transactionHash: body.transactionHash,

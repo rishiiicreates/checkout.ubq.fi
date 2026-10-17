@@ -513,6 +513,86 @@ Deno.test("reconciliation cursor advances only after a complete worker range", a
   });
 });
 
+Deno.test("discovery claims one invoice, keeps the cursor, and is idempotent after payment", async () => {
+  await withService(async ({ service, rpc, kv, clock }) => {
+    await service.publishCatalogVersion(
+      { merchantId: MERCHANT },
+      "prices",
+      catalog([product("pack", 100)]),
+    );
+    const invoice = await service.createInvoice(context("discovery"), {
+      customerReference: "discovery",
+      pricingVersionId: "prices",
+      productId: "pack",
+      chainId: 8453,
+    });
+    const cursorKey = ["uos_checkout", "v1", "payments", "reconciliation_cursors", 8453];
+    const cursor = { chainId: 8453, blockNumber: 5n, updatedAt: clock.now().toISOString() };
+    await kv.set(cursorKey, cursor);
+    rpc.setHeads(103n, null, null);
+    const empty = await service.discoverPayment(invoice.id);
+    assertEquals(empty.invoice, invoice);
+    assertEquals(empty.discovery, { found: false, searchedToBlock: "103" });
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash: hash(70),
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    const paid = await service.discoverPayment(invoice.id);
+    assertEquals(paid.invoice.status, "provisionally_paid");
+    assertEquals(paid.discovery, { found: true, searchedToBlock: "103" });
+    assert(paid.eventJws);
+    const again = await service.discoverPayment(invoice.id);
+    assertEquals(again.invoice, paid.invoice);
+    assertEquals(again.discovery, { found: true });
+    assertEquals((await service.listOutbox()).length, 1);
+    assertEquals((await kv.get<typeof cursor>(cursorKey)).value?.blockNumber, 5n);
+  });
+});
+
+Deno.test("discovery rejects nonmatching transfers and uses the coherent safe/latest head", async () => {
+  await withService(async ({ service, rpc, clock }) => {
+    await service.publishCatalogVersion(
+      { merchantId: MERCHANT },
+      "prices",
+      catalog([product("pack", 100)]),
+    );
+    const invoice = await service.createInvoice(context("discovery-wrong"), {
+      customerReference: "discovery-wrong",
+      pricingVersionId: "prices",
+      productId: "pack",
+      chainId: 8453,
+    });
+    const record = await service.getInvoiceRecord(invoice.id);
+    for (
+      const [index, changed] of [
+        { ...record, paidAmountUnits: record.paidAmountUnits + 1n },
+        { ...record, tokenAddress: `0x${"77".repeat(20)}` },
+        { ...record, treasuryAddress: `0x${"77".repeat(20)}` },
+        record,
+      ].entries()
+    ) {
+      rpc.addTransfer(changed, {
+        transactionHash: hash(71 + index),
+        blockNumber: index === 3 ? 99n : 100n,
+        includedAt: clock.now(),
+      });
+    }
+    rpc.setHeads(200n, 190n, 180n);
+    assertEquals((await service.discoverPayment(invoice.id)).discovery, {
+      found: false,
+      searchedToBlock: "190",
+    });
+    rpc.setHeads(99n, null, null);
+    assertEquals((await service.discoverPayment(invoice.id)).discovery, {
+      found: false,
+      searchedToBlock: "99",
+    });
+    assertEquals(await service.getInvoice(invoice.id), invoice);
+    assertEquals((await service.listOutbox()).length, 0);
+  });
+});
+
 Deno.test("hourly reconciliation discovers matching treasury transfers and claims them", async () => {
   await withService(async ({ service, rpc }) => {
     await service.publishCatalogVersion(
@@ -815,6 +895,7 @@ class MockRpc implements RpcClient {
   batch(_chainId: 1 | 10 | 8453, calls: readonly JsonRpcCall[]): Promise<JsonRpcBatchItem[]> {
     if (calls.length === 1 && calls[0].id === "transfer_logs") {
       const filter = calls[0].params[0] as {
+        address: string;
         fromBlock: string;
         toBlock: string;
         topics: [string, null, string];
@@ -823,6 +904,7 @@ class MockRpc implements RpcClient {
       const toBlock = BigInt(filter.toBlock);
       const logs = [...this.#transfers.values()].filter((transfer) =>
         transfer.blockNumber >= fromBlock && transfer.blockNumber <= toBlock &&
+        transfer.tokenAddress.toLowerCase() === filter.address.toLowerCase() &&
         addressTopic(transfer.treasuryAddress) === filter.topics[2]
       ).map(rpcLog);
       return Promise.resolve([{ jsonrpc: "2.0", id: "transfer_logs", result: logs }]);

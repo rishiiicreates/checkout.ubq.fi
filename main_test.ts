@@ -159,6 +159,65 @@ Deno.test("reading an invoice never performs expiration writes", async () => {
   assertEquals(expirations, 0);
 });
 
+Deno.test("claim route accepts discovery or exactly four coordinates and preserves merchant ownership", async () => {
+  let discoveries = 0;
+  let coordinates = 0;
+  let merchant = "merchant";
+  const services = {
+    merchantAuth: {
+      authenticate: (_request: Request, scopes: string[]) => {
+        assertEquals(scopes, ["claim:create"]);
+        return Promise.resolve({ merchant: { id: "merchant" } });
+      },
+    },
+    payment: {
+      getInvoiceRecord: () => Promise.resolve({ merchant }),
+      discoverPayment: () => {
+        discoveries++;
+        return Promise.resolve({
+          invoice: { id: "invoice", status: "awaiting_payment" },
+          discovery: { found: false, searchedToBlock: "100" },
+        });
+      },
+      claimPayment: () => {
+        coordinates++;
+        return Promise.resolve({
+          invoice: { id: "invoice", status: "provisionally_paid" },
+          eventJws: "signed",
+        });
+      },
+    },
+  } as unknown as CheckoutServices;
+  const handler = createHandler(services);
+  const send = (body: unknown) =>
+    handler(
+      new Request("https://checkout.ubq.fi/api/v1/invoices/invoice/claims", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
+  const discovery = await send({});
+  assertEquals(discovery.status, 200);
+  assertEquals((await discovery.json()).discovery, { found: false, searchedToBlock: "100" });
+  const locator = {
+    transactionHash: "tx",
+    logIndex: "0",
+    observedBlockNumber: "100",
+    observedBlockHash: "block",
+  };
+  assertEquals((await send(locator)).status, 200);
+  for (
+    const body of [{ transactionHash: "tx" }, { ...locator, discover: true }, { discover: true }]
+  ) {
+    assertEquals((await send(body)).status, 400);
+  }
+  merchant = "other";
+  assertEquals((await send({})).status, 404);
+  assertEquals(discoveries, 1);
+  assertEquals(coordinates, 1);
+});
+
 Deno.test("public origins cannot forge loopback trust", async () => {
   await withApp(async ({ handler }) => {
     const forged = await handler(

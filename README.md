@@ -123,6 +123,12 @@ All merchant routes use `Authorization: Bearer uos_checkout_…` outside loopbac
 - `POST /api/v1/invoices/:invoiceId/claims`
 - `GET /.well-known/jwks.json`
 
+The claim route accepts `{}` to discover the invoice's transfer on the server, or exactly
+`transactionHash`, `logIndex`, `observedBlockNumber`, and `observedBlockHash` for a wallet receipt.
+Discovery returns the current `invoice`, an `eventJws` when available, and a `discovery` marker with
+`found` and, after a chain search, decimal `searchedToBlock`. A transfer that is not visible yet
+returns HTTP 200 with `found: false`; replaying a paid invoice is idempotent.
+
 Pricing is not pinned to a single launch catalog. The merchant publishes every immutable product
 pricing version it already uses, and each invoice records that version plus its canonical digest.
 Checkout stores price identity; the merchant remains authoritative for credits and access
@@ -140,13 +146,12 @@ Direct Deno origin: `https://checkout-ubq-fi.ubiquity-dao.deno.net`
 
 ## VPS hosting (2026-10-12)
 
-`checkout.ubq.fi` runs on the VPS (`ubiquity-checkout.service`, port 8021) and
-is routed VPS-first with a Deno Deploy fallback by the ubq.fi router. Its
-authoritative state is Deno-KV-shaped but now lives in the UBQ KV service on
-Cloudflare D1: set `CHECKOUT_KV_SERVICE_URL` + `CHECKOUT_KV_SERVICE_TOKEN`
-(hosted), or `CHECKOUT_KV_URL` for a sqlite path / remote KV URL; unset keeps
-the local default. The production signing key was exported intact, so
-previously signed checkout tokens still verify.
+`checkout.ubq.fi` runs on the VPS (`ubiquity-checkout.service`, port 8021) and is routed VPS-first
+with a Deno Deploy fallback by the ubq.fi router. Its authoritative state is Deno-KV-shaped but now
+lives in the UBQ KV service on Cloudflare D1: set `CHECKOUT_KV_SERVICE_URL` +
+`CHECKOUT_KV_SERVICE_TOKEN` (hosted), or `CHECKOUT_KV_URL` for a sqlite path / remote KV URL; unset
+keeps the local default. The production signing key was exported intact, so previously signed
+checkout tokens still verify.
 
-VPS environment also sets `PORT=8021` and `CHECKOUT_MAINTENANCE_INTERVAL_MS`
-(3600000) because `Deno.cron` only exists under Deno Deploy.
+VPS environment also sets `PORT=8021` and `CHECKOUT_MAINTENANCE_INTERVAL_MS` (3600000) because
+`Deno.cron` only exists under Deno Deploy.

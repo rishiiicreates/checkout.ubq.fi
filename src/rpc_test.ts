@@ -133,6 +133,32 @@ Deno.test("reconciliation log discovery is constrained by token and indexed trea
   assertEquals(filter.topics, [TRANSFER_TOPIC, null, addressTopic(RECIPIENT)]);
 });
 
+Deno.test("discovery chunks long ranges and bisects provider range limits without gaps", async () => {
+  const successful: [bigint, bigint][] = [];
+  const client: RpcClient = {
+    batch: (_chainId, calls) => {
+      const range = calls[0].params[0] as { fromBlock: string; toBlock: string };
+      const from = BigInt(range.fromBlock);
+      const to = BigInt(range.toBlock);
+      if (to - from >= 300n) {
+        return Promise.resolve([{
+          jsonrpc: "2.0",
+          id: "transfer_logs",
+          error: { code: -32005, message: "block range limit exceeded" },
+        }]);
+      }
+      successful.push([from, to]);
+      return Promise.resolve([{ jsonrpc: "2.0", id: "transfer_logs", result: [] }]);
+    },
+  };
+  assertEquals(await discoverTransferLogs(client, 8453, TOKEN, RECIPIENT, 100n, 2_600n), []);
+  assertEquals(successful[0][0], 100n);
+  assertEquals(successful.at(-1)![1], 2_600n);
+  for (let index = 1; index < successful.length; index++) {
+    assertEquals(successful[index][0], successful[index - 1][1] + 1n);
+  }
+});
+
 function expected() {
   return {
     transactionHash: TRANSACTION_HASH,

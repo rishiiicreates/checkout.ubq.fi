@@ -153,6 +153,47 @@ export async function discoverTransferLogs(
   toBlock: bigint,
 ): Promise<DiscoveredTransferLog[]> {
   if (fromBlock < 0n || toBlock < fromBlock) throw new RpcError("invalid_log_range");
+  const logs: DiscoveredTransferLog[] = [];
+  // Bound provider range/response sizes for long-lived invoices. Smaller provider
+  // limits are handled by bisecting failed ranges down to a single block.
+  for (let start = fromBlock; start <= toBlock; start += 1_000n) {
+    const end = start + 999n < toBlock ? start + 999n : toBlock;
+    logs.push(...await discoverRange(start, end));
+  }
+  return logs;
+
+  async function discoverRange(start: bigint, end: bigint): Promise<DiscoveredTransferLog[]> {
+    try {
+      return await discoverTransferLogChunk(
+        client,
+        chainId,
+        tokenAddressInput,
+        recipientAddressInput,
+        start,
+        end,
+      );
+    } catch (error) {
+      if (
+        !(error instanceof RpcError) || start === end ||
+        !error.code.startsWith("rpc_upstream_error:transfer_logs:") ||
+        !/range|limit|too many|response size|maximum|exceed/i.test(error.code)
+      ) {
+        throw error;
+      }
+      const middle = (start + end) / 2n;
+      return [...await discoverRange(start, middle), ...await discoverRange(middle + 1n, end)];
+    }
+  }
+}
+
+async function discoverTransferLogChunk(
+  client: RpcClient,
+  chainId: SupportedChainId,
+  tokenAddressInput: string,
+  recipientAddressInput: string,
+  fromBlock: bigint,
+  toBlock: bigint,
+): Promise<DiscoveredTransferLog[]> {
   const tokenAddress = normalizeAddress(tokenAddressInput);
   const recipientAddress = normalizeAddress(recipientAddressInput);
   const calls: JsonRpcCall[] = [{
@@ -199,7 +240,7 @@ export async function discoverTransferLogs(
       recipientAddress: discoveredRecipient,
       amountUnits: parseWord(log.data, "invalid_transfer_amount"),
     };
-  });
+  }).filter((log) => log.blockNumber >= fromBlock && log.blockNumber <= toBlock);
 }
 
 export async function verifyTransferBatch(

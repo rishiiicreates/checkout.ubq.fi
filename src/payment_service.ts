@@ -35,6 +35,7 @@ import {
 } from "./payment_types.ts";
 import {
   chainHeads,
+  type DiscoveredTransferLog,
   discoverTransferLogs,
   latestBlockNumber,
   type RpcClient,
@@ -103,6 +104,7 @@ export type ClaimPaymentInput = {
 export type ClaimPaymentResult = {
   invoice: InvoiceJson;
   eventJws?: string;
+  discovery?: { found: boolean; searchedToBlock?: string };
 };
 
 type OpenInvoiceIndex = {
@@ -179,6 +181,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     listInvoices: (limit?: number) => listInvoices(kv, limit),
     getInvoiceRecord: (invoiceId: unknown) => invoiceRecord(kv, invoiceId),
     claimPayment: (invoiceId: unknown, input: ClaimPaymentInput) => claimPayment(invoiceId, input),
+    discoverPayment: (invoiceId: unknown) => discoverPayment(invoiceId),
     refreshInvoice: (invoiceId: unknown) => refreshInvoice(invoiceId),
     expireInvoice: (invoiceId: unknown) => expireInvoice(invoiceId),
     markManualReview: (invoiceId: unknown) => markManualReview(invoiceId),
@@ -387,6 +390,51 @@ export function createPaymentService(options: PaymentServiceOptions) {
       if (racedOpen.value) continue;
       throw new PaymentDomainError("amount_space_exhausted");
     }
+  }
+
+  async function discoverPayment(invoiceIdInput: unknown): Promise<ClaimPaymentResult> {
+    const invoice = await invoiceRecord(kv, invoiceIdInput);
+    if (invoice.paymentId && invoice.status !== "reverted") {
+      return {
+        invoice: invoiceJson(invoice),
+        eventJws: await signedExistingEvent(invoice.id),
+        discovery: { found: true },
+      };
+    }
+    const heads = await chainHeads(rpc, invoice.chainId);
+    const toBlock = heads.safeBlock ?? heads.finalizedBlock ?? heads.latestBlock;
+    const logs = toBlock < invoice.minimumBlock ? [] : await discoverTransferLogs(
+      rpc,
+      invoice.chainId,
+      invoice.tokenAddress,
+      invoice.treasuryAddress,
+      invoice.minimumBlock,
+      toBlock,
+    );
+    for (const log of logs) {
+      if (!invoiceMatchesTransfer(invoice, log)) continue;
+      try {
+        const result = await claimPayment(invoice.id, {
+          transactionHash: log.transactionHash,
+          logIndex: log.logIndex.toString(),
+          observedBlockNumber: log.blockNumber.toString(),
+          observedBlockHash: log.blockHash,
+        });
+        return { ...result, discovery: { found: true, searchedToBlock: toBlock.toString() } };
+      } catch (error) {
+        if (isSkippableDiscoveryError(error)) continue;
+        throw error;
+      }
+    }
+    const current = await invoiceRecord(kv, invoice.id);
+    return {
+      invoice: invoiceJson(current),
+      eventJws: current.paymentId ? await signedExistingEvent(invoice.id) : undefined,
+      discovery: {
+        found: !!current.paymentId && current.status !== "reverted",
+        searchedToBlock: toBlock.toString(),
+      },
+    };
   }
 
   async function claimPayment(
@@ -1045,13 +1093,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         )
       ))).flat();
       for (const log of logs) {
-        const invoice = watch.invoices.find((candidate) =>
-          (!candidate.paymentId || candidate.status === "reverted") &&
-          candidate.minimumBlock <= log.blockNumber &&
-          candidate.tokenAddress.toLowerCase() === log.tokenAddress.toLowerCase() &&
-          candidate.treasuryAddress.toLowerCase() === log.recipientAddress.toLowerCase() &&
-          candidate.paidAmountUnits === log.amountUnits
-        );
+        const invoice = watch.invoices.find((candidate) => invoiceMatchesTransfer(candidate, log));
         if (!invoice) continue;
         try {
           await claimPayment(invoice.id, {
@@ -1061,12 +1103,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
             observedBlockHash: log.blockHash,
           });
         } catch (error) {
-          if (error instanceof RpcVerificationError) continue;
-          if (
-            error instanceof PaymentDomainError &&
-            (error.code === "payment_locator_already_claimed" ||
-              error.code === "payment_before_minimum_block")
-          ) continue;
+          if (isSkippableDiscoveryError(error)) continue;
           throw error;
         }
       }
@@ -1083,6 +1120,21 @@ export function createPaymentService(options: PaymentServiceOptions) {
       }
     });
   }
+}
+
+function invoiceMatchesTransfer(invoice: InvoiceRecord, log: DiscoveredTransferLog): boolean {
+  return (!invoice.paymentId || invoice.status === "reverted") &&
+    invoice.minimumBlock <= log.blockNumber &&
+    invoice.tokenAddress.toLowerCase() === log.tokenAddress.toLowerCase() &&
+    invoice.treasuryAddress.toLowerCase() === log.recipientAddress.toLowerCase() &&
+    invoice.paidAmountUnits === log.amountUnits;
+}
+
+function isSkippableDiscoveryError(error: unknown): boolean {
+  return error instanceof RpcVerificationError ||
+    (error instanceof PaymentDomainError &&
+      (error.code === "payment_locator_already_claimed" ||
+        error.code === "payment_before_minimum_block"));
 }
 
 export async function listReconciliationInvoices(
