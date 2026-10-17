@@ -438,7 +438,13 @@ export function createPaymentService(options: PaymentServiceOptions) {
           observedBlockNumber: log.blockNumber.toString(),
           observedBlockHash: log.blockHash,
         });
-        return { ...result, discovery: { found: true, searchedToBlock: toBlock.toString() } };
+        return {
+          ...result,
+          discovery: {
+            found: result.invoice.status !== "reverted",
+            searchedToBlock: toBlock.toString(),
+          },
+        };
       } catch (error) {
         if (isSkippableDiscoveryError(error)) continue;
         throw error;
@@ -478,11 +484,12 @@ export function createPaymentService(options: PaymentServiceOptions) {
       : boundedText(input.observedBlockHash, "observed_block_hash", 66);
     const locatorKey = paymentLocatorKey(invoice.chainId, transactionHash, logIndex);
     const existingLocator = await kv.get<LocatorIndex>(locatorKey);
-    if (existingLocator.value) {
-      if (existingLocator.value.invoiceId !== invoice.id) {
-        throw new PaymentDomainError("payment_locator_already_claimed");
-      }
-      if (invoice.status === "reverted") {
+    if (existingLocator.value && existingLocator.value.invoiceId !== invoice.id) {
+      throw new PaymentDomainError("payment_locator_already_claimed");
+    }
+    if (invoice.status === "reverted" && invoice.paymentId) {
+      const payment = await kv.get<PaymentRecord>(paymentKey(invoice.paymentId));
+      if (payment.value?.transactionHash === transactionHash) {
         return reincludeRevertedPayment(
           invoiceEntry,
           existingLocator,
@@ -492,6 +499,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
           observedBlockHash,
         );
       }
+    }
+    if (existingLocator.value) {
       const refreshed = await refreshInvoice(invoice.id);
       if (refreshed.eventJws) return refreshed;
       return { ...refreshed, eventJws: await signedExistingEvent(invoice.id) };
@@ -525,11 +534,25 @@ export function createPaymentService(options: PaymentServiceOptions) {
     observedBlockHash: string | undefined,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
-    if (!invoice.paymentId || locatorEntry.value?.paymentId !== invoice.paymentId) {
+    if (!invoice.paymentId) throw new PaymentDomainError("payment_record_not_found");
+    const paymentEntry = await kv.get<PaymentRecord>(paymentKey(invoice.paymentId));
+    const payment = paymentEntry.value;
+    if (!payment || payment.transactionHash !== transactionHash) {
       throw new PaymentDomainError("payment_record_not_found");
     }
-    const paymentEntry = await kv.get<PaymentRecord>(paymentKey(invoice.paymentId));
-    if (!paymentEntry.value) throw new PaymentDomainError("payment_record_not_found");
+    const locatorChanged = payment.logIndex !== logIndex;
+    if (locatorChanged && locatorEntry.value) {
+      throw new PaymentDomainError("payment_locator_already_claimed");
+    }
+    const previousLocator = locatorChanged
+      ? await kv.get<LocatorIndex>(
+        paymentLocatorKey(invoice.chainId, payment.transactionHash, payment.logIndex),
+      )
+      : locatorEntry;
+    if (
+      previousLocator.value?.invoiceId !== invoice.id ||
+      previousLocator.value?.paymentId !== invoice.paymentId
+    ) throw new PaymentDomainError("payment_record_not_found");
     const evidence = await verifyTransferBatch(rpc, invoice.chainId, {
       transactionHash,
       logIndex,
@@ -594,8 +617,17 @@ export function createPaymentService(options: PaymentServiceOptions) {
       .check(openEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(nextPayment.id), nextPayment)
+      .set(
+        locatorEntry.key,
+        {
+          invoiceId: invoice.id,
+          paymentId: invoice.paymentId,
+          duplicate: false,
+        } satisfies LocatorIndex,
+      )
       .set(headKey(invoice.chainId), heads)
       .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id);
+    if (locatorChanged) atomic = atomic.check(previousLocator).delete(previousLocator.key);
     if (openEntry.value === null) {
       atomic = atomic.set(
         openKey,
@@ -996,7 +1028,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
   }
 
   async function runInvoiceWork(work: WorkRecord): Promise<number | undefined> {
-    const invoice = (await kv.get<InvoiceRecord>(invoiceKey(work.id))).value;
+    const entry = await kv.get<InvoiceRecord>(invoiceKey(work.id));
+    const invoice = entry.value;
     if (!invoice) return undefined;
     const now = clock.now().getTime();
     const expiresAt = Date.parse(invoice.expiresAt);
@@ -1016,24 +1049,32 @@ export function createPaymentService(options: PaymentServiceOptions) {
       }
       return undefined;
     }
+    const discoveryUntil = invoiceDiscoveryDeadline(invoice);
     if (needsPaymentRefresh(invoice)) {
       await refreshInvoice(invoice.id);
-    } else if (
-      (invoice.status === "awaiting_payment" || invoice.status === "reverted") && now < expiresAt
-    ) {
+    } else if (discoveryUntil !== undefined && now < discoveryUntil) {
       await discoverPayment(invoice.id);
     } else {
+      await addInvoiceWork(kv.atomic().check(entry), invoice, now).commit();
       return undefined;
     }
-    const current = await invoiceRecord(kv, invoice.id);
-    if (needsPaymentRefresh(current)) return clock.now().getTime() + 60_000;
-    if (current.status !== "awaiting_payment" && current.status !== "reverted") return undefined;
-    const delays = [2, 5, 10, 20, 30];
+    const currentEntry = await kv.get<InvoiceRecord>(invoiceKey(invoice.id));
+    const current = currentEntry.value!;
+    const currentNow = clock.now().getTime();
+    if (needsPaymentRefresh(current)) return currentNow + 60_000;
+    const deadline = invoiceDiscoveryDeadline(current);
+    if (deadline === undefined || currentNow >= deadline) {
+      await addInvoiceWork(kv.atomic().check(currentEntry), current, currentNow).commit();
+      return undefined;
+    }
+    const delays = current.status === "expired" ? [60, 240] : [2, 5, 10, 20, 30];
     const delay = current.status === "reverted"
       ? 30
       : delays[Math.min(work.attempts, delays.length - 1)];
-    const next = clock.now().getTime() + delay * 60_000;
-    return next < Date.parse(current.expiresAt) ? next : undefined;
+    const next = currentNow + delay * 60_000;
+    return current.status === "awaiting_payment"
+      ? next < deadline ? next : undefined
+      : Math.min(next, deadline);
   }
 
   async function recoverWork(): Promise<void> {
@@ -1619,15 +1660,35 @@ function needsPaymentRefresh(invoice: InvoiceRecord): boolean {
     ["confirming", "provisionally_paid", "settled"].includes(invoice.status);
 }
 
+function invoiceDiscoveryDeadline(invoice: InvoiceRecord): number | undefined {
+  if (invoice.status === "awaiting_payment") return Date.parse(invoice.expiresAt);
+  if (invoice.status === "expired" && !invoice.paymentId) {
+    return Date.parse(invoice.expiredAt ?? invoice.updatedAt) + RECENTLY_EXPIRED_WINDOW_MS;
+  }
+  if (invoice.status === "reverted") {
+    return Date.parse(invoice.revertedAt ?? invoice.updatedAt) + RECENTLY_EXPIRED_WINDOW_MS;
+  }
+}
+
 function invoiceWork(invoice: InvoiceRecord, now: number): { type: WorkType; dueAt: number }[] {
   if (needsPaymentRefresh(invoice)) return [{ type: "reconcile_invoice", dueAt: now + 60_000 }];
   const expiry = Date.parse(invoice.expiresAt);
-  if (invoice.status === "awaiting_payment" || (invoice.status === "reverted" && now < expiry)) {
+  if (invoice.status === "awaiting_payment") {
     return [
       ...(now + 60_000 < expiry
         ? [{ type: "reconcile_invoice" as const, dueAt: now + 60_000 }]
         : []),
       { type: "expire_invoice", dueAt: expiry },
+    ];
+  }
+  const deadline = invoiceDiscoveryDeadline(invoice);
+  if (deadline !== undefined && now < deadline) {
+    const delay = invoice.status === "reverted" ? 30 : 15;
+    return [
+      { type: "reconcile_invoice", dueAt: Math.min(now + delay * 60_000, deadline) },
+      ...(invoice.status === "reverted" && now < expiry
+        ? [{ type: "expire_invoice" as const, dueAt: expiry }]
+        : []),
     ];
   }
   return [];

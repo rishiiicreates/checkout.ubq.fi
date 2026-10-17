@@ -9,6 +9,11 @@ amount/token/treasury/minimum-block predicate and independently verify canonical
 claiming. An absent transfer is a successful response with `discovery.found: false`; an already
 claimed invoice returns its current state and a signed event when available.
 
+Canonical re-inclusion keeps the original payment identity when the same transaction returns at a
+changed log index. The payment update, removal of its old locator, and creation of the empty new
+locator share one atomic commit with checks on both locators. Discovery reports `found: false` while
+the invoice remains reverted, including when another transaction is retained as a duplicate.
+
 Transfer-log queries use at most 1,000 blocks per request and bisect provider range-limit errors.
 This bounds long-invoice scans while retaining the same matching and canonical verification rules.
 
@@ -24,12 +29,20 @@ history. Amount quarantine remains lazy allocation behavior and needs no periodi
 
 Discovery starts after one minute, then backs off by 2, 5, 10, 20, and 30 minutes while the invoice
 is eligible. Confirming, accepted, and safe payments continue refreshing after their original
-deadline until finalized. Reverted payments receive a targeted 30-minute follow-up only before
-expiry. The expiry event makes a final discovery attempt and expires an unpaid invoice even if RPC
-is unavailable; an explicit later claim is the recovery event for delayed visibility, late payment,
-or re-inclusion after expiry. This deliberately replaces the former 24-hour expired-invoice polling
-and indefinite reverted-invoice polling. Finalized invoices had no indefinite reorg monitor in the
-previous job.
+deadline until finalized. The 60-minute expiry event attempts discovery and expires an unpaid
+invoice even if RPC is unavailable. Unpaid expired invoices retain a bounded 24-hour watch from
+`expiredAt` (or `updatedAt` for older records): first after 15 minutes, then one hour, then every
+four hours. Reverted payments retain a 30-minute watch for 24 hours from `revertedAt` (or
+`updatedAt`), including after invoice expiry. Both watches cap their final job at the window end,
+then remove their work and active index. Startup recovers missing jobs while their window remains
+open.
+
+These bounded per-invoice watches are the maintenance backstop for delayed safe-head visibility,
+expiry RPC failures, late payments, and canonical re-inclusion. On-time inclusion can still be
+accepted after expiry; later inclusion is retained as `late_payment` without an accepted event. An
+explicit later claim remains available after the watch ends. This replaces indefinite reverted
+polling and the former hourly sweep; no periodic maintenance runs when no eligible invoice or
+undelivered event remains. Finalized invoices had no indefinite reorg monitor in the previous job.
 
 The hosted D1 adapter has CRUD/list/atomic operations but no native queue methods and no range
 selectors. Its runtime uses a single one-shot timer for the earliest persisted work record, and it

@@ -45,10 +45,14 @@ The customer watcher subscribes to `newHeads` and matching Transfer logs over
 `wss://rpc.ubq.fi/{chainId}`. It queries `safe` once per new head. A 15-second timer is only a dead
 connection watchdog; it is not a polling interval. Durable per-invoice jobs discover payments with
 backoff and refresh confirming, accepted, and safe payments through finalization. Each invoice has
-an expiry event that makes one final discovery attempt before expiring an unpaid invoice. Expired
-invoices and reverted invoices past expiry have no background watch; a later explicit claim can
-still discover a transfer. This replaces the former hourly scan, including its 24-hour watch of
-recently expired invoices.
+an expiry event that attempts discovery before expiring an unpaid invoice at 60 minutes. Unpaid
+expired invoices retain a 24-hour discovery watch from expiration, starting after 15 minutes and
+backing off to one hour and then four hours. Reverted payments retain a 30-minute watch for 24 hours
+from the revert, including past invoice expiry. These bounded per-invoice jobs recover delayed
+on-time payments, flag late payments, and recover the same transaction after canonical re-inclusion
+even if its log index changes. They stop and remove their active index at the window end; a later
+explicit claim remains available. This replaces the former hourly scan and leaves no periodic
+maintenance when idle.
 
 Signed events atomically create delivery work and retry failed webhooks at their persisted due
 times. Duplicate jobs use persisted leases and check delivery state before sending. Delivery is at

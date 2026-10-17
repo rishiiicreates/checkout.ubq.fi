@@ -821,7 +821,7 @@ Deno.test("invoice jobs preserve pending/safe/finalized lifecycle past expiry an
   });
 });
 
-Deno.test("invoice jobs back off, finish at expiry, and later explicit discovery recovers pre-expiry payment", async () => {
+Deno.test("invoice jobs back off through the expired watch window and then stop", async () => {
   await withService(async ({ service, rpc, clock, kv }) => {
     const invoice = await createTestInvoice(service, "job-expiry");
     const queue = invoiceQueue(service, kv, clock);
@@ -834,11 +834,36 @@ Deno.test("invoice jobs back off, finish at expiry, and later explicit discovery
     clock.advance(59 * 60_000);
     await queue.runDue();
     assertEquals((await service.getInvoice(invoice.id)).status, "expired");
+    const followup = (await kv.get<WorkRecord>(workKey("reconcile_invoice", invoice.id))).value!;
+    assertEquals(followup.dueAt, clock.now().getTime() + 15 * 60_000);
+    clock.advance(15 * 60_000);
+    await queue.runDue();
+    const coarseRetry = (await kv.get<WorkRecord>(workKey("reconcile_invoice", invoice.id))).value!;
+    assertEquals(coarseRetry.dueAt, clock.now().getTime() + 60 * 60_000);
+    clock.advance(60 * 60_000);
+    await queue.runDue();
+    const laterRetry = (await kv.get<WorkRecord>(workKey("reconcile_invoice", invoice.id))).value!;
+    assertEquals(laterRetry.dueAt, clock.now().getTime() + 4 * 60 * 60_000);
+    const windowEnd = Date.parse(invoice.expiresAt) + 24 * 60 * 60_000;
+    let scheduled = laterRetry;
+    while (scheduled.dueAt < windowEnd) {
+      clock.advance(scheduled.dueAt - clock.now().getTime());
+      await queue.runDue();
+      scheduled = (await kv.get<WorkRecord>(workKey("reconcile_invoice", invoice.id))).value!;
+    }
+    assertEquals(scheduled.dueAt, windowEnd);
     const callsAtExpiry = rpc.requests;
-    clock.advance(24 * 60 * 60_000);
+    clock.advance(windowEnd - clock.now().getTime());
     await queue.runDue();
     assertEquals(rpc.requests, callsAtExpiry);
     assertEquals((await kv.get(workKey("expire_invoice", invoice.id))).value, null);
+    assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
+    assertEquals(
+      (await kv.get(["uos_checkout", "v1", "payments", "invoices_by_chain", 8453, invoice.id]))
+        .value,
+      null,
+    );
+    await service.recoverWork();
     assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
     rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
       transactionHash: hash(81),
@@ -852,7 +877,7 @@ Deno.test("invoice jobs back off, finish at expiry, and later explicit discovery
   });
 });
 
-Deno.test("expiry event makes its final discovery and transient RPC failure cannot prevent expiration", async () => {
+Deno.test("expiry discovery RPC failure expires the invoice and a follow-up still recovers payment", async () => {
   await withService(async ({ service, rpc, clock, kv }) => {
     const paid = await createTestInvoice(service, "expiry-final-discovery");
     const unpaid = await createTestInvoice(service, "expiry-rpc-failure");
@@ -880,11 +905,20 @@ Deno.test("expiry event makes its final discovery and transient RPC failure cann
     });
     assertEquals((await service.getInvoice(unpaid.id)).status, "expired");
     assertEquals((await kv.get(workKey("expire_invoice", unpaid.id))).value, null);
+    const followup = (await kv.get<WorkRecord>(workKey("reconcile_invoice", unpaid.id))).value!;
+    assertEquals(followup.dueAt, clock.now().getTime() + 15 * 60_000);
+    rpc.addTransfer(await service.getInvoiceRecord(unpaid.id), {
+      transactionHash: hash(85),
+      blockNumber: 100n,
+      includedAt: new Date(Date.parse(unpaid.expiresAt) - 60_000),
+    });
+    clock.advance(15 * 60_000);
     await queue.runDue();
+    assertEquals((await service.getInvoice(unpaid.id)).status, "provisionally_paid");
   });
 });
 
-Deno.test("invoice jobs handle transient evidence and reorgs, reinclude, and stop expired reverted watches", async () => {
+Deno.test("invoice jobs handle reorgs and bound reverted watches from the revert time", async () => {
   await withService(async ({ service, rpc, clock, kv }) => {
     const invoice = await createTestInvoice(service, "job-reorg");
     const queue = invoiceQueue(service, kv, clock);
@@ -915,7 +949,7 @@ Deno.test("invoice jobs handle transient evidence and reorgs, reinclude, and sto
     assertEquals((await service.getInvoice(invoice.id)).status, "reverted");
     rpc.reincludeTransfer(hash(83), 102n);
     rpc.setHeads(105n, null, null);
-    clock.advance(60_000);
+    clock.advance(30 * 60_000);
     await queue.runDue();
     assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
     rpc.reorgTransfer(hash(83));
@@ -924,9 +958,237 @@ Deno.test("invoice jobs handle transient evidence and reorgs, reinclude, and sto
     clock.advance(60 * 60_000);
     await queue.runDue();
     assertEquals((await service.getInvoice(invoice.id)).status, "reverted");
+    assert((await kv.get(workKey("reconcile_invoice", invoice.id))).value);
+    assertEquals((await kv.get(workKey("expire_invoice", invoice.id))).value, null);
+    const revertedAt = (await service.getInvoiceRecord(invoice.id)).revertedAt!;
+    clock.advance(Date.parse(revertedAt) + 24 * 60 * 60_000 - clock.now().getTime());
+    await queue.runDue();
     assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
     assertEquals((await kv.get(workKey("expire_invoice", invoice.id))).value, null);
+    assertEquals(
+      (await kv.get(["uos_checkout", "v1", "payments", "invoices_by_chain", 8453, invoice.id]))
+        .value,
+      null,
+    );
   });
+});
+
+Deno.test("expired watch recovers an on-time payment once the safe head catches up", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "safe-head-expiry");
+    const queue = invoiceQueue(service, kv, clock);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash: hash(91),
+      blockNumber: 105n,
+      includedAt: new Date(Date.parse(invoice.expiresAt) - 60_000),
+    });
+    rpc.setHeads(110n, 99n, null);
+    clock.advance(60 * 60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "expired");
+    assert((await kv.get(workKey("reconcile_invoice", invoice.id))).value);
+    await kv.delete(workKey("reconcile_invoice", invoice.id));
+    await service.recoverWork();
+    const followup = (await kv.get<WorkRecord>(workKey("reconcile_invoice", invoice.id))).value!;
+    assertEquals(followup.dueAt, clock.now().getTime() + 15 * 60_000);
+    rpc.setHeads(115n, 110n, null);
+    clock.advance(followup.dueAt - clock.now().getTime());
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
+    assertEquals((await service.listOutbox()).map((event) => event.type), ["payment.accepted.v1"]);
+  });
+});
+
+Deno.test("expired watch flags a late payment without accepting it", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "late-expired-watch");
+    const queue = invoiceQueue(service, kv, clock);
+    clock.advance(60 * 60_000);
+    await queue.runDue();
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash: hash(92),
+      blockNumber: 105n,
+      includedAt: new Date(Date.parse(invoice.expiresAt) + 60_000),
+    });
+    rpc.setHeads(115n, 110n, null);
+    clock.advance(15 * 60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "late_payment");
+    assertEquals((await service.listOutbox()).length, 0);
+    assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
+    assertEquals(
+      (await kv.get(["uos_checkout", "v1", "payments", "invoices_by_chain", 8453, invoice.id]))
+        .value,
+      null,
+    );
+  });
+});
+
+Deno.test("replacement invoice creation retains the unpaid expired invoice watch", async () => {
+  await withService(async ({ service, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "replacement-watch");
+    clock.advance(60 * 60_000);
+    await service.createInvoice(context("replacement-watch-next"), {
+      customerReference: "replacement-watch",
+      pricingVersionId: "prices",
+      productId: "pack",
+      chainId: 8453,
+    });
+    assertEquals((await service.getInvoice(invoice.id)).status, "expired");
+    const followup = (await kv.get<WorkRecord>(workKey("reconcile_invoice", invoice.id))).value!;
+    assertEquals(followup.dueAt, clock.now().getTime() + 15 * 60_000);
+  });
+});
+
+Deno.test("discovery moves a reverted payment locator when its logIndex changes", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "changed-index-reinclude");
+    const transactionHash = hash(93);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash,
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    await service.claimPayment(invoice.id, claim(transactionHash, 100n));
+    const paymentId = (await service.getInvoiceRecord(invoice.id)).paymentId;
+    rpc.reorgTransfer(transactionHash);
+    await service.refreshInvoice(invoice.id);
+    rpc.reincludeTransfer(transactionHash, 104n, 5);
+    rpc.setHeads(110n, 110n, null);
+    const recovered = await service.discoverPayment(invoice.id);
+    assertEquals(recovered.invoice.status, "provisionally_paid");
+    assertEquals(recovered.discovery?.found, true);
+    assert(recovered.eventJws);
+    assertEquals((await service.getInvoiceRecord(invoice.id)).paymentId, paymentId);
+    const locatorPrefix = [
+      "uos_checkout",
+      "v1",
+      "payments",
+      "payment_locators",
+      8453,
+      transactionHash,
+    ];
+    assertEquals((await kv.get([...locatorPrefix, 0])).value, null);
+    assertEquals((await kv.get([...locatorPrefix, 5])).value, {
+      invoiceId: invoice.id,
+      paymentId,
+      duplicate: false,
+    });
+    const replay = await service.claimPayment(invoice.id, {
+      ...claim(transactionHash, 104n),
+      logIndex: "5",
+    });
+    assert(replay.eventJws);
+    assertEquals((await service.discoverPayment(invoice.id)).discovery?.found, true);
+    assertEquals((await service.listOutbox()).map((event) => event.type), [
+      "payment.accepted.v1",
+      "payment.reverted.v1",
+      "payment.accepted.v1",
+      "payment.settled.v1",
+    ]);
+  });
+});
+
+Deno.test("discovery of a different transaction does not report a reverted invoice recovered", async () => {
+  await withService(async ({ service, rpc, clock }) => {
+    const invoice = await createTestInvoice(service, "unrelated-reverted-transfer");
+    const record = await service.getInvoiceRecord(invoice.id);
+    rpc.addTransfer(record, {
+      transactionHash: hash(94),
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    await service.claimPayment(invoice.id, claim(hash(94), 100n));
+    rpc.reorgTransfer(hash(94));
+    await service.refreshInvoice(invoice.id);
+    rpc.addTransfer(record, {
+      transactionHash: hash(95),
+      blockNumber: 104n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(110n, 110n, null);
+    const result = await service.discoverPayment(invoice.id);
+    assertEquals(result.invoice.status, "reverted");
+    assertEquals(result.discovery?.found, false);
+    assertEquals((await service.discoverPayment(invoice.id)).discovery?.found, false);
+  });
+});
+
+Deno.test("re-inclusion refuses an occupied new locator and preserves the original locator", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "occupied-reinclude-locator");
+    const transactionHash = hash(97);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash,
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    await service.claimPayment(invoice.id, claim(transactionHash, 100n));
+    const paymentId = (await service.getInvoiceRecord(invoice.id)).paymentId;
+    rpc.reorgTransfer(transactionHash);
+    await service.refreshInvoice(invoice.id);
+    rpc.reincludeTransfer(transactionHash, 104n, 5);
+    const locatorPrefix = [
+      "uos_checkout",
+      "v1",
+      "payments",
+      "payment_locators",
+      8453,
+      transactionHash,
+    ];
+    const occupied = { invoiceId: invoice.id, paymentId: "occupied", duplicate: true };
+    await kv.set([...locatorPrefix, 5], occupied);
+    await assertDomainError(
+      () => service.claimPayment(invoice.id, { ...claim(transactionHash, 104n), logIndex: "5" }),
+      "payment_locator_already_claimed",
+    );
+    assertEquals((await kv.get([...locatorPrefix, 0])).value, {
+      invoiceId: invoice.id,
+      paymentId,
+      duplicate: false,
+    });
+    assertEquals((await kv.get([...locatorPrefix, 5])).value, occupied);
+    assertEquals((await service.getInvoice(invoice.id)).status, "reverted");
+  });
+});
+
+Deno.test("queue recovers re-inclusion after expiry for reverts before and after expiry", async () => {
+  for (const revertMinute of [55, 61]) {
+    await withService(async ({ service, rpc, clock, kv }) => {
+      const invoice = await createTestInvoice(service, `post-expiry-revert-${revertMinute}`);
+      const queue = invoiceQueue(service, kv, clock);
+      const transactionHash = hash(96);
+      clock.advance(40 * 60_000);
+      rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+        transactionHash,
+        blockNumber: 100n,
+        includedAt: clock.now(),
+      });
+      rpc.setHeads(103n, 99n, null);
+      await service.claimPayment(invoice.id, claim(transactionHash, 100n));
+      clock.advance((revertMinute - 40) * 60_000);
+      rpc.reorgTransfer(transactionHash);
+      await queue.runDue();
+      assertEquals((await service.getInvoice(invoice.id)).status, "reverted");
+      rpc.reincludeTransfer(transactionHash, 104n, 5);
+      rpc.setHeads(110n, 101n, 99n);
+      clock.advance(10 * 60_000);
+      await queue.runDue();
+      assertEquals((await service.getInvoice(invoice.id)).status, "reverted");
+      rpc.setHeads(120n, 110n, null);
+      const watch = (await kv.get<WorkRecord>(workKey("reconcile_invoice", invoice.id))).value!;
+      clock.advance(watch.dueAt - clock.now().getTime());
+      await queue.runDue();
+      assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
+      assertEquals(
+        (await service.listOutbox()).filter((event) => event.type === "payment.accepted.v1").length,
+        2,
+      );
+    });
+  }
 });
 
 Deno.test("startup recovers pre-cutover invoices/outbox, preserves retries, and prunes orphan indexes", async () => {
@@ -1091,11 +1353,12 @@ class MockRpc implements RpcClient {
     this.#canonicalOverrides.set(transactionHash.toLowerCase(), hash(90_000));
   }
 
-  reincludeTransfer(transactionHash: string, blockNumber: bigint): void {
+  reincludeTransfer(transactionHash: string, blockNumber: bigint, logIndex?: number): void {
     const key = transactionHash.toLowerCase();
     const transfer = this.#transfers.get(key);
     if (!transfer) throw new Error("missing mock transfer");
     transfer.blockNumber = blockNumber;
+    if (logIndex !== undefined) transfer.logIndex = logIndex;
     transfer.blockHash = hash(Number(blockNumber) + 5_000);
     this.#canonicalOverrides.delete(key);
     this.#missingReceipts.delete(key);
