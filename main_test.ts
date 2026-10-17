@@ -7,6 +7,8 @@ import {
 } from "./main.ts";
 import { LOCAL_PEER_HEADER } from "./src/admin_auth.ts";
 import type { JsonRpcBatchItem, JsonRpcCall, RpcClient } from "./src/rpc.ts";
+import { verifyCompactJws } from "./src/jws.ts";
+import { scheduleWork, workKey } from "./src/work_queue.ts";
 
 const TREASURY = "0x1111111111111111111111111111111111111111";
 
@@ -304,6 +306,131 @@ Deno.test("webhook delivery paginates, isolates failures, forbids redirects, and
   assertEquals(delivered.at(-1), "healthy-100");
   assertEquals(attempts.length, 101);
 });
+
+Deno.test("delivery jobs serialize duplicate messages, persist retries, renew JWS, and ignore delivered events", async () => {
+  const kv = await Deno.openKv(":memory:");
+  let now = Date.parse("2026-10-17T12:00:00Z");
+  const bodies: string[] = [];
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const services = createCheckoutServices(kv, {
+    clock: { now: () => new Date(now) },
+    rpc: new StaticRpc(),
+    resolveDns: () => Promise.resolve(["93.184.216.34"]),
+    webhookSender: async (_target, body, signal) => {
+      assert(signal instanceof AbortSignal);
+      bodies.push(body);
+      if (bodies.length === 1) {
+        entered.resolve();
+        await release.promise;
+        return { status: 503, ok: false };
+      }
+      return { status: 204, ok: true };
+    },
+  });
+  try {
+    await services.merchantAuth.upsertMerchant({
+      id: "merchant",
+      name: "Merchant",
+      settlementWebhookUrl: "https://merchant.example/hook",
+    });
+    await seedDelivery(kv, "event", "merchant", now);
+    await services.payment.recoverWork();
+    const running = services.work.runDue();
+    await entered.promise;
+    await services.work.runDue();
+    assertEquals(bodies.length, 1);
+    release.resolve();
+    await running;
+    await services.work.runDue();
+    assertEquals(bodies.length, 1);
+    const retry = await services.payment.getOutboxEvent("event");
+    assertEquals(retry?.deliveryAttempts, 1);
+    assertEquals(retry?.nextAttemptAt, new Date(now + 60_000).toISOString());
+    now += 25 * 60 * 60_000;
+    const restarted = createCheckoutServices(kv, {
+      clock: { now: () => new Date(now) },
+      rpc: new StaticRpc(),
+      resolveDns: () => Promise.resolve(["93.184.216.34"]),
+      webhookSender: (_target, body) => {
+        bodies.push(body);
+        return Promise.resolve({ status: 204, ok: true });
+      },
+    });
+    await restarted.payment.recoverWork();
+    await restarted.work.runDue();
+    assertEquals(bodies.length, 2);
+    const claims = await Promise.all(
+      bodies.map(async (body) =>
+        (await verifyCompactJws(JSON.parse(body).eventJws, await services.payment.jwks()))
+          .payload as Record<string, unknown>
+      ),
+    );
+    assertEquals(claims[0].jti, claims[1].jti);
+    assert(Number(claims[1].iat) > Number(claims[0].iat));
+    assert(Number(claims[1].exp) > Number(claims[0].exp));
+    await scheduleWork(kv.atomic(), "deliver_event", "event", now, now).commit();
+    await restarted.work.runDue();
+    assertEquals(bodies.length, 2);
+    assertEquals((await kv.get(workKey("deliver_event", "event"))).value, null);
+  } finally {
+    release.resolve();
+    kv.close();
+  }
+});
+
+Deno.test("poison delivery jobs do not block healthy events and future retries are not due", async () => {
+  const kv = await Deno.openKv(":memory:");
+  const now = Date.parse("2026-10-17T12:00:00Z");
+  let sends = 0;
+  const services = createCheckoutServices(kv, {
+    clock: { now: () => new Date(now) },
+    rpc: new StaticRpc(),
+    resolveDns: () => Promise.resolve(["93.184.216.34"]),
+    webhookSender: () => {
+      sends++;
+      return Promise.resolve({ status: 204, ok: true });
+    },
+  });
+  try {
+    await services.merchantAuth.upsertMerchant({
+      id: "healthy",
+      name: "Healthy",
+      settlementWebhookUrl: "https://healthy.example/hook",
+    });
+    await seedDelivery(kv, "poison", "missing", now);
+    await seedDelivery(kv, "healthy", "healthy", now);
+    await services.payment.recoverWork();
+    await services.work.runDue();
+    assertEquals(sends, 1);
+    assertEquals((await services.payment.getOutboxEvent("poison"))?.deliveryAttempts, 1);
+    assertEquals(await services.payment.getOutboxEvent("healthy"), null);
+    assertEquals((await services.payment.listOutbox()).length, 0);
+  } finally {
+    kv.close();
+  }
+});
+
+async function seedDelivery(
+  kv: Deno.Kv,
+  id: string,
+  merchantId: string,
+  now: number,
+): Promise<void> {
+  await kv.set(["uos_checkout", "v1", "payments", "events", id], {
+    schemaVersion: 1,
+    id,
+    invoiceId: "invoice",
+    paymentId: "payment",
+    type: "payment.accepted.v1",
+    payload: { merchantId, invoiceId: "invoice", jti: id },
+    compactJws: "stale",
+    createdAt: new Date(now).toISOString(),
+    deliveryAttempts: 0,
+    nextAttemptAt: new Date(now).toISOString(),
+  });
+  await kv.set(["uos_checkout", "v1", "payments", "outbox", now, id], id);
+}
 
 async function withApp(
   run: (

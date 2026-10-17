@@ -11,3 +11,51 @@ claimed invoice returns its current state and a signed event when available.
 
 Transfer-log queries use at most 1,000 blocks per request and bisect provider range-limit errors.
 This bounds long-invoice scans while retaining the same matching and canonical verification rules.
+
+## 2026-10-17: durable event-driven maintenance
+
+Invoice creation atomically records discovery and expiry work in the authoritative store. Payment
+transitions atomically retain confirmation work until finalization, and event writes atomically
+record webhook work. Work uses stable per-target keys, compare-and-swap leases, persisted retry
+times, and recovery of abandoned leases. Startup recovers existing active invoice indexes and
+undelivered outbox indexes once, preserving retries; terminal transitions and recovery prune only
+work/index entries, never invoices, payment locators, amount reservations, events, or idempotency
+history. Amount quarantine remains lazy allocation behavior and needs no periodic sweep.
+
+Discovery starts after one minute, then backs off by 2, 5, 10, 20, and 30 minutes while the invoice
+is eligible. Confirming, accepted, and safe payments continue refreshing after their original
+deadline until finalized. Reverted payments receive a targeted 30-minute follow-up only before
+expiry. The expiry event makes a final discovery attempt and expires an unpaid invoice even if RPC
+is unavailable; an explicit later claim is the recovery event for delayed visibility, late payment,
+or re-inclusion after expiry. This deliberately replaces the former 24-hour expired-invoice polling
+and indefinite reverted-invoice polling. Finalized invoices had no indefinite reorg monitor in the
+previous job.
+
+The hosted D1 adapter has CRUD/list/atomic operations but no native queue methods and no range
+selectors. Its runtime uses a single one-shot timer for the earliest persisted work record, and it
+has no timer or store scan while idle. Genuine Deno KV additionally receives wake messages in the
+same atomic operation as domain/job writes so suspended instances can wake. Local native queue tests
+prove the API behavior; deployed isolate scheduling remains untested. No extra infrastructure or
+environment setting is required, and the former cron and interval entrypoints are removed.
+
+Webhook work rereads the event after acquiring its lease, signs a fresh JWS with stable event
+identity, and retires delivery only after a saved success. Failures use the existing exponential
+retry from one minute to a 24-hour cap. Ordinary repeated or concurrent jobs do not resend delivered
+events. A crash after a recipient accepts but before the saved acknowledgement can repeat delivery,
+so the merchant must deduplicate by event ID/JWS `jti`.
+
+## 2026-10-17: JSON KV value encoding and conflict handling
+
+The canonical KV service stores generic JSON without interpreting value tags. Checkout now wraps new
+values in a version-one envelope containing a fully tagged tree, including escaped objects/arrays
+and decimal bigint nodes; undefined values are explicit nodes too. Adapter get, getMany, and list
+decode only that outer envelope. Existing plain JSON is returned unchanged, and new tag-shaped
+application objects round-trip as data. Existing Checkout-owned record roots do not use the reserved
+envelope shape; an arbitrary historical JSON value that exactly matched the entire reserved envelope
+would be ambiguous. No guessed legacy bigint format or production conversion is introduced.
+
+An HTTP 200 response with `ok: false` from the atomic endpoint is a normal failed version check,
+matching the service source. The adapter returns that conflict to the caller instead of throwing a
+transport error. This allows durable-job lease contention and existing domain compare-and-swap loops
+to retry correctly. The service protocol and store are unchanged, and acceptance uses an isolated
+fake HTTP implementation of that generic-JSON boundary.

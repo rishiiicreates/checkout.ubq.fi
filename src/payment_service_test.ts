@@ -6,6 +6,7 @@ import {
 } from "./payment_service.ts";
 import { type InvoiceRecord, PaymentDomainError } from "./payment_types.ts";
 import { type JsonRpcBatchItem, type JsonRpcCall, type RpcClient, TRANSFER_TOPIC } from "./rpc.ts";
+import { createWorkQueue, workKey, type WorkRecord } from "./work_queue.ts";
 
 const MERCHANT = "linkedin-scraper-2025";
 const TREASURY = `0x${"44".repeat(20)}`;
@@ -785,6 +786,212 @@ Deno.test("treasury rejects zero and token addresses and events target the invoi
   });
 });
 
+Deno.test("invoice jobs preserve pending/safe/finalized lifecycle past expiry and disabled configuration", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "job-lifecycle");
+    const queue = invoiceQueue(service, kv, clock);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash: hash(80),
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(100n, null, null);
+    await service.configureChain(8453, { enabled: false, treasuryAddress: `0x${"88".repeat(20)}` });
+    clock.advance(60_000);
+    await Promise.all([queue.runDue(), queue.runDue()]);
+    assertEquals((await service.getInvoice(invoice.id)).status, "confirming");
+    assertEquals((await kv.get(workKey("expire_invoice", invoice.id))).value, null);
+    clock.advance(61 * 60_000);
+    rpc.setHeads(103n, 100n, 100n);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
+    clock.advance(60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "settled");
+    clock.advance(60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "finalized");
+    assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
+    const events = [];
+    for await (const entry of kv.list({ prefix: ["uos_checkout", "v1", "payments", "events"] })) {
+      events.push(entry);
+    }
+    assertEquals(events.length, 2);
+    assertEquals((await service.listReconciliationInvoices(8453)).length, 0);
+  });
+});
+
+Deno.test("invoice jobs back off, finish at expiry, and later explicit discovery recovers pre-expiry payment", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "job-expiry");
+    const queue = invoiceQueue(service, kv, clock);
+    rpc.setHeads(103n, null, null);
+    clock.advance(60_000);
+    await queue.runDue();
+    const retry = (await kv.get<WorkRecord>(workKey("reconcile_invoice", invoice.id))).value!;
+    assertEquals(retry.attempts, 1);
+    assertEquals(retry.dueAt, clock.now().getTime() + 2 * 60_000);
+    clock.advance(59 * 60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "expired");
+    const callsAtExpiry = rpc.requests;
+    clock.advance(24 * 60 * 60_000);
+    await queue.runDue();
+    assertEquals(rpc.requests, callsAtExpiry);
+    assertEquals((await kv.get(workKey("expire_invoice", invoice.id))).value, null);
+    assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash: hash(81),
+      blockNumber: 100n,
+      includedAt: new Date("2026-07-21T12:30:00Z"),
+    });
+    const recovered = await service.discoverPayment(invoice.id);
+    assertEquals(recovered.discovery?.found, true);
+    assertEquals(recovered.invoice.status, "provisionally_paid");
+    assert((await kv.get(workKey("reconcile_invoice", invoice.id))).value);
+  });
+});
+
+Deno.test("expiry event makes its final discovery and transient RPC failure cannot prevent expiration", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const paid = await createTestInvoice(service, "expiry-final-discovery");
+    const unpaid = await createTestInvoice(service, "expiry-rpc-failure");
+    const queue = invoiceQueue(service, kv, clock);
+    rpc.addTransfer(await service.getInvoiceRecord(paid.id), {
+      transactionHash: hash(82),
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    clock.advance(60 * 60_000);
+    await service.runInvoiceWork({
+      type: "expire_invoice",
+      id: paid.id,
+      dueAt: clock.now().getTime(),
+      attempts: 0,
+    });
+    assertEquals((await service.getInvoice(paid.id)).status, "provisionally_paid");
+    rpc.failures = 1;
+    await service.runInvoiceWork({
+      type: "expire_invoice",
+      id: unpaid.id,
+      dueAt: clock.now().getTime(),
+      attempts: 0,
+    });
+    assertEquals((await service.getInvoice(unpaid.id)).status, "expired");
+    assertEquals((await kv.get(workKey("expire_invoice", unpaid.id))).value, null);
+    await queue.runDue();
+  });
+});
+
+Deno.test("invoice jobs handle transient evidence and reorgs, reinclude, and stop expired reverted watches", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "job-reorg");
+    const queue = invoiceQueue(service, kv, clock);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash: hash(83),
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(100n, null, null);
+    await service.claimPayment(invoice.id, claim(hash(83), 100n));
+    rpc.hideReceipt(hash(83));
+    clock.advance(60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "confirming");
+    rpc.reincludeTransfer(hash(83), 100n);
+    rpc.reorgTransfer(hash(83));
+    clock.advance(60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "awaiting_payment");
+    rpc.reincludeTransfer(hash(83), 101n);
+    rpc.setHeads(104n, null, null);
+    clock.advance(60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
+    rpc.reorgTransfer(hash(83));
+    clock.advance(60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "reverted");
+    rpc.reincludeTransfer(hash(83), 102n);
+    rpc.setHeads(105n, null, null);
+    clock.advance(60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
+    rpc.reorgTransfer(hash(83));
+    clock.advance(60_000);
+    await queue.runDue();
+    clock.advance(60 * 60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "reverted");
+    assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
+    assertEquals((await kv.get(workKey("expire_invoice", invoice.id))).value, null);
+  });
+});
+
+Deno.test("startup recovers pre-cutover invoices/outbox, preserves retries, and prunes orphan indexes", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "recover-invoice");
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash: hash(84),
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    await service.claimPayment(invoice.id, claim(hash(84), 100n));
+    const [event] = await service.listOutbox();
+    await service.markOutboxFailed(event.id, "offline retry");
+    const job = (await kv.get<WorkRecord>(workKey("deliver_event", event.id))).value!;
+    await kv.set(workKey("deliver_event", event.id), {
+      ...job,
+      attempts: 7,
+      leaseId: "dead",
+      leaseUntil: job.dueAt + 1_000,
+    });
+    await kv.delete(workKey("reconcile_invoice", invoice.id));
+    await kv.set(["uos_checkout", "v1", "payments", "invoices_by_chain", 8453, "orphan"], "orphan");
+    await kv.set(["uos_checkout", "v1", "payments", "outbox", 0, "orphan"], "orphan");
+    await service.recoverWork();
+    await service.recoverWork();
+    const recovered = (await kv.get<WorkRecord>(workKey("deliver_event", event.id))).value!;
+    assertEquals(recovered.attempts, 7);
+    assertEquals(recovered.dueAt, job.dueAt);
+    assertEquals(recovered.leaseId, "dead");
+    assert((await kv.get(workKey("reconcile_invoice", invoice.id))).value);
+    assertEquals((await service.listReconciliationInvoices(8453)).length, 1);
+    assertEquals(
+      (await kv.get(["uos_checkout", "v1", "payments", "outbox", 0, "orphan"])).value,
+      null,
+    );
+    assertEquals((await service.listOutbox()).length, 0);
+  });
+});
+
+async function createTestInvoice(service: PaymentService, key: string) {
+  await service.publishCatalogVersion(
+    { merchantId: MERCHANT },
+    "prices",
+    catalog([product("pack", 100)]),
+  );
+  return service.createInvoice(context(key), {
+    customerReference: key,
+    pricingVersionId: "prices",
+    productId: "pack",
+    chainId: 8453,
+  });
+}
+
+function invoiceQueue(service: PaymentService, kv: Deno.Kv, clock: MutableClock) {
+  return createWorkQueue({
+    kv,
+    clock,
+    handle: (job) =>
+      job.type === "deliver_event"
+        ? Promise.resolve(clock.now().getTime() + 24 * 60 * 60_000)
+        : service.runInvoiceWork(job),
+  });
+}
+
 async function withService(
   fn: (context: {
     service: PaymentService;
@@ -840,6 +1047,8 @@ type MockTransfer = {
 };
 
 class MockRpc implements RpcClient {
+  requests = 0;
+  failures = 0;
   #transfers = new Map<string, MockTransfer>();
   #missingReceipts = new Set<string>();
   #canonicalOverrides = new Map<string, string>();
@@ -893,6 +1102,11 @@ class MockRpc implements RpcClient {
   }
 
   batch(_chainId: 1 | 10 | 8453, calls: readonly JsonRpcCall[]): Promise<JsonRpcBatchItem[]> {
+    this.requests++;
+    if (this.failures > 0) {
+      this.failures--;
+      return Promise.reject(new Error("offline RPC unavailable"));
+    }
     if (calls.length === 1 && calls[0].id === "transfer_logs") {
       const filter = calls[0].params[0] as {
         address: string;

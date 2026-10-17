@@ -43,8 +43,17 @@ late payments are retained for manual review instead of being silently assigned.
 
 The customer watcher subscribes to `newHeads` and matching Transfer logs over
 `wss://rpc.ubq.fi/{chainId}`. It queries `safe` once per new head. A 15-second timer is only a dead
-connection watchdog; it is not a polling interval. One hourly Deno Cron pass backs up normal
-browser-driven claims and webhook delivery without consuming a per-minute free-tier schedule.
+connection watchdog; it is not a polling interval. Durable per-invoice jobs discover payments with
+backoff and refresh confirming, accepted, and safe payments through finalization. Each invoice has
+an expiry event that makes one final discovery attempt before expiring an unpaid invoice. Expired
+invoices and reverted invoices past expiry have no background watch; a later explicit claim can
+still discover a transfer. This replaces the former hourly scan, including its 24-hour watch of
+recently expired invoices.
+
+Signed events atomically create delivery work and retry failed webhooks at their persisted due
+times. Duplicate jobs use persisted leases and check delivery state before sending. Delivery is at
+least once across a crash after the recipient accepts but before its acknowledgement is saved;
+merchants must deduplicate by the stable event ID/JWS `jti`.
 
 ## Local development
 
@@ -153,5 +162,14 @@ lives in the UBQ KV service on Cloudflare D1: set `CHECKOUT_KV_SERVICE_URL` +
 keeps the local default. The production signing key was exported intact, so previously signed
 checkout tokens still verify.
 
-VPS environment also sets `PORT=8021` and `CHECKOUT_MAINTENANCE_INTERVAL_MS` (3600000) because
-`Deno.cron` only exists under Deno Deploy.
+The VPS uses `PORT=8021`. It now recovers eligible invoice and outbox jobs once at startup and uses
+one timer for the earliest persisted job. With no eligible invoices or pending deliveries, no timer
+or periodic KV/RPC scan remains. `CHECKOUT_MAINTENANCE_INTERVAL_MS` is no longer read. Genuine Deno
+KV also receives queue wakeups atomically with state and job writes; the D1 adapter uses the running
+VPS timer and does not require native queue methods or a separate store.
+
+The adapter stores a versioned, fully tagged JSON tree so payment `bigint` values round-trip through
+the generic JSON service. Existing plain JSON is read unchanged. New ordinary objects resembling
+codec tags are escaped as data. The reserved outer codec envelope is not a historical Checkout
+record shape; arbitrary historical JSON matching that entire envelope would be ambiguous. No
+production data migration or deployed-runtime acceptance is implied by the offline adapter tests.

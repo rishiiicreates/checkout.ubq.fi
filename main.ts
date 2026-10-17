@@ -11,6 +11,8 @@ import {
 } from "./src/merchant_auth.ts";
 import { type CompactJwsSigner, createPersistentJwsSigner, JwsError } from "./src/jws.ts";
 import { UbqKv } from "./src/ubq_kv.ts";
+import { type Clock, systemClock } from "./src/payment_catalog.ts";
+import { createWorkQueue, type WorkQueue, type WorkRecord } from "./src/work_queue.ts";
 import { createPaymentService, type PaymentService } from "./src/payment_service.ts";
 import { type InvoiceJson, PaymentDomainError } from "./src/payment_types.ts";
 import { HttpRpcClient, type RpcClient, RpcError, RpcVerificationError } from "./src/rpc.ts";
@@ -36,6 +38,7 @@ export type CheckoutServices = {
   adminAuth: AdminAuthService;
   merchantAuth: MerchantAuthService;
   payment: PaymentService;
+  work: WorkQueue;
   fetcher: typeof fetch;
   webhookSender: (
     target: ResolvedWebhookTarget,
@@ -50,6 +53,7 @@ type CheckoutServiceOptions = {
   signer?: CompactJwsSigner;
   resolveDns?: (hostname: string, recordType: "A" | "AAAA") => Promise<string[]>;
   webhookSender?: CheckoutServices["webhookSender"];
+  clock?: Clock;
 };
 
 export function createCheckoutServices(
@@ -57,8 +61,14 @@ export function createCheckoutServices(
   options: CheckoutServiceOptions = {},
 ): CheckoutServices {
   const fetcher = options.fetch ?? fetch;
-  const signer = options.signer ?? createPersistentJwsSigner(kv);
-  return {
+  const clock = options.clock ?? systemClock;
+  const signer = options.signer ?? createPersistentJwsSigner(kv, clock);
+  const work = createWorkQueue({
+    kv,
+    clock,
+    handle: (job) => handleCheckoutWork(services, job, clock.now().getTime()),
+  });
+  const services: CheckoutServices = {
     kv,
     adminAuth: createAdminAuthService(kv, { fetch: fetcher }),
     merchantAuth: createMerchantAuthService(kv, { resolveDns: options.resolveDns }),
@@ -66,10 +76,14 @@ export function createCheckoutServices(
       kv,
       rpc: options.rpc ?? new HttpRpcClient(fetcher),
       signer,
+      clock,
+      onWork: work.notify,
     }),
+    work,
     fetcher,
     webhookSender: options.webhookSender ?? postPinnedWebhook,
   };
+  return services;
 }
 
 export function createHandler(services: CheckoutServices): (request: Request) => Promise<Response> {
@@ -299,17 +313,36 @@ async function adminOverview(services: CheckoutServices) {
   };
 }
 
-export async function runHourlyMaintenance(services: CheckoutServices): Promise<void> {
-  const chains = await services.payment.listChainConfigurations();
-  for (const chain of chains) {
-    if (chain.revision === 0) continue;
-    try {
-      await services.payment.reconcileHourly(chain.chainId);
-    } catch (error) {
-      console.error("checkout_reconciliation_chain_failed", chain.chainId, error);
-    }
+async function handleCheckoutWork(
+  services: CheckoutServices,
+  job: WorkRecord,
+  now: number,
+): Promise<number | undefined> {
+  if (job.type !== "deliver_event") return services.payment.runInvoiceWork(job);
+  // The queue lease serializes simultaneous messages. Check authoritative
+  // delivery state again before any external side effect.
+  const event = await services.payment.getOutboxEvent(job.id);
+  if (!event) return undefined;
+  if (Date.parse(event.nextAttemptAt) > now) return Date.parse(event.nextAttemptAt);
+  const merchant = await services.merchantAuth.getMerchant(event.payload.merchantId);
+  if (!merchant) {
+    await services.payment.markOutboxFailed(event.id, "merchant_not_found");
+    return undefined;
   }
-  await deliverOutbox(services);
+  try {
+    const target = await services.merchantAuth.resolveWebhookTarget(merchant.settlementWebhookUrl);
+    const response = await services.webhookSender(
+      target,
+      JSON.stringify({ eventJws: event.compactJws }),
+      AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+    );
+    if (response.ok) await services.payment.markOutboxDelivered(event.id);
+    else await services.payment.markOutboxFailed(event.id, `webhook_http_${response.status}`);
+  } catch (error) {
+    await services.payment.markOutboxFailed(event.id, error);
+    console.error("checkout_settlement_webhook_failed", event.id, error);
+  }
+  return undefined;
 }
 
 export async function deliverOutbox(services: CheckoutServices): Promise<void> {
@@ -473,18 +506,7 @@ if (import.meta.main) {
   const kv = await openCheckoutKv();
   const services = createCheckoutServices(kv);
   const handler = createHandler(services);
-  const maintenanceIntervalMs = Number(readEnv("CHECKOUT_MAINTENANCE_INTERVAL_MS") ?? "");
-  if (Deno.env.get("DENO_DEPLOYMENT_ID")) {
-    Deno.cron("hourly checkout reconciliation", "0 * * * *", () => runHourlyMaintenance(services));
-  } else if (Number.isSafeInteger(maintenanceIntervalMs) && maintenanceIntervalMs > 0) {
-    // Hosted runs without Deno.cron (the VPS) keep the same hourly maintenance
-    // by setting CHECKOUT_MAINTENANCE_INTERVAL_MS.
-    setInterval(() => {
-      runHourlyMaintenance(services).catch((error) => {
-        console.error("checkout maintenance failed:", error);
-      });
-    }, maintenanceIntervalMs);
-  }
+  await services.work.start(() => services.payment.recoverWork());
   Deno.serve({ port: parsePort(readEnv("PORT")) }, (request, info) => {
     const remoteAddress = info.remoteAddr;
     const peerAddress = "hostname" in remoteAddress ? remoteAddress.hostname : "";

@@ -7,6 +7,7 @@
  * delete, list, and atomic (check/set/delete/commit). Keys are strings,
  * numbers, or booleans, matching the hub's stored keys.
  */
+import { decodeKvValue, encodeKvValue } from "./kv_value.ts";
 
 export type UbqKvKey = readonly (string | number | boolean)[];
 
@@ -38,7 +39,12 @@ export class UbqKvAtomic {
   }
 
   set(key: UbqKvKey, value: unknown, options?: { expireIn?: number }): this {
-    this.mutations.push({ type: "set", key, value, expireInMs: options?.expireIn });
+    this.mutations.push({
+      type: "set",
+      key,
+      value: encodeKvValue(value),
+      expireInMs: options?.expireIn,
+    });
     return this;
   }
 
@@ -92,7 +98,9 @@ export class UbqKv {
       error?: string;
       message?: string;
     } & Record<string, unknown>;
-    if (!response.ok || payload.ok !== true) {
+    const conflict = path === "/kv/atomic" && response.status === 200 &&
+      payload.ok === false && payload.error === undefined;
+    if (!response.ok || (payload.ok !== true && !conflict)) {
       throw new Error(
         `ubq_kv_request_failed:${path}:${response.status}:${payload.error ?? "unknown"}`,
       );
@@ -120,7 +128,7 @@ export class UbqKv {
   ): Promise<{ ok: true; versionstamp: string }> {
     const result = await this.request<{ versionstamp: string }>("/kv/set", {
       key,
-      value,
+      value: encodeKvValue(value),
       expireInMs: options?.expireIn,
     });
     return { ok: true, versionstamp: result.versionstamp };
@@ -156,7 +164,7 @@ export class UbqKv {
       for (const entry of page.entries) {
         yield {
           key: entry.key,
-          value: entry.value as T,
+          value: decodeKvValue(entry.value) as T,
           versionstamp: entry.versionstamp,
         };
         remaining -= 1;
@@ -174,5 +182,9 @@ export class UbqKv {
 
 function toEntryMaybe<T>(key: UbqKvKey, entry: WireEntry | null): UbqKvEntryMaybe<T> {
   if (!entry) return { key, value: null, versionstamp: null };
-  return { key: entry.key, value: entry.value as T, versionstamp: entry.versionstamp };
+  return {
+    key: entry.key,
+    value: decodeKvValue(entry.value) as T,
+    versionstamp: entry.versionstamp,
+  };
 }

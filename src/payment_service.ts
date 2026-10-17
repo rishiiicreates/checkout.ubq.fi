@@ -43,6 +43,7 @@ import {
   type VerifiedTransfer,
   verifyTransferBatch,
 } from "./rpc.ts";
+import { scheduleWork, workKey, type WorkRecord, type WorkType } from "./work_queue.ts";
 
 const PREFIX: Deno.KvKey = ["uos_checkout", "v1", "payments"];
 const INVOICES_PREFIX: Deno.KvKey = [...PREFIX, "invoices"];
@@ -77,6 +78,7 @@ export type PaymentServiceOptions = {
   clock?: Clock;
   idGenerator?: IdGenerator;
   discountStart?: () => bigint;
+  onWork?: () => void;
 };
 
 export type MerchantContext = {
@@ -155,6 +157,11 @@ export function createPaymentService(options: PaymentServiceOptions) {
   const clock = options.clock ?? systemClock;
   const idGenerator = options.idGenerator ?? { next: () => crypto.randomUUID() };
   const discountStart = options.discountStart ?? randomDiscountStart;
+  async function notifyAfter<T>(operation: Promise<T>): Promise<T> {
+    const result = await operation;
+    options.onWork?.();
+    return result;
+  }
   return {
     publishCatalogVersion: (
       context: MerchantContext,
@@ -176,19 +183,29 @@ export function createPaymentService(options: PaymentServiceOptions) {
       getChainConfiguration(kv, supportedChainId(chainId)),
     listChainConfigurations: () => listChainConfigurations(kv),
     createInvoice: (context: InvoiceCreationContext, input: CreateInvoiceInput) =>
-      createInvoice(context, input),
+      notifyAfter(createInvoice(context, input)),
     getInvoice: async (invoiceId: unknown) => invoiceJson(await invoiceRecord(kv, invoiceId)),
     listInvoices: (limit?: number) => listInvoices(kv, limit),
     getInvoiceRecord: (invoiceId: unknown) => invoiceRecord(kv, invoiceId),
-    claimPayment: (invoiceId: unknown, input: ClaimPaymentInput) => claimPayment(invoiceId, input),
-    discoverPayment: (invoiceId: unknown) => discoverPayment(invoiceId),
-    refreshInvoice: (invoiceId: unknown) => refreshInvoice(invoiceId),
-    expireInvoice: (invoiceId: unknown) => expireInvoice(invoiceId),
-    markManualReview: (invoiceId: unknown) => markManualReview(invoiceId),
+    claimPayment: (invoiceId: unknown, input: ClaimPaymentInput) =>
+      notifyAfter(claimPayment(invoiceId, input)),
+    discoverPayment: (invoiceId: unknown) => notifyAfter(discoverPayment(invoiceId)),
+    refreshInvoice: (invoiceId: unknown) => notifyAfter(refreshInvoice(invoiceId)),
+    expireInvoice: (invoiceId: unknown) => notifyAfter(expireInvoice(invoiceId)),
+    markManualReview: (invoiceId: unknown) => notifyAfter(markManualReview(invoiceId)),
+    recoverWork: () => notifyAfter(recoverWork()),
+    runInvoiceWork,
+    getOutboxEvent: async (eventId: string): Promise<SignedOutboxEvent | null> => {
+      const event = (await kv.get<DeliveryEventRecord>(eventKey(eventId))).value;
+      return !event || event.deliveredAt ? null : {
+        ...event,
+        compactJws: await signEventForDelivery(signer, event, clock.now()),
+      };
+    },
     listOutbox: (limit?: number) => listOutbox(kv, signer, clock, limit),
-    markOutboxDelivered: (eventId: unknown) => markOutboxDelivered(kv, eventId, clock),
+    markOutboxDelivered: (eventId: unknown) => notifyAfter(markOutboxDelivered(kv, eventId, clock)),
     markOutboxFailed: (eventId: unknown, reason: unknown) =>
-      markOutboxFailed(kv, eventId, reason, clock),
+      notifyAfter(markOutboxFailed(kv, eventId, reason, clock)),
     listReconciliationInvoices: (chainId: unknown) =>
       listReconciliationInvoices(kv, supportedChainId(chainId), clock),
     reconcileChainRange: (
@@ -378,6 +395,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
           .set(invoiceByChainKey(chainId, invoiceId), invoiceId)
           .set(openKey, index)
           .set(idempotencyKeyEntry, index);
+        atomic = addInvoiceWork(atomic, record, now.getTime());
         if (reservedInvoice) atomic = atomic.check(reservedInvoice);
         const committed = await atomic.commit();
         if (committed.ok) return invoiceJson(record);
@@ -587,6 +605,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         } satisfies OpenInvoiceIndex,
       );
     }
+    atomic = addInvoiceWork(atomic, nextInvoice, clock.now().getTime());
     if (event) atomic = addEventMutations(atomic, event);
     if (!(await atomic.commit()).ok) {
       return claimPayment(invoice.id, {
@@ -684,6 +703,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     if (includedLate || conflictingOpen) {
       atomic = atomic.delete(invoiceByChainKey(invoice.chainId, invoice.id));
     }
+    atomic = addInvoiceWork(atomic, nextInvoice, now.getTime());
     if (event) atomic = addEventMutations(atomic, event);
     const committed = await atomic.commit();
     if (!committed.ok) {
@@ -743,6 +763,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         locatorKey,
         { invoiceId: invoice.id, paymentId, duplicate: true } satisfies LocatorIndex,
       );
+    atomic = addInvoiceWork(atomic, nextInvoice, clock.now().getTime());
     if (openEntry.value?.invoiceId === invoice.id) atomic = atomic.check(openEntry).delete(openKey);
     const committed = await atomic.commit();
     if (!committed.ok) throw new PaymentDomainError("payment_claim_conflict");
@@ -842,6 +863,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     if (nextInvoice.status === "finalized") {
       atomic = atomic.delete(invoiceByChainKey(invoice.chainId, invoice.id));
     }
+    atomic = addInvoiceWork(atomic, nextInvoice, clock.now().getTime());
     if (event) atomic = addEventMutations(atomic, event);
     const committed = await atomic.commit();
     if (!committed.ok) return refreshInvoice(invoice.id);
@@ -886,6 +908,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       if (expired && openEntry.value?.invoiceId === invoice.id) {
         atomic = atomic.check(openEntry).delete(openKey);
       }
+      atomic = addInvoiceWork(atomic, nextInvoice, clock.now().getTime());
       const committed = await atomic.commit();
       if (!committed.ok) return refreshInvoice(invoice.id);
       return { invoice: invoiceJson(nextInvoice) };
@@ -919,6 +942,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       event,
     );
     if (openEntry.value?.invoiceId === invoice.id) atomic = atomic.check(openEntry).delete(openKey);
+    atomic = addInvoiceWork(atomic, nextInvoice, clock.now().getTime());
     const committed = await atomic.commit();
     if (!committed.ok) return refreshInvoice(invoice.id);
     return { invoice: invoiceJson(nextInvoice), eventJws: event.compactJws };
@@ -962,11 +986,98 @@ export function createPaymentService(options: PaymentServiceOptions) {
       );
       const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
       let atomic = kv.atomic().check(entry).set(invoiceKey(invoiceId), next);
+      atomic = addInvoiceWork(atomic, next, clock.now().getTime());
       atomic = atomic.delete(invoiceByChainKey(entry.value.chainId, invoiceId));
       if (openEntry.value?.invoiceId === invoiceId) {
         atomic = atomic.check(openEntry).delete(openKey);
       }
       if ((await atomic.commit()).ok) return invoiceJson(next);
+    }
+  }
+
+  async function runInvoiceWork(work: WorkRecord): Promise<number | undefined> {
+    const invoice = (await kv.get<InvoiceRecord>(invoiceKey(work.id))).value;
+    if (!invoice) return undefined;
+    const now = clock.now().getTime();
+    const expiresAt = Date.parse(invoice.expiresAt);
+    if (work.type === "expire_invoice") {
+      if (now < expiresAt) return expiresAt;
+      if (invoice.status === "awaiting_payment" || invoice.status === "reverted") {
+        try {
+          await discoverPayment(invoice.id);
+        } catch (error) {
+          console.error("checkout_expiry_discovery_failed", invoice.id, error);
+        }
+        await expireInvoice(invoice.id);
+        const entry = await kv.get<InvoiceRecord>(invoiceKey(invoice.id));
+        if (entry.value?.status === "reverted") {
+          await addInvoiceWork(kv.atomic().check(entry), entry.value, now).commit();
+        }
+      }
+      return undefined;
+    }
+    if (needsPaymentRefresh(invoice)) {
+      await refreshInvoice(invoice.id);
+    } else if (
+      (invoice.status === "awaiting_payment" || invoice.status === "reverted") && now < expiresAt
+    ) {
+      await discoverPayment(invoice.id);
+    } else {
+      return undefined;
+    }
+    const current = await invoiceRecord(kv, invoice.id);
+    if (needsPaymentRefresh(current)) return clock.now().getTime() + 60_000;
+    if (current.status !== "awaiting_payment" && current.status !== "reverted") return undefined;
+    const delays = [2, 5, 10, 20, 30];
+    const delay = current.status === "reverted"
+      ? 30
+      : delays[Math.min(work.attempts, delays.length - 1)];
+    const next = clock.now().getTime() + delay * 60_000;
+    return next < Date.parse(current.expiresAt) ? next : undefined;
+  }
+
+  async function recoverWork(): Promise<void> {
+    // This is a one-time cutover/startup pass over active indexes, not a sweep
+    // that wakes periodically. Existing retry attempts and leases survive it.
+    for await (const indexed of kv.list<string>({ prefix: INVOICES_BY_CHAIN_PREFIX })) {
+      while (true) {
+        const entry = await kv.get<InvoiceRecord>(invoiceKey(indexed.value));
+        if (!entry.value) {
+          await kv.delete(indexed.key);
+          break;
+        }
+        const now = clock.now().getTime();
+        const wanted = invoiceWork(entry.value, now);
+        let atomic = kv.atomic().check(entry);
+        for (const type of ["reconcile_invoice", "expire_invoice"] as const) {
+          const job = await kv.get<WorkRecord>(workKey(type, entry.value.id));
+          atomic = atomic.check(job);
+          const dueAt = wanted.find((item) => item.type === type)?.dueAt;
+          if (dueAt === undefined) atomic = atomic.delete(job.key);
+          else if (!job.value) atomic = scheduleWork(atomic, type, entry.value.id, dueAt, now);
+        }
+        if (wanted.length === 0) atomic = atomic.delete(indexed.key);
+        if ((await atomic.commit()).ok) break;
+      }
+    }
+    for await (const indexed of kv.list<string>({ prefix: OUTBOX_PREFIX })) {
+      while (true) {
+        const entry = await kv.get<DeliveryEventRecord>(eventKey(indexed.value));
+        const job = await kv.get<WorkRecord>(workKey("deliver_event", indexed.value));
+        let atomic = kv.atomic().check(entry).check(job);
+        if (!entry.value || entry.value.deliveredAt) {
+          atomic = atomic.delete(indexed.key).delete(job.key);
+        } else if (!job.value) {
+          atomic = scheduleWork(
+            atomic,
+            "deliver_event",
+            entry.value.id,
+            Date.parse(entry.value.nextAttemptAt ?? entry.value.createdAt),
+            clock.now().getTime(),
+          );
+        }
+        if ((await atomic.commit()).ok) break;
+      }
     }
   }
 
@@ -1176,13 +1287,9 @@ export async function listOutbox(
   }
   const events: SignedOutboxEvent[] = [];
   const now = clock.now();
-  const selector = {
-    start: [...OUTBOX_PREFIX, 0] as Deno.KvKey,
-    end: [...OUTBOX_PREFIX, now.getTime(), "\uffff"] as Deno.KvKey,
-  };
-  for await (const entry of kv.list<string>(selector)) {
+  for await (const entry of kv.list<string>({ prefix: OUTBOX_PREFIX })) {
     const event = (await kv.get<DeliveryEventRecord>(eventKey(entry.value))).value;
-    if (!event || event.deliveredAt) continue;
+    if (!event || event.deliveredAt || Date.parse(event.nextAttemptAt) > now.getTime()) continue;
     events.push({ ...event, compactJws: await signEventForDelivery(signer, event, now) });
     if (events.length === limit) break;
   }
@@ -1202,6 +1309,7 @@ export async function markOutboxDelivered(
     const next = { ...entry.value, deliveredAt: clock.now().toISOString() };
     if (
       (await kv.atomic().check(entry).set(eventKey(eventId), next).delete(outboxKey(entry.value))
+        .delete(workKey("deliver_event", eventId))
         .commit())
         .ok
     ) return next;
@@ -1232,11 +1340,17 @@ export async function markOutboxFailed(
       lastError: boundedDeliveryError(reason),
       nextAttemptAt: new Date(attemptedAt.getTime() + delay).toISOString(),
     };
-    const committed = await kv.atomic().check(entry)
+    const atomic = kv.atomic().check(entry)
       .set(eventKey(eventId), next)
       .delete(outboxKey(entry.value))
-      .set(outboxKey(next), eventId)
-      .commit();
+      .set(outboxKey(next), eventId);
+    const committed = await scheduleWork(
+      atomic,
+      "deliver_event",
+      eventId,
+      Date.parse(next.nextAttemptAt),
+      attemptedAt.getTime(),
+    ).commit();
     if (committed.ok) return next;
   }
 }
@@ -1442,10 +1556,16 @@ function addEventMutations(
   event: OutboxEventRecord,
 ): Deno.AtomicOperation {
   const delivery = event as DeliveryEventRecord;
-  return atomic
-    .set(eventKey(event.id), event)
-    .set(eventByInvoiceKey(event.invoiceId, event.type), event.id)
-    .set(outboxKey(delivery), event.id);
+  return scheduleWork(
+    atomic
+      .set(eventKey(event.id), event)
+      .set(eventByInvoiceKey(event.invoiceId, event.type), event.id)
+      .set(outboxKey(delivery), event.id),
+    "deliver_event",
+    event.id,
+    Date.parse(delivery.nextAttemptAt),
+    Date.parse(event.createdAt),
+  );
 }
 
 function signEventForDelivery(
@@ -1483,9 +1603,49 @@ async function expireAwaiting(
     expiredAt: timestamp,
     updatedAt: timestamp,
   };
-  let atomic = kv.atomic().check(invoiceEntry).set(invoiceKey(invoice.id), next);
+  let atomic = addInvoiceWork(
+    kv.atomic().check(invoiceEntry).set(invoiceKey(invoice.id), next),
+    next,
+    clock.now().getTime(),
+  );
   if (openEntry.value?.invoiceId === invoice.id) {
     atomic = atomic.check(openEntry).delete(openKey);
   }
   return (await atomic.commit()).ok ? next : null;
+}
+
+function needsPaymentRefresh(invoice: InvoiceRecord): boolean {
+  return !!invoice.paymentId &&
+    ["confirming", "provisionally_paid", "settled"].includes(invoice.status);
+}
+
+function invoiceWork(invoice: InvoiceRecord, now: number): { type: WorkType; dueAt: number }[] {
+  if (needsPaymentRefresh(invoice)) return [{ type: "reconcile_invoice", dueAt: now + 60_000 }];
+  const expiry = Date.parse(invoice.expiresAt);
+  if (invoice.status === "awaiting_payment" || (invoice.status === "reverted" && now < expiry)) {
+    return [
+      ...(now + 60_000 < expiry
+        ? [{ type: "reconcile_invoice" as const, dueAt: now + 60_000 }]
+        : []),
+      { type: "expire_invoice", dueAt: expiry },
+    ];
+  }
+  return [];
+}
+
+function addInvoiceWork(
+  atomic: Deno.AtomicOperation,
+  invoice: InvoiceRecord,
+  now: number,
+): Deno.AtomicOperation {
+  const wanted = invoiceWork(invoice, now);
+  for (const type of ["reconcile_invoice", "expire_invoice"] as const) {
+    const dueAt = wanted.find((item) => item.type === type)?.dueAt;
+    atomic = dueAt === undefined
+      ? atomic.delete(workKey(type, invoice.id))
+      : scheduleWork(atomic, type, invoice.id, dueAt, now);
+  }
+  return wanted.length === 0
+    ? atomic.delete(invoiceByChainKey(invoice.chainId, invoice.id))
+    : atomic;
 }
