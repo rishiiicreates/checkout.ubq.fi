@@ -46,12 +46,7 @@ export function invoiceWakeTarget(
   )
     return target;
   const times = confirmationMilestones(invoice.chainId, Date.parse(payment.blockTimestamp));
-  const expected =
-    invoice.status === "confirming"
-      ? times.sealedAt
-      : invoice.status === "provisionally_paid"
-        ? times.safeAt
-        : times.finalizedAt;
+  const expected = invoice.status === "settled" ? times.finalizedAt : times.safeAt;
   return { ...target, dueAt: Math.max(now, expected), reason: "confirmation" };
 }
 
@@ -331,7 +326,7 @@ export function createEntityJobRunner(
       if (refreshed.status !== entry.value.status || refreshed.paymentId !== entry.value.paymentId)
         return plan(currentJob.target, undefined, now);
       const times = confirmationMilestones(entry.value.chainId, Date.parse(payment.blockTimestamp));
-      const next = [times.sealedAt, times.safeAt, times.finalizedAt].find(
+      const next = [times.safeAt, times.finalizedAt].find(
         (at) => at > Math.max(now, currentJob.dueAt),
       );
       return next === undefined

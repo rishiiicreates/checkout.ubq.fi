@@ -3,6 +3,7 @@ import {
   normalizeTransactionHash,
   type SupportedChainId,
 } from "./payment_types.ts";
+import { collectRpcBatchOutcomes } from "./rpc_batch.ts";
 
 export const RPC_ORIGIN = "https://rpc.ubq.fi";
 export const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -152,15 +153,7 @@ export async function chainHeads(
     method: "eth_getBlockByNumber",
     params: [id, false],
   }));
-  const results = responseMap(await client.batch(chainId, calls), calls);
-  const latest = parseBlock(results.get("latest"), "latest");
-  const safe = parseOptionalBlock(results.get("safe"), "safe");
-  const finalized = parseOptionalBlock(results.get("finalized"), "finalized");
-  return validateChainHeads({
-    latestBlock: latest.number,
-    safeBlock: safe?.number ?? null,
-    finalizedBlock: finalized?.number ?? null,
-  });
+  return canonicalHeads(await canonicalResults(client, chainId, calls));
 }
 
 export async function discoverTransferLogs(
@@ -308,8 +301,8 @@ export async function verifyTransferBatch(
     },
   ];
 
-  // All canonical evidence and provider heads deliberately share this one batch/upstream request.
-  const results = responseMap(await client.batch(chainId, calls), calls);
+  // Preserve essential successes when an optional head fails; retry only failed head IDs once.
+  const results = await canonicalResults(client, chainId, calls);
   const eventBlock = parseBlock(results.get("event_block"), "event_block");
   if (
     previouslyVerifiedBlockHash !== undefined &&
@@ -388,14 +381,8 @@ export async function verifyTransferBatch(
     throw new RpcVerificationError("wrong_transfer_amount");
   }
 
-  const latest = parseBlock(results.get("latest"), "latest");
-  const safe = parseOptionalBlock(results.get("safe"), "safe");
-  const finalized = parseOptionalBlock(results.get("finalized"), "finalized");
-  const heads = validateChainHeads({
-    latestBlock: latest.number,
-    safeBlock: safe?.number ?? null,
-    finalizedBlock: finalized?.number ?? null,
-  });
+  const heads = canonicalHeads(results);
+  if (heads.latestBlock < receiptBlockNumber) throw new RpcError("rpc_incoherent_chain_heads");
   return {
     transactionHash,
     logIndex,
@@ -410,15 +397,49 @@ export async function verifyTransferBatch(
   };
 }
 
-function validateChainHeads(heads: ChainHeads): ChainHeads {
-  if (
-    (heads.safeBlock !== null && heads.safeBlock > heads.latestBlock) ||
-    (heads.finalizedBlock !== null &&
-      (heads.safeBlock === null || heads.finalizedBlock > heads.safeBlock))
-  ) {
-    throw new RpcError("rpc_incoherent_chain_heads");
+async function canonicalResults(
+  client: RpcClient,
+  chainId: SupportedChainId,
+  calls: readonly JsonRpcCall[],
+): Promise<Map<string, unknown>> {
+  const first = collectRpcBatchOutcomes(calls, await client.batch(chainId, calls));
+  const results = new Map<string, unknown>();
+  for (const outcome of first.outcomes) {
+    if (outcome.status === "success") results.set(outcome.id, outcome.result);
+    else if (!["latest", "safe", "finalized"].includes(outcome.id))
+      throw new RpcError(`rpc_${outcome.reason}:${outcome.id}`);
   }
-  return heads;
+  const failedHeads = calls.filter((call) => !results.has(call.id));
+  if (failedHeads.length) {
+    try {
+      const retry = collectRpcBatchOutcomes(failedHeads, await client.batch(chainId, failedHeads));
+      for (const outcome of retry.outcomes)
+        if (outcome.status === "success") results.set(outcome.id, outcome.result);
+    } catch (error) {
+      if (!(error instanceof RpcError)) throw error;
+      // A failed optional retry cannot discard an already verified receipt/latest response.
+    }
+  }
+  if (!results.has("latest")) throw new RpcError("rpc_missing_response:latest");
+  return results;
+}
+
+function canonicalHeads(results: Map<string, unknown>): ChainHeads {
+  const latest = parseBlock(results.get("latest"), "latest");
+  const optional = (id: string): bigint | null => {
+    try {
+      const head = parseOptionalBlock(results.get(id), id);
+      return head && head.number <= latest.number ? head.number : null;
+    } catch (error) {
+      if (!(error instanceof RpcVerificationError)) throw error;
+      return null;
+    }
+  };
+  const finalizedBlock = optional("finalized");
+  let safeBlock = optional("safe");
+  // A stale safe response must not invalidate independently useful finalized evidence.
+  if (safeBlock !== null && finalizedBlock !== null && safeBlock < finalizedBlock) safeBlock = null;
+  return { latestBlock: latest.number, safeBlock, finalizedBlock };
 }
 
 export class RpcError extends Error {

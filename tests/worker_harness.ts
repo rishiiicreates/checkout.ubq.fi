@@ -506,11 +506,8 @@ try {
     ),
   );
   equal(discovery.discovery.found, true);
-  equal(discovery.invoice.status, "provisionally_paid");
-  equal(
-    ((await verifyCompactJws(discovery.eventJws, jwks)).payload as { type: string }).type,
-    "payment.accepted.v1",
-  );
+  equal(discovery.invoice.status, "confirming");
+  equal(discovery.eventJws, undefined);
   const afterFound = await counts();
   const foundCalls =
     afterFound.rpcCalls + afterFound.kvCalls - afterPending.rpcCalls - afterPending.kvCalls;
@@ -530,6 +527,18 @@ try {
         observedBlockHash: "0x" + "ab".repeat(32),
       }),
     });
+  await store.fetch("https://fixture.invalid/rpc-fixture", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      transactionHash,
+      tokenAddress: invoice.tokenAddress,
+      treasuryAddress: invoice.treasuryAddress,
+      amountUnits: invoice.paidAmountUnits,
+      blockNumber: invoice.minimumBlock,
+      safeBlock: invoice.minimumBlock,
+    }),
+  });
   const claimed = await claim();
   if (claimed.status !== 200) {
     const error = await claimed.text();
@@ -543,6 +552,18 @@ try {
   const event = await verifyCompactJws(accepted.eventJws, jwks);
   equal((event.payload as { type: string; invoiceId: string }).type, "payment.accepted.v1");
   equal((event.payload as { invoiceId: string }).invoiceId, invoice.id);
+  await store.fetch("https://fixture.invalid/rpc-fixture", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      transactionHash,
+      tokenAddress: invoice.tokenAddress,
+      treasuryAddress: invoice.treasuryAddress,
+      amountUnits: invoice.paidAmountUnits,
+      blockNumber: invoice.minimumBlock,
+      unavailableHeadTags: true,
+    }),
+  });
   const replay = await claim();
   equal(replay.status, 200);
   equal(
@@ -672,7 +693,8 @@ try {
     treasuryAddress: push.treasuryAddress,
     amountUnits: push.paidAmountUnits,
     blockNumber: push.minimumBlock,
-    unavailableHeadTags: true,
+    safeBlock: push.minimumBlock,
+    includedAt: Math.floor(Date.now() / 1000) - 117,
   };
   const configure = async (transfer: Record<string, unknown>) => {
     await store.fetch("https://fixture.invalid/rpc-fixture", {
@@ -734,9 +756,28 @@ try {
   );
   await eventually(
     async () =>
-      (await kv.get<{ status: string }>([...payments, "invoices", push.id])).value?.status ===
-      "provisionally_paid",
+      (await kv.get<string>([...payments, "events_by_invoice", push.id, "payment.accepted.v1"]))
+        .value !== null,
     "known-payment confirmation alarm did not accept payment",
+  );
+  const pushAcceptedId = (
+    await kv.get<string>([...payments, "events_by_invoice", push.id, "payment.accepted.v1"])
+  ).value!;
+  const pushAccepted = (
+    await kv.get<{ compactJws: string }>([...payments, "events", pushAcceptedId])
+  ).value!;
+  const pushAcceptedClaims = (await verifyCompactJws(pushAccepted.compactJws, jwks)).payload as {
+    type: string;
+    jti: string;
+    invoiceId: string;
+  };
+  equal(pushAcceptedClaims.type, "payment.accepted.v1");
+  equal(pushAcceptedClaims.invoiceId, push.id);
+  equal(pushAcceptedClaims.jti, pushAcceptedId);
+  ok(
+    ["provisionally_paid", "settled", "finalized"].includes(
+      (await kv.get<{ status: string }>([...payments, "invoices", push.id])).value!.status,
+    ),
   );
   equal(
     (await stats()).methods.eth_getLogs ?? 0,
@@ -766,6 +807,11 @@ try {
   // A different authenticated ID with the same transfer is still domain-idempotent.
   const semanticReplay = await submit(await signed("push_duplicate", log));
   equal(semanticReplay.status, 200, await semanticReplay.text());
+  equal(
+    (await kv.get<string>([...payments, "events_by_invoice", push.id, "payment.accepted.v1"]))
+      .value,
+    pushAcceptedId,
+  );
   await configure({ ...pushTransfer, canonicalHash: "0x" + "cd".repeat(32) });
   const removed = await signed("push_removed", { ...log, removed: true });
   let removal = await submit(removed);

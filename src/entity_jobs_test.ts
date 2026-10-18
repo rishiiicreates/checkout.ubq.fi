@@ -128,10 +128,6 @@ test("known-payment milestones never search for new payments and stop when final
     const start = app.now();
     let job = await app.runner.plan(app.target);
     ok(job);
-    equal(job.dueAt, start + 6000);
-    app.setNow(job.dueAt);
-    job = await app.runner.run(job, async () => true);
-    ok(job);
     equal(job.dueAt, start + 120000);
     app.setNow(job.dueAt);
     job = await app.runner.run(job, async () => true);

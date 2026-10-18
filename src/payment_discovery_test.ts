@@ -1,5 +1,5 @@
 import { test } from "bun:test";
-import { deepStrictEqual as equal, ok, rejects } from "node:assert/strict";
+import { deepStrictEqual as equal, ok } from "node:assert/strict";
 import { createPaymentService } from "./payment_service.ts";
 import { createPersistentJwsSigner } from "./jws.ts";
 import {
@@ -16,7 +16,6 @@ import type { Kv, KvCheck, KvKey } from "./kv.ts";
 import type { InvoiceRecord } from "./payment_types.ts";
 import {
   TRANSFER_TOPIC,
-  RpcError,
   type DiscoveredTransferLog,
   type JsonRpcCall,
   type JsonRpcBatchItem,
@@ -92,7 +91,7 @@ test("matching logs with unavailable receipts retain the retry position beyond t
     const replay = await app.service.discoverPayment(app.invoice.id);
     equal(replay.invoice.paymentId, found.invoice.paymentId);
     equal(replay.discovery?.found, true);
-    equal((await app.service.listOutbox()).length, 1);
+    equal((await app.service.listOutbox()).length, 0);
   } finally {
     app.kv.close();
   }
@@ -107,13 +106,10 @@ test("discovery uses coherent safe or latest heads and one shared exact match pr
     equal((await app.service.discoverPayment(app.invoice.id)).discovery?.searchedToBlock, "120");
     app.rpc.safe = null;
     app.rpc.finalized = 150n;
-    await rejects(
-      () => app.service.discoverPayment(app.invoice.id),
-      (error) => error instanceof RpcError && error.code === "rpc_incoherent_chain_heads",
-    );
+    equal((await app.service.discoverPayment(app.invoice.id)).discovery?.searchedToBlock, "150");
     equal(
       (await app.kv.get<DiscoveryState>(discoveryStateKey(app.invoice.id))).value?.searchedThrough,
-      120n,
+      150n,
     );
     app.rpc.finalized = null;
     equal((await app.service.discoverPayment(app.invoice.id)).discovery?.searchedToBlock, "200");
@@ -202,7 +198,9 @@ test("same-transaction reinclusion can move the log index without replaying an o
   try {
     app.rpc.latest = 115n;
     const original = app.rpc.add(app.invoice, 110n);
-    const accepted = await app.service.claimPayment(app.invoice.id, coordinates(original));
+    await app.service.claimPayment(app.invoice.id, coordinates(original));
+    app.rpc.safe = 110n;
+    const accepted = await app.service.refreshInvoice(app.invoice.id);
     ok(accepted.eventJws);
     app.rpc.reorged.add(original.transactionHash);
     equal((await app.service.refreshInvoice(app.invoice.id)).invoice.status, "reverted");
@@ -211,6 +209,7 @@ test("same-transaction reinclusion can move the log index without replaying an o
     original.blockHash = hash(1120);
     original.logIndex = 7;
     app.rpc.latest = 120n;
+    app.rpc.safe = null;
     const recovered = await app.service.discoverPayment(app.invoice.id);
     equal(recovered.discovery?.found, true);
     equal(recovered.invoice.status, "confirming");
@@ -306,12 +305,50 @@ test("the Worker budget retains completion headroom for partial results and late
       .restart(countedKv(app.kv, foundBudget), foundRpc, foundBudget)
       .discoverPayment(app.invoice.id);
     equal(paid.discovery?.found, true);
-    ok(paid.eventJws);
-    ok(foundBudget.remaining >= 0);
+    equal(paid.invoice.status, "confirming");
+    equal(paid.eventJws, undefined);
+    ok(foundBudget.remaining > 0);
   } finally {
     app.kv.close();
   }
 });
+
+for (const maximum of [8, 12]) {
+  test(`optional head retry preserves mandatory payment writes with budget ${maximum}`, async () => {
+    const app = await setup();
+    try {
+      app.rpc.latest = 115n;
+      const transfer = app.rpc.add(app.invoice, 110n);
+      const budget = new WorkerRequestBudget(maximum);
+      const requests: string[][] = [];
+      const rpc: RpcClient = {
+        async batch(chain, calls) {
+          budget.reserve();
+          requests.push(calls.map(({ id }) => id));
+          const responses = await app.rpc.batch(chain, calls);
+          return calls.some(({ id }) => id === "receipt")
+            ? responses.map((item) =>
+                item.id === "safe" || item.id === "finalized"
+                  ? { jsonrpc: "2.0", id: item.id, error: { code: -32000, message: "unavailable" } }
+                  : item,
+              )
+            : responses;
+        },
+      };
+      const result = await app
+        .restart(countedKv(app.kv, budget), rpc, budget)
+        .claimPayment(app.invoice.id, coordinates(transfer));
+      equal(result.invoice.status, "confirming");
+      equal(result.eventJws, undefined);
+      equal(requests.length, maximum === 8 ? 1 : 2);
+      if (maximum === 12) equal(requests[1], ["safe", "finalized"]);
+      ok(budget.remaining > 0);
+      equal((await app.service.getInvoice(app.invoice.id)).paymentId, result.invoice.paymentId);
+    } finally {
+      app.kv.close();
+    }
+  });
+}
 
 test("real service-adapter calls keep intent prearming and a zero-search-budget response within24", async () => {
   const app = await setup();
@@ -392,10 +429,11 @@ test("real service-adapter calls keep intent prearming and a zero-search-budget 
     });
     const result = await app.restart(wire, rpc, budget, wakeups).discoverPayment(app.invoice.id);
     equal(result.discovery?.found, true);
-    ok(result.eventJws);
-    ok(sawCompletionBoundary);
-    ok(budget.remaining >= 0);
-    equal(prepareCalls, 2);
+    equal(result.invoice.status, "confirming");
+    equal(result.eventJws, undefined);
+    equal(sawCompletionBoundary, false);
+    ok(budget.remaining > 0);
+    equal(prepareCalls, 1);
     console.log(
       `intent discovery calls: storage=${storageCalls},rpc=${rpcCalls},prearm=${prepareCalls},prior=6,total=${24 - budget.remaining},ceiling=24`,
     );
@@ -420,8 +458,12 @@ test("chain push uses the reserved invoice treasury snapshot and records one con
     equal((await app.service.listOutbox()).length, 0);
     equal((await app.service.processChainTransfer(event, context)).disposition, "ignored");
     const publicReplay = await app.service.claimPayment(app.invoice.id, coordinates(transfer));
-    equal(publicReplay.invoice.status, "provisionally_paid");
-    ok(publicReplay.eventJws);
+    equal(publicReplay.invoice.status, "confirming");
+    equal(publicReplay.eventJws, undefined);
+    app.rpc.finalized = 110n;
+    const credited = await app.service.refreshInvoice(app.invoice.id);
+    equal(credited.invoice.status, "provisionally_paid");
+    ok(credited.eventJws);
   } finally {
     app.kv.close();
   }
@@ -433,11 +475,14 @@ test("out-of-order reinclusion uses two receipt phases and ignores the older rem
     app.rpc.latest = 115n;
     const transfer = app.rpc.add(app.invoice, 110n);
     const original = { ...transfer, chainId: 8453 as const, removed: true };
-    const accepted = await app.service.claimPayment(app.invoice.id, coordinates(transfer));
+    await app.service.claimPayment(app.invoice.id, coordinates(transfer));
+    app.rpc.safe = 110n;
+    const accepted = await app.service.refreshInvoice(app.invoice.id);
     transfer.blockNumber = 120n;
     transfer.blockHash = hash(1120);
     transfer.logIndex = 7;
     app.rpc.latest = 125n;
+    app.rpc.safe = null;
     const event = { ...transfer, chainId: 8453 as const, removed: false };
     const context = { deadline: Date.now() + 20000, isCurrent: async () => true };
     equal((await app.service.processChainTransfer(event, context)).terminal, false);
@@ -461,6 +506,7 @@ test("an exact removed hint canonically reverts a finalized payment without a ba
     await app.service.claimPayment(app.invoice.id, coordinates(transfer));
     app.rpc.safe = 110n;
     app.rpc.finalized = 110n;
+    await app.service.refreshInvoice(app.invoice.id);
     await app.service.refreshInvoice(app.invoice.id);
     await app.service.refreshInvoice(app.invoice.id);
     equal((await app.service.getInvoice(app.invoice.id)).status, "finalized");
