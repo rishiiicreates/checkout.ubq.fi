@@ -1,4 +1,4 @@
-import type { KvKey, Kv, KvEntryMaybe, KvAtomic } from "./kv.ts";
+import type { KvKey, Kv, KvEntryMaybe, KvAtomic, KvCheck } from "./kv.ts";
 import { confirmationMilestones, type WakeupPort, type WakeTarget } from "./wakeup.ts";
 import { StaleWakeupError } from "./wakeup.ts";
 import type { ChainTransferEvent } from "./chain_events.ts";
@@ -234,8 +234,11 @@ export function createPaymentService(options: PaymentServiceOptions) {
     getInvoiceRecord: (invoiceId: unknown) => invoiceRecord(kv, invoiceId),
     claimPayment: (invoiceId: unknown, input: ClaimPaymentInput) => claimPayment(invoiceId, input),
     reportPayment: async (invoiceId: unknown, input: ClaimPaymentInput) => {
-      await claimPayment(invoiceId, input);
-      return discoverAccount(invoiceId);
+      const signed: { value?: { result: ClaimPaymentResult; versionstamp: string | null } } = {};
+      await claimPayment(invoiceId, input, undefined, undefined, (event) => {
+        signed.value = event;
+      });
+      return discoverAccount(invoiceId, undefined, undefined, false, false, signed.value);
     },
     processChainTransfer: async (event: ChainTransferEvent, context: ChainTransferContext) => {
       return processChainTransfer(event, context);
@@ -397,10 +400,14 @@ export function createPaymentService(options: PaymentServiceOptions) {
     suppliedAnchor?: KvEntryMaybe<InvoiceRecord>,
     reuseComplete = false,
     indexReady = false,
+    signed?: { result: ClaimPaymentResult; versionstamp: string | null },
   ): Promise<ClaimPaymentResult> {
     const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
     const anchor = suppliedAnchor ?? (await kv.get<InvoiceRecord>(invoiceKey(invoiceId)));
     if (!anchor.value) throw new PaymentDomainError("invoice_not_found");
+    const refreshedAnchor: { value?: ClaimPaymentResult; versionstamp?: string | null } = signed
+      ? { value: signed.result, versionstamp: signed.versionstamp }
+      : {};
     const result = await runAccountHunt({
       kv,
       rpc,
@@ -450,7 +457,24 @@ export function createPaymentService(options: PaymentServiceOptions) {
         );
       },
       refresh: async (entry, scope) => {
-        await refreshInvoice(entry.value!.id, scope, { invoiceEntry: entry });
+        const verified: KvCheck[] = [];
+        const refreshed = await refreshInvoice(
+          entry.value!.id,
+          scope,
+          { invoiceEntry: entry },
+          undefined,
+          (checks) => {
+            verified.push(...checks);
+          },
+        );
+        const invoiceProof = verified.find(
+          (check) => JSON.stringify(check.key) === JSON.stringify(entry.key),
+        );
+        if (refreshed.eventJws && refreshed.invoice.id === anchor.value!.id && invoiceProof) {
+          refreshedAnchor.value = refreshed;
+          refreshedAnchor.versionstamp = invoiceProof.versionstamp;
+        }
+        return verified.length ? verified : null;
       },
       invalidate: async (entry, state, reservation, scope, checks) => {
         const next: InvoiceRecord = {
@@ -474,6 +498,31 @@ export function createPaymentService(options: PaymentServiceOptions) {
         group.tokenAddress === anchor.value!.tokenAddress.toLowerCase() &&
         group.treasuryAddress === anchor.value!.treasuryAddress.toLowerCase(),
     );
+    const responseBudget = context?.budget ?? options.discovery?.budget;
+    let eventJws =
+      refreshedAnchor.versionstamp === result.anchorVersionstamp &&
+      refreshedAnchor.value?.invoice.paymentId === result.anchor.paymentId &&
+      refreshedAnchor.value?.invoice.status === result.anchor.status &&
+      refreshedAnchor.value?.invoice.acceptedAt === result.anchor.acceptedAt &&
+      refreshedAnchor.value?.invoice.settledAt === result.anchor.settledAt &&
+      refreshedAnchor.value?.invoice.revertedAt === result.anchor.revertedAt
+        ? refreshedAnchor.value?.eventJws
+        : undefined;
+    // Two event-index/record pairs, a cold signing-key read/create, and one cleanup slot.
+    if (
+      !eventJws &&
+      hasCurrentPaymentRecord(result.anchor) &&
+      responseBudget?.hasCapacity(7) !== false
+    ) {
+      const release = responseBudget?.reserveForCompletion(1);
+      try {
+        eventJws = await signedExistingEvent(result.anchor);
+      } catch (error) {
+        if (!(error instanceof WorkerBudgetError)) throw error;
+      } finally {
+        release?.();
+      }
+    }
     return {
       invoice: result.anchor,
       accountHunt: result.accountHunt,
@@ -481,10 +530,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         found: hasCurrentPaymentRecord(result.anchor),
         ...(group?.searchedToBlock === undefined ? {} : { searchedToBlock: group.searchedToBlock }),
       },
-      ...(hasCurrentPaymentRecord(result.anchor) &&
-      (context?.budget ?? options.discovery?.budget)?.hasCapacity(1) !== false
-        ? { eventJws: await signedExistingEvent(result.anchor) }
-        : {}),
+      ...(eventJws ? { eventJws } : {}),
     };
   }
 
@@ -574,8 +620,12 @@ export function createPaymentService(options: PaymentServiceOptions) {
       (!sameInclusion || locator.value?.paymentId !== invoice.paymentId || locator.value?.duplicate)
     )
       return ignored(id);
-    if (!event.removed && hasCurrentPaymentRecord(invoice) && sameInclusion) return ignored(id);
-    if (payment && !sameTransaction) return ignored(id);
+    if (
+      !event.removed &&
+      ((hasCurrentPaymentRecord(invoice) && sameInclusion) || locator.value?.duplicate)
+    )
+      return ignored(id);
+    const additionalTransfer = Boolean(payment && !sameTransaction);
     const mutationCalls =
       event.removed || (hasCurrentPaymentRecord(invoice) && sameTransaction && !sameInclusion)
         ? 12
@@ -606,8 +656,9 @@ export function createPaymentService(options: PaymentServiceOptions) {
         };
       }
       if (
-        !invoiceMatchesTransfer(invoice, event) ||
-        ["manual_review", "late_payment", "finalized"].includes(invoice.status)
+        !additionalTransfer &&
+        (!invoiceMatchesTransfer(invoice, event) ||
+          ["manual_review", "late_payment", "finalized"].includes(invoice.status))
       )
         return ignored(id);
       const result = await claimPayment(
@@ -812,6 +863,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     input: ClaimPaymentInput,
     context?: ChainTransferContext,
     snapshot?: ClaimSnapshot,
+    signed?: (event: { result: ClaimPaymentResult; versionstamp: string | null }) => void,
   ): Promise<ClaimPaymentResult> {
     const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
     const invoiceEntry =
@@ -891,8 +943,17 @@ export function createPaymentService(options: PaymentServiceOptions) {
       }
     }
     if (existingLocator.value) {
-      const refreshed = await refreshInvoice(invoice.id, context);
-      if (refreshed.eventJws) return refreshed;
+      const checks: KvCheck[] = [];
+      const refreshed = await refreshInvoice(invoice.id, context, undefined, undefined, (proof) => {
+        checks.push(...proof);
+      });
+      if (refreshed.eventJws) {
+        const invoiceProof = checks.find(
+          (check) => JSON.stringify(check.key) === JSON.stringify(invoiceEntry.key),
+        );
+        if (invoiceProof) signed?.({ result: refreshed, versionstamp: invoiceProof.versionstamp });
+        return refreshed;
+      }
       return { ...refreshed, eventJws: await signedExistingEvent(refreshed.invoice) };
     }
 
@@ -1191,6 +1252,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     context?: ChainTransferContext,
     snapshot?: ClaimSnapshot,
     inconclusive?: () => void,
+    verified?: (checks: KvCheck[]) => void,
   ): Promise<ClaimPaymentResult> {
     const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
     const invoiceEntry =
@@ -1226,6 +1288,17 @@ export function createPaymentService(options: PaymentServiceOptions) {
       return handleReorg(invoiceEntry, paymentEntry, error.code, context);
     }
 
+    const reportVerified = (versionstamp?: string) => {
+      if (
+        (evidence.safeBlock !== null && evidence.safeBlock >= evidence.blockNumber) ||
+        (evidence.finalizedBlock !== null && evidence.finalizedBlock >= evidence.blockNumber)
+      ) {
+        verified?.([
+          { key: invoiceEntry.key, versionstamp: versionstamp ?? invoiceEntry.versionstamp },
+          { key: paymentEntry.key, versionstamp: versionstamp ?? paymentEntry.versionstamp },
+        ]);
+      }
+    };
     const timestamp = clock.now().toISOString();
     const headsEntry = await kv.get<ChainHeadRecord>(headKey(invoice.chainId));
     const heads = mergeHeads(invoice.chainId, headsEntry.value, evidence, timestamp);
@@ -1272,7 +1345,10 @@ export function createPaymentService(options: PaymentServiceOptions) {
         updatedAt: timestamp,
       };
     } else {
-      if (!headAdvanced(headsEntry.value, heads)) return { invoice: invoiceJson(invoice) };
+      if (!headAdvanced(headsEntry.value, heads)) {
+        reportVerified();
+        return { invoice: invoiceJson(invoice) };
+      }
     }
 
     if (nextInvoice === invoice) {
@@ -1285,8 +1361,9 @@ export function createPaymentService(options: PaymentServiceOptions) {
       if (context && !(await context.isCurrent())) throw new StaleWakeupError();
       if (!(await atomic.commit()).ok) {
         if (context) throw new StaleWakeupError();
-        return refreshInvoice(invoice.id, context, undefined, inconclusive);
+        return refreshInvoice(invoice.id, context, undefined, inconclusive, verified);
       }
+      reportVerified();
       return { invoice: invoiceJson(invoice) };
     }
 
@@ -1315,8 +1392,9 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const committed = await commitInvoice(atomic, nextInvoice, event, evidence, context);
     if (!committed.ok) {
       if (context) throw new StaleWakeupError();
-      return refreshInvoice(invoice.id, context, undefined, inconclusive);
+      return refreshInvoice(invoice.id, context, undefined, inconclusive, verified);
     }
+    reportVerified(committed.versionstamp);
     return { invoice: invoiceJson(nextInvoice), eventJws: event?.compactJws };
   }
 
