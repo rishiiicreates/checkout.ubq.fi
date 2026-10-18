@@ -13,9 +13,14 @@ import {
   type AttemptState,
 } from "./account_store.ts";
 import type { ChainTransferContext } from "./chain_ingress.ts";
-import type { Kv, KvCheck, KvEntryMaybe, KvKey } from "./kv.ts";
+import type { Kv, KvAtomic, KvCheck, KvEntryMaybe, KvKey } from "./kv.ts";
 import { invoiceJson, type InvoiceRecord, type InvoiceJson } from "./payment_types.ts";
-import { latestBlockNumber, type DiscoveredTransferLog, type RpcClient } from "./rpc.ts";
+import {
+  latestBlockNumber,
+  RpcVerificationError,
+  type DiscoveredTransferLog,
+  type RpcClient,
+} from "./rpc.ts";
 import { huntTransferLogs } from "./rpc_batch_logs.ts";
 import { StaleWakeupError } from "./wakeup.ts";
 import { invoiceMatchesTransfer } from "./payment_discovery.ts";
@@ -37,6 +42,7 @@ export type TransferReview = {
   cursor: string | null;
   complete: boolean;
   historyVersion?: string | null;
+  canonicalContradiction?: string;
 };
 type Run = {
   membership: string | null;
@@ -50,6 +56,7 @@ type Run = {
   trigger?: string;
   response?: AccountHuntJson;
   restart?: boolean;
+  quarantinedInclusions?: string[];
 };
 export type AccountHuntJson = {
   complete: boolean;
@@ -311,6 +318,8 @@ export async function runAccountHunt(options: {
           invalidated: [],
           complete: false,
           trigger,
+          quarantinedInclusions:
+            stored.value && !stored.value.complete ? stored.value.quarantinedInclusions : undefined,
         };
   if (trigger) run.trigger = trigger;
   // A membership change cannot erase an unprocessed observation suffix.
@@ -323,13 +332,14 @@ export async function runAccountHunt(options: {
   let entry: KvEntryMaybe<Run> = stored;
   const current = async () =>
     Date.now() < run.lease!.until && (options.context ? await options.context.isCurrent() : true);
-  async function save() {
+  async function save(extend?: (atomic: KvAtomic) => KvAtomic, next: Run = run) {
     if (!(await current())) throw new StaleWakeupError();
-    let atomic = kv.atomic().check(entry, membership).set(entry.key, run);
+    let atomic = kv.atomic().check(entry, membership).set(entry.key, next);
+    if (extend) atomic = extend(atomic);
     if (options.context?.fence) atomic = atomic.check(options.context.fence);
     const committed = await atomic.commit();
     if (!committed.ok) throw new StaleWakeupError();
-    entry = { key: entry.key, value: run, versionstamp: committed.versionstamp };
+    entry = { key: entry.key, value: next, versionstamp: committed.versionstamp };
   }
   const release = budget?.reserveForCompletion(5);
   const verifiedThisEvent = new Map<string, KvCheck[]>();
@@ -489,9 +499,37 @@ export async function runAccountHunt(options: {
     }
     const result = run.result;
     if (!result) return pending("account_search_pending");
+    const invalidateCoverage = (observed: AccountHuntResult["observations"][number]) => {
+      result.reachedHead = false;
+      run.restart = true;
+      resolutionComplete = false;
+      result.diagnostics = [...new Set([...result.diagnostics, "canonical_range_pending"])];
+      for (const group of result.groups) {
+        if (
+          group.chainId !== observed.chainId ||
+          group.tokenAddress !== observed.log.tokenAddress.toLowerCase() ||
+          group.treasuryAddress !== observed.log.recipientAddress.toLowerCase()
+        )
+          continue;
+        group.reachedHead = false;
+        group.searchedToBlock = undefined;
+        group.ranges = group.ranges.map((range) =>
+          range.fromBlock <= observed.log.blockNumber && observed.log.blockNumber <= range.toBlock
+            ? { ...range, status: "failed" as const, reason: "canonical_contradiction" }
+            : range,
+        );
+      }
+    };
     while (run.offset < result.observations.length && room(options.context ? 6 : 5)) {
       if (!(await current())) throw new StaleWakeupError();
       const observed = result.observations[run.offset];
+      const inclusion = JSON.stringify(observationKey(observed.chainId, observed.log));
+      if (run.quarantinedInclusions?.includes(inclusion)) {
+        invalidateCoverage(observed);
+        run.offset++;
+        await save();
+        continue;
+      }
       const candidateId =
         observed.candidateInvoiceIds.length === 1 ? observed.candidateInvoiceIds[0] : undefined;
       const [invoice, state] = candidateId
@@ -519,7 +557,51 @@ export async function runAccountHunt(options: {
         if (!room(options.context ? 13 : 8)) break;
         const scope = scoped();
         scope.fences = [...(scope.fences ?? []), ...(attribution.checks ?? [])];
-        await options.claim(invoice!, { ...observed.log }, scope, attribution);
+        try {
+          await options.claim(invoice!, { ...observed.log }, scope, attribution);
+        } catch (error) {
+          if (
+            !(error instanceof RpcVerificationError) ||
+            (!error.canonicalContradiction && error.code !== "non_canonical_block")
+          )
+            throw error;
+          invalidateCoverage(observed);
+          if (!room(2)) break;
+          const prior = await kv.get<TransferReview>(
+            observationKey(observed.chainId, observed.log),
+          );
+          const review: TransferReview = {
+            ...(prior.value ?? {
+              chainId: observed.chainId,
+              log: { ...observed.log },
+              classification: "unclassified" as const,
+              provenance: [],
+              removed: false,
+              owners: [],
+              cursor: null,
+              complete: false,
+            }),
+            canonicalContradiction: error.code,
+            provenance: [
+              ...new Set([
+                ...(prior.value?.provenance ?? []),
+                "account_hunt_canonical_contradiction",
+              ]),
+            ],
+          };
+          const next = {
+            ...run,
+            offset: run.offset + 1,
+            quarantinedInclusions: [...(run.quarantinedInclusions ?? []), inclusion],
+          };
+          // History and replay progress commit together; a failed save leaves the raw observation pending.
+          await save(
+            (atomic) => atomic.check(prior, invoice!, state!).set(prior.key, review),
+            next,
+          );
+          Object.assign(run, next);
+          continue;
+        }
         const changed = await kv.get<InvoiceRecord>(invoice!.key);
         (run.versions ??= {})[invoice!.value!.id] = changed.versionstamp;
       }

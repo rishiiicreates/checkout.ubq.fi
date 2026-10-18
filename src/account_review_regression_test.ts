@@ -9,6 +9,7 @@ import { RuntimeRpc } from "./account_runtime_test_fixture.ts";
 import { attemptStateKey, reservationKey, type AttemptState } from "./account_store.ts";
 import { WorkerRequestBudget } from "./worker_budget.ts";
 import type { JsonRpcCall } from "./rpc.ts";
+import { observationKey, type TransferReview } from "./account_runtime.ts";
 
 const prefix = ["uos_checkout", "v1", "payments"];
 const treasury = `0x${"44".repeat(20)}`;
@@ -19,45 +20,110 @@ const coordinates = (log: ReturnType<RuntimeRpc["add"]>) => ({
   observedBlockHash: log.blockHash,
 });
 
-test("reorg-cleared earlier attempt replays retained matching before reservation release", async () => {
+for (const keepReorgedLogs of [false, true]) {
+  test(`reorg-cleared earlier attempt replays retained matching (contradicted log retained=${keepReorgedLogs})`, async () => {
+    const app = await setup();
+    try {
+      const earlier = await app.create("earlier");
+      const later = await app.create("later");
+      const original = app.rpc.add(await app.service.getInvoiceRecord(earlier.id), 200n);
+      const laterLog = app.rpc.add(await app.service.getInvoiceRecord(later.id), 210n);
+      app.rpc.latest = 300n;
+      await app.service.claimPayment(earlier.id, coordinates(original));
+      await app.service.claimPayment(later.id, coordinates(laterLog));
+      app.rpc.safe = 250n;
+      await app.service.refreshInvoice(later.id);
+      app.rpc.reorged.add(original.transactionHash);
+      app.rpc.keepReorgedLogs = keepReorgedLogs;
+      const replacement = app.rpc.add(await app.service.getInvoiceRecord(earlier.id), 220n);
+
+      const first = await app.service.discoverPayment(later.id);
+      const afterRefresh = await app.service.getInvoiceRecord(earlier.id);
+      ok((await app.kv.get(reservationKey(afterRefresh))).value);
+      ok(
+        (await app.kv.get<AttemptState>(attemptStateKey(earlier.id))).value?.resolution !==
+          "invalidated",
+      );
+      if (!afterRefresh.paymentId) equal(first.accountHunt?.pending, true);
+      // The replacement remains canonically verifiable even if a later log query omits it.
+      app.rpc.hidden.add(replacement.transactionHash);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const invoice = await app.service.getInvoiceRecord(earlier.id);
+        if (invoice.paymentId) break;
+        await app.service.discoverPayment(later.id);
+      }
+      const recovered = await app.service.getInvoiceRecord(earlier.id);
+      ok(recovered.paymentId);
+      const payment = await app.kv.get<PaymentRecord>([
+        ...prefix,
+        "payment_records",
+        recovered.paymentId,
+      ]);
+      equal(payment.value?.transactionHash, replacement.transactionHash);
+      ok((await app.kv.get(reservationKey(recovered))).value);
+      if (keepReorgedLogs) {
+        const quarantined = await app.kv.get<TransferReview>(observationKey(8453, original));
+        equal(quarantined.value?.canonicalContradiction, "non_canonical_block");
+        equal(quarantined.value?.log.transactionHash, original.transactionHash);
+        equal(quarantined.value?.log.blockHash, original.blockHash);
+        ok(quarantined.value?.provenance.includes("account_hunt_canonical_contradiction"));
+      }
+    } finally {
+      app.kv.close();
+    }
+  });
+}
+
+test("fork coverage cannot release an unpaid attempt until a clean related-event range pass", async () => {
   const app = await setup();
   try {
-    const earlier = await app.create("earlier");
+    const unpaid = await app.create("unpaid");
+    const reorged = await app.create("reorged");
     const later = await app.create("later");
-    const original = app.rpc.add(await app.service.getInvoiceRecord(earlier.id), 200n);
-    const laterLog = app.rpc.add(await app.service.getInvoiceRecord(later.id), 210n);
+    const old = app.rpc.add(await app.service.getInvoiceRecord(reorged.id), 200n);
+    const paid = app.rpc.add(await app.service.getInvoiceRecord(later.id), 210n);
     app.rpc.latest = 300n;
-    await app.service.claimPayment(earlier.id, coordinates(original));
-    await app.service.claimPayment(later.id, coordinates(laterLog));
+    await app.service.claimPayment(reorged.id, coordinates(old));
+    await app.service.claimPayment(later.id, coordinates(paid));
     app.rpc.safe = 250n;
     await app.service.refreshInvoice(later.id);
-    app.rpc.reorged.add(original.transactionHash);
-    const replacement = app.rpc.add(await app.service.getInvoiceRecord(earlier.id), 220n);
-
-    const first = await app.service.discoverPayment(later.id);
-    const afterRefresh = await app.service.getInvoiceRecord(earlier.id);
-    ok((await app.kv.get(reservationKey(afterRefresh))).value);
-    ok(
-      (await app.kv.get<AttemptState>(attemptStateKey(earlier.id))).value?.resolution !==
-        "invalidated",
-    );
-    if (!afterRefresh.paymentId) equal(first.accountHunt?.pending, true);
-    // The replacement remains canonically verifiable even if a later log query omits it.
-    app.rpc.hidden.add(replacement.transactionHash);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const invoice = await app.service.getInvoiceRecord(earlier.id);
-      if (invoice.paymentId) break;
-      await app.service.discoverPayment(later.id);
-    }
-    const recovered = await app.service.getInvoiceRecord(earlier.id);
-    ok(recovered.paymentId);
+    app.rpc.reorged.add(old.transactionHash);
+    app.rpc.keepReorgedLogs = true;
+    const replacement = app.rpc.add(await app.service.getInvoiceRecord(reorged.id), 220n);
+    await app.service.discoverPayment(later.id);
+    const contradicted = await app.service.discoverPayment(later.id);
+    const replacementInvoice = await app.service.getInvoiceRecord(reorged.id);
     const payment = await app.kv.get<PaymentRecord>([
       ...prefix,
       "payment_records",
-      recovered.paymentId,
+      replacementInvoice.paymentId!,
     ]);
     equal(payment.value?.transactionHash, replacement.transactionHash);
-    ok((await app.kv.get(reservationKey(recovered))).value);
+    const unpaidRecord = await app.service.getInvoiceRecord(unpaid.id);
+    equal(
+      (await app.kv.get<AttemptState>(attemptStateKey(unpaid.id))).value?.resolution,
+      "unresolved",
+    );
+    ok((await app.kv.get(reservationKey(unpaidRecord))).value);
+    equal(contradicted.accountHunt?.pending, true);
+    equal(contradicted.accountHunt?.reachedHead, false);
+    const repeatedFork = await app.service.discoverPayment(later.id);
+    equal(repeatedFork.accountHunt?.pending, true);
+    equal(repeatedFork.accountHunt?.reachedHead, false);
+    ok((await app.kv.get(reservationKey(unpaidRecord))).value);
+    app.rpc.keepReorgedLogs = false;
+    const clean = await app.service.discoverPayment(later.id);
+    equal(clean.accountHunt?.reachedHead, true);
+    equal(clean.accountHunt?.pending, false);
+    equal(
+      (await app.kv.get<AttemptState>(attemptStateKey(unpaid.id))).value?.resolution,
+      "invalidated",
+    );
+    equal((await app.kv.get(reservationKey(unpaidRecord))).value, null);
+    equal(
+      (await app.kv.get<TransferReview>(observationKey(8453, old))).value?.canonicalContradiction,
+      "non_canonical_block",
+    );
   } finally {
     app.kv.close();
   }
@@ -237,6 +303,7 @@ test("wallet report preserves its verified fresh event when the account hunt has
 
 class ReviewRpc extends RuntimeRpc {
   reorged = new Set<string>();
+  keepReorgedLogs = false;
   hidden = new Set<string>();
   unavailable = new Map<string, "receipt" | "block" | "provider">();
   override async batch(chain: number, calls: readonly JsonRpcCall[]) {
@@ -250,7 +317,8 @@ class ReviewRpc extends RuntimeRpc {
           ...response,
           result: response.result.filter(
             (log) =>
-              !this.reorged.has(log.transactionHash) && !this.hidden.has(log.transactionHash),
+              (!this.reorged.has(log.transactionHash) || this.keepReorgedLogs) &&
+              !this.hidden.has(log.transactionHash),
           ),
         };
       if (failure === "provider" && call.id === "receipt")
