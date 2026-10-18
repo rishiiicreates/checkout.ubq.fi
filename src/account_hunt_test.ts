@@ -260,6 +260,101 @@ test("partial retries preserve later matches while persistent middle holes preve
   }
 });
 
+test("unsupported chain log queries retry failed entries once without losing healthy-chain coverage", async () => {
+  const unsupported = invoice({ id: "unsupported", chainId: 1 });
+  const healthy = invoice({ id: "healthy", chainId: 8453 });
+  const app = await setup([unsupported, healthy]);
+  try {
+    app.rpc.unsupportedLogChains.add(1);
+    app.rpc.logs.set(8453, [transfer(healthy, 2500n)]);
+    const result = await huntAccountAttempts(app.dependencies, options());
+    equal(result.enumerationComplete, true);
+    equal(result.reachedHead, false);
+    equal(result.callsUsed, 5);
+    const failed = result.groups.find((group) => group.chainId === 1)!;
+    equal(failed.targetHead, 3000n);
+    equal(failed.reachedHead, false);
+    equal(failed.searchedToBlock, undefined);
+    equal(
+      failed.ranges.map(({ fromBlock, toBlock, status, attempts, reason, logs }) => ({
+        fromBlock,
+        toBlock,
+        status,
+        attempts,
+        reason,
+        logs,
+      })),
+      [
+        {
+          fromBlock: 1n,
+          toBlock: 1000n,
+          status: "failed",
+          attempts: 2,
+          reason: "upstream_error",
+          logs: [],
+        },
+        {
+          fromBlock: 1001n,
+          toBlock: 2000n,
+          status: "failed",
+          attempts: 2,
+          reason: "upstream_error",
+          logs: [],
+        },
+        {
+          fromBlock: 2001n,
+          toBlock: 3000n,
+          status: "failed",
+          attempts: 2,
+          reason: "upstream_error",
+          logs: [],
+        },
+      ],
+    );
+    const covered = result.groups.find((group) => group.chainId === 8453)!;
+    equal(covered.reachedHead, true);
+    equal(covered.searchedToBlock, 3000n);
+    equal(
+      covered.ranges.map(({ status, attempts }) => [status, attempts]),
+      [
+        ["complete", 1],
+        ["complete", 1],
+        ["complete", 1],
+      ],
+    );
+    equal(
+      result.observations.map(({ chainId, candidateInvoiceIds, log }) => [
+        chainId,
+        candidateInvoiceIds,
+        log.blockNumber,
+      ]),
+      [[8453, ["healthy"], 2500n]],
+    );
+    const requests = (chain: SupportedChainId) =>
+      app.rpc.calls.filter((entry) => entry.chainId === chain);
+    equal(
+      requests(1).map(({ calls }) => calls.length),
+      [1, 3, 3],
+    );
+    equal(requests(1)[2].calls, requests(1)[1].calls);
+    equal(
+      requests(8453).map(({ calls }) => calls.length),
+      [1, 3],
+    );
+    for (const request of app.rpc.calls) {
+      ok(request.calls.length > 0);
+      equal(new Set(request.calls.map(({ id }) => id)).size, request.calls.length);
+      ok(
+        request.calls.every(({ method }) =>
+          ["eth_getBlockByNumber", "eth_getLogs"].includes(method),
+        ),
+      );
+    }
+  } finally {
+    app.kv.close();
+  }
+});
+
 test("shared matching returns raw ambiguous candidates and unclassified transfers without inferring payment phases", async () => {
   const first = invoice({ id: "a", status: "expired" });
   const records = [
@@ -524,6 +619,7 @@ class FakeRpc implements RpcClient {
     [8453, 3000n],
   ]);
   logs = new Map<SupportedChainId, ReturnType<typeof transfer>[]>();
+  unsupportedLogChains = new Set<SupportedChainId>();
   failure?: { from: bigint; persistent: boolean };
   failedIds = new Set<string>();
   headMode: "normal" | "throw" | "malformed" | "stale" = "normal";
@@ -550,6 +646,13 @@ class FakeRpc implements RpcClient {
         };
       }
       equal(call.method, "eth_getLogs");
+      if (this.unsupportedLogChains.has(chainId)) {
+        return {
+          jsonrpc: "2.0",
+          id: call.id,
+          error: { code: -32601, message: "eth_getLogs is unsupported on this chain" },
+        };
+      }
       const query = call.params[0] as {
         address: string;
         fromBlock: string;
