@@ -150,7 +150,7 @@ test("finalized amount reservations become reusable only after the quarantine wi
   });
 });
 
-test("concurrent creation is idempotent and enforces one open tuple", async () => {
+test("concurrent creation replays one key and gives fresh keys distinct attempts", async () => {
   await withService(async ({ service }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -171,7 +171,8 @@ test("concurrent creation is idempotent and enforces one open tuple", async () =
     assertEquals(new Set(invoices.map((invoice) => invoice.paidAmountUnits)).size, 1);
 
     const secondKey = await service.createInvoice(context("another-key"), input);
-    assertEquals(secondKey.id, invoices[0].id);
+    assert(secondKey.id !== invoices[0].id);
+    assert(secondKey.paidAmountUnits !== invoices[0].paidAmountUnits);
     await assertDomainError(
       () => service.createInvoice(creationContext, { ...input, customerReference: "changed" }),
       "idempotency_key_conflict",
@@ -214,7 +215,7 @@ test("admin overviews merge disabled chains and never expose invoice binding sec
   });
 });
 
-test("late inclusion is quarantined but pre-expiry inclusion can be accepted after expiry", async () => {
+test("expired unresolved attempts accept both late and pre-expiry canonical inclusion", async () => {
   await withService(async ({ service, rpc, clock }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -237,7 +238,7 @@ test("late inclusion is quarantined but pre-expiry inclusion can be accepted aft
     clock.advance(2 * 60 * 60 * 1000);
     assertEquals((await service.expireInvoice(late.id)).status, "expired");
     const lateClaim = await service.claimPayment(late.id, claim(hash(10), 100n));
-    assertEquals(lateClaim.invoice.status, "late_payment");
+    assertEquals(lateClaim.invoice.status, "confirming");
     assertEquals(lateClaim.eventJws, undefined);
 
     const onTime = await service.createInvoice(context("on-time"), {
@@ -266,7 +267,7 @@ test("late inclusion is quarantined but pre-expiry inclusion can be accepted aft
       productId: "pack",
       chainId: 8453,
     });
-    assertEquals(idempotentOpen.id, onTime.id);
+    assert(idempotentOpen.id !== onTime.id);
   });
 });
 

@@ -3,11 +3,12 @@ import { isOpenInvoiceStatus, type InvoiceRecord } from "./payment_types.ts";
 import type { SchedulerStorage } from "./worker_scheduler.ts";
 import type { WakeTarget } from "./wakeup.ts";
 import type { WorkerRequestBudget } from "./worker_budget.ts";
+import { adoptAccountIndexSlice } from "./account_store.ts";
 
-export const MIGRATION_OBJECT_NAME = "migration:checkout-events-v1";
-export const MIGRATION_STATE_KEY = "checkout_migration_v1";
+export const MIGRATION_OBJECT_NAME = "migration:checkout-events-v2";
+export const MIGRATION_STATE_KEY = "checkout_migration_v2";
 type Migration = {
-  phase: "invoices" | "outbox" | "complete";
+  phase: "invoices" | "accounts" | "outbox" | "complete";
   cursor: string | null;
   page?: { targets: WakeTarget[]; next: string | null; offset: number };
   owner?: { id: string; until: number };
@@ -54,6 +55,18 @@ export async function ensureWorkerMigration(options: {
   try {
     let state = await current();
     if (!state) return "pending";
+    if (state.phase === "accounts") {
+      const done = await adoptAccountIndexSlice(kv, {
+        budget,
+        isCurrent: async () => Boolean(await current()),
+      });
+      if (done && (await current())) {
+        state.phase = "outbox";
+        state.cursor = null;
+        await save(state);
+      }
+      return "pending";
+    }
     if (!state.page) {
       const prefix = ["uos_checkout", "v1", "payments", state.phase];
       const page = await kv.listPage<unknown>(prefix, { limit: 8, cursor: state.cursor });
@@ -90,7 +103,7 @@ export async function ensureWorkerMigration(options: {
       delete state.page;
       state.cursor = next;
       if (next === null) {
-        state.phase = state.phase === "invoices" ? "outbox" : "complete";
+        state.phase = state.phase === "invoices" ? "accounts" : "complete";
         state.cursor = null;
       }
       await save(state);

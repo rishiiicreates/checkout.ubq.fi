@@ -108,6 +108,7 @@ test("the final working slice stays pending until a later entry-complete request
   try {
     equal(await app.run(), "pending");
     equal(await app.run(), "pending");
+    equal(await app.run(), "pending");
     equal((await app.storage.get<{ phase: string }>(MIGRATION_STATE_KEY))?.phase, "complete");
     equal(await app.run(), "complete");
     equal(app.seen, []);

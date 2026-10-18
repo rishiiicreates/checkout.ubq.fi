@@ -5,8 +5,9 @@ import {
   listAccountAttemptPage,
   type AccountKey,
   type AttemptResolution,
+  type AccountAttemptReference,
 } from "./account_attempts.ts";
-import type { Kv } from "./kv.ts";
+import type { Kv, KvPage, KvPageOptions } from "./kv.ts";
 import { invoiceMatchesTransfer } from "./payment_discovery.ts";
 import {
   normalizeAddress,
@@ -27,6 +28,10 @@ export type AccountHuntDependencies = {
   kv: Kv;
   rpc: RpcClient;
   loadAttempt(invoiceId: string): Promise<LoadedAccountAttempt | null>;
+  listAttempts?: (
+    account: AccountKey,
+    options: KvPageOptions,
+  ) => Promise<KvPage<AccountAttemptReference>>;
 };
 export type AccountHuntOptions = {
   account: AccountKey;
@@ -41,6 +46,16 @@ export type AccountHuntOptions = {
   maximumEntries?: number;
   maximumRequestBytes?: number;
   maximumResponseBytes?: number;
+  /** A durable selection fenced to this account's membership revision by the caller. */
+  retained?: AccountHuntSelection;
+  deferSearchUntilEnumerated?: boolean;
+};
+export type AccountHuntSelection = {
+  accountHash: string;
+  snapshots: AccountAttemptSnapshot[];
+  cursor: string | null;
+  pendingReferences: AccountAttemptReference[];
+  complete: boolean;
 };
 export type AccountAttemptSnapshot = Readonly<{
   invoice: Readonly<InvoiceRecord>;
@@ -78,6 +93,7 @@ export type AccountHuntResult = {
   diagnostics: string[];
   /** Coverage of the selected index snapshot, never canonical settlement or an account lock. */
   reachedHead: boolean;
+  selection: AccountHuntSelection;
 };
 
 /** Read-only: no claims, domain writes, reservation changes or scheduled work. */
@@ -89,29 +105,46 @@ export async function huntAccountAttempts(
   const account: AccountKey = Object.freeze([...options.account] as [string, string]);
   const owner = await accountHash(account);
   const diagnostics = new Set<string>();
-  const selected: AccountAttemptSnapshot[] = [];
-  const seen = new Set<string>();
+  if (options.retained && options.retained.accountHash !== owner)
+    throw new PaymentDomainError("account_selection_mismatch");
+  const selected: AccountAttemptSnapshot[] = (options.retained?.snapshots ?? []).map((snapshot) =>
+    capture({ ...snapshot, invoice: { ...snapshot.invoice } }, account),
+  );
+  const seen = new Set(selected.map((snapshot) => snapshot.invoice.id));
   let pagesRead = 0;
   let attemptReads = 0;
-  let finished = false;
+  let finished = options.retained?.complete ?? false;
   let inconsistent = false;
-  let cursor: string | null = null;
-  enumeration: while (pagesRead < options.maximumPages) {
+  let cursor: string | null = options.retained?.cursor ?? null;
+  let pendingReferences = options.retained?.pendingReferences ?? [];
+  const failedReferences: AccountAttemptReference[] = [];
+  enumeration: while (!finished && pagesRead < options.maximumPages) {
     if (!(options.canRead?.("page") ?? true)) break;
     let page;
     try {
-      pagesRead++;
-      page = await listAccountAttemptPage(dependencies.kv, account, {
-        limit: options.pageSize,
-        cursor,
-      });
+      if (pendingReferences.length) {
+        page = { entries: pendingReferences.map((value) => ({ value })), cursor };
+        pendingReferences = [];
+      } else {
+        pagesRead++;
+        page = await (
+          dependencies.listAttempts ??
+          ((account, options) => listAccountAttemptPage(dependencies.kv, account, options))
+        )(account, {
+          limit: options.pageSize,
+          cursor,
+        });
+      }
     } catch {
       diagnostics.add("attempt_page_failed");
       break;
     }
-    for (const { value: reference } of page.entries) {
+    for (let offset = 0; offset < page.entries.length; offset++) {
+      const reference = page.entries[offset].value;
       if (seen.has(reference.invoiceId)) continue;
       if (attemptReads >= options.maximumAttempts || !(options.canRead?.("attempt") ?? true)) {
+        pendingReferences = page.entries.slice(offset).map((entry) => entry.value);
+        cursor = page.cursor;
         break enumeration;
       }
       seen.add(reference.invoiceId);
@@ -129,6 +162,7 @@ export async function huntAccountAttempts(
         selected.push(snapshot);
       } catch {
         inconsistent = true;
+        failedReferences.push(reference);
         diagnostics.add("attempt_load_or_identity_failed");
       }
     }
@@ -138,13 +172,17 @@ export async function huntAccountAttempts(
       break;
     }
   }
-  const enumerationComplete = finished && !inconsistent;
+  pendingReferences.push(...failedReferences);
+  const enumerationComplete = finished && !inconsistent && pendingReferences.length === 0;
   if (!enumerationComplete) diagnostics.add("attempt_selection_incomplete");
   const unresolvedAttempts = selected.filter((attempt) => attempt.resolution === "unresolved");
   const resolvedAttempts = selected.filter((attempt) => attempt.resolution !== "unresolved");
   const groups = groupAttempts(unresolvedAttempts);
   let callsUsed = 0;
-  const canRequest = () => callsUsed < options.maximumCalls && (options.canRequest?.() ?? true);
+  const canRequest = () =>
+    !(options.deferSearchUntilEnumerated && !enumerationComplete) &&
+    callsUsed < options.maximumCalls &&
+    (options.canRequest?.() ?? true);
   const limits = {
     maximumRequestBytes: options.maximumRequestBytes ?? 256 * 1024,
     maximumResponseBytes: options.maximumResponseBytes ?? 1024 * 1024,
@@ -266,6 +304,13 @@ export async function huntAccountAttempts(
     observations: [...observations.values()],
     diagnostics: [...diagnostics],
     reachedHead: enumerationComplete && groups.every((group) => group.reachedHead),
+    selection: {
+      accountHash: owner,
+      snapshots: selected,
+      cursor,
+      pendingReferences,
+      complete: enumerationComplete,
+    },
   };
 }
 

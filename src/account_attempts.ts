@@ -202,16 +202,17 @@ function accountPrefix(owner: string): KvKey {
 }
 
 async function ownershipPrefix(fingerprint: AmountFingerprint): Promise<KvKey> {
-  return [
-    ...PREFIX,
-    "amount_ownership",
-    await digest("uos_checkout.amount.v1", [
-      fingerprint.chainId,
-      fingerprint.tokenAddress,
-      fingerprint.treasuryAddress,
-      fingerprint.amountUnits.toString(),
-    ]),
-  ];
+  return [...PREFIX, "amount_ownership", await amountOwnershipHash(fingerprint)];
+}
+
+export async function amountOwnershipHash(input: AmountFingerprint): Promise<string> {
+  const fingerprint = normalizedFingerprint(input);
+  return digest("uos_checkout.amount.v1", [
+    fingerprint.chainId,
+    fingerprint.tokenAddress,
+    fingerprint.treasuryAddress,
+    fingerprint.amountUnits.toString(),
+  ]);
 }
 
 function chronologicalId(value: AccountAttemptReference): string {

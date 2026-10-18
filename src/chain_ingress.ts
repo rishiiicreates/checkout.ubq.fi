@@ -27,6 +27,7 @@ export type ChainTransferMatch = {
 export type ChainTransferContext = {
   /** The payment transaction checks this same receipt version before committing. */
   fence?: KvCheck;
+  fences?: KvCheck[];
   budget?: WorkerRequestBudget;
   deadline: number;
   /** Costs one KV read; check before asynchronous canonical mutation phases. */
@@ -40,6 +41,7 @@ export type ChainIngressOptions = {
   ): Promise<{ terminal: boolean }>;
   /** Minimum calls for ONE viable callback phase, including its isCurrent reads. Larger phases must defer. */
   minimumTransferCalls: number;
+  prepareTransfer?: (event: ChainTransferEvent, context: ChainTransferContext) => Promise<boolean>;
   budget?: WorkerRequestBudget;
   deadline?: number;
   clock?: Clock;
@@ -56,6 +58,8 @@ export type ChainEventReceipt = VerifiedChainEventDelivery & {
   state: "pending" | "complete";
   leaseId?: string;
   leaseUntil?: number;
+  accountPrepared?: number;
+  requiresAccountPreparation?: boolean;
 };
 
 export function chainEventReceiptKey(identity: Reference): KvKey {
@@ -122,7 +126,7 @@ async function processReceipt(
   }
   if (!capacity(options, 3)) return pending();
   const key = chainEventReceiptKey(identity);
-  const existing = await kv.get<ChainEventReceipt>(key);
+  let existing = await kv.get<ChainEventReceipt>(key);
   if (existing.value && existing.value.bodySha256 !== identity.bodySha256) {
     throw new ChainWebhookError("chain_webhook_replay_conflict", 409);
   }
@@ -131,6 +135,53 @@ async function processReceipt(
     throw new ChainWebhookError("chain_webhook_busy", 503);
   }
   if (!existing.value && !delivery) return pending();
+  if (existing.value?.requiresAccountPreparation && !options.prepareTransfer) return pending();
+  if (options.prepareTransfer) {
+    if (!existing.value) {
+      const initial: ChainEventReceipt = {
+        ...delivery!,
+        schemaVersion: 1,
+        nextIndex: 0,
+        state: "pending",
+        accountPrepared: 0,
+        requiresAccountPreparation: true,
+      };
+      const saved = await kv.atomic().check(existing).set(key, initial).commit();
+      if (!saved.ok) return pending();
+      existing = { key, value: initial, versionstamp: saved.versionstamp };
+    }
+    while ((existing.value!.accountPrepared ?? 0) < existing.value!.transfers.length) {
+      if (!capacity(options, 4) || Date.now() >= deadline) return pending();
+      const snapshot = existing;
+      const release = budget?.reserveForCompletion(1);
+      let prepared: boolean;
+      try {
+        prepared = await options.prepareTransfer(
+          existing.value!.transfers[existing.value!.accountPrepared ?? 0],
+          {
+            budget,
+            deadline,
+            fence: { key, versionstamp: snapshot.versionstamp },
+            isCurrent: async () =>
+              Date.now() < deadline &&
+              (await kv.get<ChainEventReceipt>(key)).versionstamp === snapshot.versionstamp,
+          },
+        );
+      } catch {
+        return pending();
+      } finally {
+        release?.();
+      }
+      if (!prepared) return pending();
+      const next: ChainEventReceipt = {
+        ...existing.value!,
+        accountPrepared: (existing.value!.accountPrepared ?? 0) + 1,
+      };
+      const saved = await kv.atomic().check(existing).set(key, next).commit();
+      if (!saved.ok) return pending();
+      existing = { key, value: next, versionstamp: saved.versionstamp };
+    }
+  }
   if (expectedIndex !== undefined && existing.value?.nextIndex !== expectedIndex) return pending();
   if (Date.now() >= deadline) return pending();
   const leaseId = crypto.randomUUID();

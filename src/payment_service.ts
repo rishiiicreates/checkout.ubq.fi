@@ -55,6 +55,19 @@ import {
   verifyTransferBatch,
 } from "./rpc.ts";
 import { WorkerBudgetError } from "./worker_budget.ts";
+import {
+  runAccountHunt,
+  resolveTransferAttribution,
+  type AccountHuntJson,
+} from "./account_runtime.ts";
+import {
+  prepareAccountAttempt,
+  adoptAccountIndexSlice,
+  treasuryHistoryKey,
+  ACCOUNT_INDEX_STATE_KEY,
+  type AttemptState,
+} from "./account_store.ts";
+import { legacyAttemptResolution } from "./account_attempts.ts";
 
 const PREFIX: KvKey = ["uos_checkout", "v1", "payments"];
 const INVOICES_PREFIX: KvKey = [...PREFIX, "invoices"];
@@ -118,6 +131,7 @@ export type ClaimPaymentResult = {
   invoice: InvoiceJson;
   eventJws?: string;
   discovery?: { found: boolean; searchedToBlock?: string };
+  accountHunt?: AccountHuntJson;
 };
 
 function hasCurrentPaymentRecord(invoice: Pick<InvoiceRecord, "paymentId" | "status">): boolean {
@@ -146,6 +160,7 @@ type ClaimSnapshot = {
   invoiceEntry?: KvEntryMaybe<InvoiceRecord>;
   locatorEntry?: KvEntryMaybe<LocatorIndex>;
   paymentEntry?: KvEntryMaybe<PaymentRecord>;
+  attributed?: boolean;
 };
 
 type ReconciliationCursor = {
@@ -209,41 +224,97 @@ export function createPaymentService(options: PaymentServiceOptions) {
     getChainConfiguration: (chainId: unknown) =>
       getChainConfiguration(kv, supportedChainId(chainId)),
     listChainConfigurations: () => listChainConfigurations(kv),
-    createInvoice: (context: InvoiceCreationContext, input: CreateInvoiceInput) =>
-      createInvoice(context, input),
+    createInvoice: async (context: InvoiceCreationContext, input: CreateInvoiceInput) => {
+      const invoice = await createInvoice(context, input);
+      const result = await discoverAccount(invoice.id);
+      return { ...result.invoice, accountHunt: result.accountHunt };
+    },
     getInvoice: async (invoiceId: unknown) => invoiceJson(await invoiceRecord(kv, invoiceId)),
     listInvoices: (limit?: number) => listInvoices(kv, limit),
     getInvoiceRecord: (invoiceId: unknown) => invoiceRecord(kv, invoiceId),
     claimPayment: (invoiceId: unknown, input: ClaimPaymentInput) => claimPayment(invoiceId, input),
-    processChainTransfer: (event: ChainTransferEvent, context: ChainTransferContext) =>
-      processChainTransfer(event, context),
+    reportPayment: async (invoiceId: unknown, input: ClaimPaymentInput) => {
+      await claimPayment(invoiceId, input);
+      return discoverAccount(invoiceId);
+    },
+    processChainTransfer: async (event: ChainTransferEvent, context: ChainTransferContext) => {
+      return processChainTransfer(event, context);
+    },
+    prepareChainTransfer: async (event: ChainTransferEvent, context: ChainTransferContext) => {
+      // A negative inclusion hint belongs to canonical reorg handling below, not a positive search.
+      if (event.removed) return true;
+      if (!(context.budget?.hasCapacity(6) ?? true)) return false;
+      const [reservation, locator, index] = await kv.getMany<
+        [AmountReservation, LocatorIndex, { complete: boolean }]
+      >([
+        amountReservationKey(
+          event.chainId,
+          event.tokenAddress,
+          event.recipientAddress,
+          event.amountUnits,
+        ),
+        paymentLocatorKey(event.chainId, event.transactionHash, event.logIndex),
+        ACCOUNT_INDEX_STATE_KEY,
+      ]);
+      const id = locator.value?.invoiceId ?? reservation.value?.invoiceId;
+      if (!id) return true;
+      const anchor = await kv.get<InvoiceRecord>(invoiceKey(id));
+      if (
+        !anchor.value ||
+        anchor.value.treasuryAddress.toLowerCase() !== event.recipientAddress.toLowerCase()
+      )
+        return true;
+      if (event.removed) {
+        const payment = anchor.value.paymentId
+          ? (await kv.get<PaymentRecord>(paymentKey(anchor.value.paymentId))).value
+          : null;
+        if (
+          !payment ||
+          payment.transactionHash !== event.transactionHash ||
+          payment.logIndex !== event.logIndex ||
+          payment.blockNumber !== event.blockNumber ||
+          payment.blockHash !== event.blockHash
+        )
+          return true;
+      }
+      const result = await discoverAccount(
+        id,
+        { ...context, fences: [...(context.fences ?? []), index] },
+        anchor,
+        true,
+        index.value?.complete === true,
+      );
+      return result.accountHunt?.complete === true;
+    },
     discoverPayment: (
       invoiceId: unknown,
       search?: Pick<DiscoveryOptions, "expiryToBlock" | "isCurrent">,
     ) =>
-      discoverInvoicePayment(
-        {
-          kv,
-          rpc,
-          clock,
-          claim: (id, input, invoiceEntry) =>
-            claimPayment(
-              id,
-              input,
-              search?.expiryToBlock === undefined
-                ? undefined
-                : {
-                    budget: options.discovery?.budget,
-                    deadline: options.discovery?.deadline ?? Date.now() + 20_000,
-                    isCurrent: search.isCurrent ?? (async () => true),
-                  },
-              { invoiceEntry },
-            ),
-          existingEvent: signedExistingEvent,
-        },
-        invoiceId,
-        { ...options.discovery, ...search },
-      ),
+      search?.expiryToBlock === undefined
+        ? discoverAccount(invoiceId)
+        : discoverInvoicePayment(
+            {
+              kv,
+              rpc,
+              clock,
+              claim: (id, input, invoiceEntry) =>
+                claimPayment(
+                  id,
+                  input,
+                  search?.expiryToBlock === undefined
+                    ? undefined
+                    : {
+                        budget: options.discovery?.budget,
+                        deadline: options.discovery?.deadline ?? Date.now() + 20_000,
+                        isCurrent: search.isCurrent ?? (async () => true),
+                      },
+                  { invoiceEntry },
+                ),
+              existingEvent: signedExistingEvent,
+            },
+            invoiceId,
+            { ...options.discovery, ...search },
+          ),
     refreshInvoice: (invoiceId: unknown) => refreshInvoice(invoiceId),
     expireInvoice: (invoiceId: unknown) => expireInvoice(invoiceId),
     markManualReview: (invoiceId: unknown) => markManualReview(invoiceId),
@@ -279,6 +350,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     context?: ChainTransferContext,
   ) {
     if (context?.fence) atomic.check(context.fence);
+    if (context?.fences) atomic.check(...context.fences);
     if (!options.wakeups) {
       if (context && !(await context.isCurrent())) throw new StaleWakeupError();
       return atomic.commit();
@@ -319,6 +391,103 @@ export function createPaymentService(options: PaymentServiceOptions) {
     );
   }
 
+  async function discoverAccount(
+    invoiceIdInput: unknown,
+    context?: ChainTransferContext,
+    suppliedAnchor?: KvEntryMaybe<InvoiceRecord>,
+    reuseComplete = false,
+    indexReady = false,
+  ): Promise<ClaimPaymentResult> {
+    const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
+    const anchor = suppliedAnchor ?? (await kv.get<InvoiceRecord>(invoiceKey(invoiceId)));
+    if (!anchor.value) throw new PaymentDomainError("invoice_not_found");
+    const result = await runAccountHunt({
+      kv,
+      rpc,
+      anchor,
+      budget: context?.budget ?? options.discovery?.budget,
+      deadline: context?.deadline ?? options.discovery?.deadline,
+      context,
+      reuseComplete,
+      indexReady,
+      verifyCredit: async (entry, scope) => {
+        if (!entry.value?.paymentId || legacyAttemptResolution(entry.value) !== "credited")
+          return null;
+        const payment = await kv.get<PaymentRecord>(paymentKey(entry.value.paymentId));
+        if (!payment.value || !(await scope.isCurrent())) return null;
+        try {
+          const evidence = await verifyTransferBatch(verificationRpc(scope), entry.value.chainId, {
+            transactionHash: payment.value.transactionHash,
+            logIndex: payment.value.logIndex,
+            observedBlockNumber: payment.value.blockNumber,
+            observedBlockHash: payment.value.blockHash,
+            previouslyVerifiedBlockHash: payment.value.blockHash,
+            tokenAddress: entry.value.tokenAddress,
+            recipientAddress: entry.value.treasuryAddress,
+            amountUnits: entry.value.paidAmountUnits,
+          });
+          return ((evidence.safeBlock !== null && evidence.safeBlock >= evidence.blockNumber) ||
+            (evidence.finalizedBlock !== null &&
+              evidence.finalizedBlock >= evidence.blockNumber)) &&
+            (await scope.isCurrent())
+            ? [entry, payment]
+            : null;
+        } catch {
+          return null;
+        }
+      },
+      claim: async (entry, log, scope, attribution) => {
+        await claimPayment(
+          entry.value!.id,
+          {
+            transactionHash: log.transactionHash,
+            logIndex: String(log.logIndex),
+            observedBlockNumber: log.blockNumber.toString(),
+            observedBlockHash: log.blockHash,
+          },
+          scope,
+          { invoiceEntry: entry, locatorEntry: attribution.locator, attributed: true },
+        );
+      },
+      refresh: async (entry, scope) => {
+        await refreshInvoice(entry.value!.id, scope, { invoiceEntry: entry });
+      },
+      invalidate: async (entry, state, reservation, scope, checks) => {
+        const next: InvoiceRecord = {
+          ...entry.value!,
+          status: "expired",
+          expiredAt: entry.value!.expiredAt ?? clock.now().toISOString(),
+          updatedAt: clock.now().toISOString(),
+        };
+        let atomic = kv
+          .atomic()
+          .check(entry, state, reservation, ...checks)
+          .set(entry.key, next)
+          .set(state.key, { ...state.value!, resolution: "invalidated" } satisfies AttemptState);
+        if (reservation.value?.invoiceId === next.id) atomic = atomic.delete(reservation.key);
+        return (await commitInvoice(atomic, next, undefined, undefined, scope)).ok;
+      },
+    });
+    const group = result.accountHunt.groups.find(
+      (group) =>
+        group.chainId === anchor.value!.chainId &&
+        group.tokenAddress === anchor.value!.tokenAddress.toLowerCase() &&
+        group.treasuryAddress === anchor.value!.treasuryAddress.toLowerCase(),
+    );
+    return {
+      invoice: result.anchor,
+      accountHunt: result.accountHunt,
+      discovery: {
+        found: hasCurrentPaymentRecord(result.anchor),
+        ...(group?.searchedToBlock === undefined ? {} : { searchedToBlock: group.searchedToBlock }),
+      },
+      ...(hasCurrentPaymentRecord(result.anchor) &&
+      (context?.budget ?? options.discovery?.budget)?.hasCapacity(1) !== false
+        ? { eventJws: await signedExistingEvent(result.anchor) }
+        : {}),
+    };
+  }
+
   async function processChainTransfer(
     event: ChainTransferEvent,
     context: ChainTransferContext,
@@ -331,6 +500,29 @@ export function createPaymentService(options: PaymentServiceOptions) {
     });
     const room = (calls: number) =>
       Date.now() < context.deadline && (context.budget?.hasCapacity(calls) ?? true);
+    if (
+      event.tokenAddress.toLowerCase() !==
+      CHAIN_CONFIGURATIONS[event.chainId].tokenAddress.toLowerCase()
+    )
+      return ignored();
+    if (!room(4)) return deferred();
+    const [registeredTreasury, settings] = await kv.getMany<[boolean, PaymentChainSettings]>([
+      treasuryHistoryKey(event.chainId, event.tokenAddress, event.recipientAddress),
+      chainSettingsKey(event.chainId),
+    ]);
+    if (
+      !registeredTreasury.value &&
+      settings.value?.treasuryAddress.toLowerCase() !== event.recipientAddress.toLowerCase()
+    )
+      return ignored();
+    let indexed = await adoptAccountIndexSlice(kv, {
+      budget: context.budget,
+      isCurrent: context.isCurrent,
+    });
+    if (!context.budget)
+      for (let count = 0; !indexed && count < 1000; count++)
+        indexed = await adoptAccountIndexSlice(kv, { isCurrent: context.isCurrent });
+    if (!indexed) return deferred();
     if (!room(3)) return deferred();
     const locatorKey = paymentLocatorKey(event.chainId, event.transactionHash, event.logIndex);
     const [reservation, locator] = await kv.getMany<[AmountReservation, LocatorIndex]>([
@@ -343,7 +535,18 @@ export function createPaymentService(options: PaymentServiceOptions) {
       locatorKey,
     ]);
     const id = locator.value?.invoiceId ?? reservation.value?.invoiceId;
-    if (!id) return ignored();
+    if (!id) {
+      const attribution = await resolveTransferAttribution({
+        kv,
+        chainId: event.chainId,
+        log: event,
+        budget: context.budget,
+        context,
+        provenance: "signed_chain_event",
+        removed: event.removed,
+      });
+      return { terminal: attribution.complete, disposition: attribution.classification };
+    }
     const invoiceEntry = await kv.get<InvoiceRecord>(invoiceKey(id));
     const invoice = invoiceEntry.value;
     if (
@@ -501,33 +704,6 @@ export function createPaymentService(options: PaymentServiceOptions) {
         return invoiceJson(await invoiceRecord(kv, idempotency.value.invoiceId));
       }
 
-      const open = await kv.get<OpenInvoiceIndex>(openKey);
-      if (open.value) {
-        const existing = await kv.get<InvoiceRecord>(invoiceKey(open.value.invoiceId));
-        if (!existing.value || !isOpenInvoiceStatus(existing.value.status)) {
-          await kv.atomic().check(open).delete(openKey).commit();
-          continue;
-        }
-        if (
-          existing.value.status === "awaiting_payment" &&
-          Date.parse(existing.value.expiresAt) <= clock.now().getTime()
-        ) {
-          await expireAwaiting(kv, clock, existing, open, openKey, options.wakeups);
-          continue;
-        }
-        if (open.value.requestFingerprint !== requestFingerprint) {
-          throw new PaymentDomainError("open_invoice_conflict");
-        }
-        const committed = await kv
-          .atomic()
-          .check(idempotency)
-          .check(open)
-          .set(idempotencyKeyEntry, open.value)
-          .commit();
-        if (committed.ok) return invoiceJson(existing.value);
-        continue;
-      }
-
       const versionEntry = await kv.get<CatalogVersionRecord>(
         catalogVersionKey(merchant, pricingVersionId),
       );
@@ -559,12 +735,10 @@ export function createPaymentService(options: PaymentServiceOptions) {
           treasuryAddress,
           paidAmountUnits,
         );
-        const [reservation, currentOpen, currentIdempotency] = await Promise.all([
-          kv.get<AmountReservation>(reservationKey),
-          kv.get<OpenInvoiceIndex>(openKey),
-          kv.get<IdempotencyIndex>(idempotencyKeyEntry),
-        ]);
-        if (currentIdempotency.value || currentOpen.value) break;
+        const [reservation, currentOpen, currentIdempotency] = await kv.getMany<
+          [AmountReservation, OpenInvoiceIndex, IdempotencyIndex]
+        >([reservationKey, openKey, idempotencyKeyEntry]);
+        if (currentIdempotency.value) break;
         let reservedInvoice: KvEntryMaybe<InvoiceRecord> | null = null;
         if (reservation.value !== null) {
           if (typeof reservation.value.invoiceId !== "string") {
@@ -618,6 +792,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
           .set(openKey, index)
           .set(idempotencyKeyEntry, index);
         if (reservedInvoice) atomic = atomic.check(reservedInvoice);
+        const prepared = await prepareAccountAttempt(kv, record, true);
+        atomic = prepared.apply(atomic);
         const committed = await commitInvoice(atomic, record);
         if (committed.ok) return invoiceJson(record);
         continue creationLoop;
@@ -660,6 +836,43 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const existingLocator = snapshot?.locatorEntry ?? (await kv.get<LocatorIndex>(locatorKey));
     if (existingLocator.value && existingLocator.value.invoiceId !== invoice.id) {
       throw new PaymentDomainError("payment_locator_already_claimed");
+    }
+    if (!snapshot?.attributed && !existingLocator.value) {
+      let ready = await adoptAccountIndexSlice(kv, {
+        budget: context?.budget ?? options.discovery?.budget,
+        isCurrent: context?.isCurrent,
+      });
+      if (!(context?.budget ?? options.discovery?.budget))
+        for (let count = 0; !ready && count < 1000; count++)
+          ready = await adoptAccountIndexSlice(kv);
+      if (!ready) return { invoice: invoiceJson(invoice) };
+      const attribution = await resolveTransferAttribution({
+        kv,
+        chainId: invoice.chainId,
+        invoice,
+        log: {
+          transactionHash,
+          logIndex,
+          blockNumber: observedBlockNumber,
+          blockHash: observedBlockHash ?? `0x${"0".repeat(64)}`,
+          tokenAddress: invoice.tokenAddress,
+          recipientAddress: invoice.treasuryAddress,
+          amountUnits: invoice.paidAmountUnits,
+          payerAddress: `0x${"0".repeat(40)}`,
+        },
+        budget: context?.budget ?? options.discovery?.budget,
+        context,
+        provenance: "wallet_report_unverified",
+      });
+      if (!attribution.complete || attribution.classification !== "owned")
+        return { invoice: invoiceJson(invoice) };
+      context = {
+        budget: context?.budget ?? options.discovery?.budget,
+        deadline: context?.deadline ?? options.discovery?.deadline ?? Date.now() + 20_000,
+        isCurrent: context?.isCurrent ?? (async () => true),
+        fence: context?.fence,
+        fences: [...(context?.fences ?? []), ...(attribution.checks ?? [])],
+      };
     }
     if (invoice.status === "reverted" && invoice.paymentId) {
       const payment =
@@ -756,7 +969,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       invoice.chainId,
     );
     const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
-    const conflictingOpen = openEntry.value !== null && openEntry.value.invoiceId !== invoice.id;
+    const conflictingOpen = false;
     const nextInvoice: InvoiceRecord = {
       ...invoice,
       status: "confirming",
@@ -856,7 +1069,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     };
     const headsEntry = await kv.get<ChainHeadRecord>(headKey(invoice.chainId));
     const heads = mergeHeads(invoice.chainId, headsEntry.value, evidence, timestamp);
-    const includedLate = evidence.blockTimestamp.getTime() >= Date.parse(invoice.expiresAt);
+    const includedLate = false;
     const openKey = openInvoiceKey(
       invoice.merchant,
       invoice.customerReference,
@@ -864,8 +1077,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       invoice.chainId,
     );
     const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
-    const conflictingOpen =
-      !includedLate && openEntry.value !== null && openEntry.value.invoiceId !== invoice.id;
+    const conflictingOpen = false;
     const nextInvoice: InvoiceRecord = {
       ...invoice,
       paymentId,

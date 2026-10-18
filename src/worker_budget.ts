@@ -4,12 +4,25 @@ import type { FetchLike } from "./rpc.ts";
 export class WorkerRequestBudget {
   private used = 0;
   private held = 0;
+  private nested = 0;
   constructor(
     private readonly maximum: number,
     private readonly signal?: AbortSignal,
   ) {}
   get remaining(): number {
-    return this.maximum - this.used - this.held;
+    return this.maximum - this.used - this.held - this.nested;
+  }
+  get limit(): number {
+    return this.maximum;
+  }
+  get nestedInvocations(): number {
+    return this.nested;
+  }
+  /** Charge a binding's full nested upper bound before issuing it, preserving one final call. */
+  reserveNestedInvocations(calls: number): void {
+    if (!Number.isSafeInteger(calls) || calls < 0 || !this.hasCapacity(calls + 2))
+      throw new WorkerBudgetError();
+    this.nested += calls;
   }
   hasCapacity(calls: number): boolean {
     return !this.signal?.aborted && this.remaining >= calls;
