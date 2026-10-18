@@ -250,7 +250,7 @@ export function createEntityJobRunner(
         if (!(await isCurrent())) return null;
         const saved = await writePass(
           invoice.id,
-          { toBlock: heads.safeBlock ?? heads.finalizedBlock ?? heads.latestBlock, failures: 0 },
+          { toBlock: heads.latestBlock, failures: 0 },
           isCurrent,
         );
         return continuation(currentJob, now, saved ?? state);

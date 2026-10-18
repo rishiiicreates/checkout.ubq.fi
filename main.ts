@@ -118,6 +118,7 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
       kv: services.kv,
       budget: services.budget,
       minimumTransferCalls: 12,
+      prepareTransfer: services.payment.prepareChainTransfer,
       processTransfer: services.payment.processChainTransfer,
     });
   }
@@ -295,7 +296,7 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
       )
     )
       throw new HttpError(400, "invalid_claim_input");
-    const result = await services.payment.claimPayment(invoiceId, {
+    const result = await services.payment.reportPayment(invoiceId, {
       transactionHash: body.transactionHash,
       logIndex: body.logIndex,
       observedBlockNumber: body.observedBlockNumber,
@@ -367,11 +368,12 @@ async function relatedInvoiceEvent(
           kv: services.kv,
           budget: services.budget,
           minimumTransferCalls: 3,
+          prepareTransfer: services.payment.prepareChainTransfer,
           processTransfer: services.payment.processChainTransfer,
         },
       );
     }
-    if (services.wakeups?.ensure && (services.budget?.hasCapacity(1) ?? true)) {
+    if (services.wakeups?.ensure && (services.budget?.hasCapacity(9) ?? true)) {
       await services.wakeups.ensure({
         kind: "invoice",
         id: invoice.id,

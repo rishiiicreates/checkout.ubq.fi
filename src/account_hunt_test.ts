@@ -507,3 +507,46 @@ class FakeRpc implements RpcClient {
     });
   }
 }
+
+test("retained selection resumes an interrupted page without losing earlier attempts or repeating their loads", async () => {
+  const app = await setup([invoice({ id: "a" }), invoice({ id: "b" }), invoice({ id: "c" })]);
+  try {
+    const loaded: string[] = [];
+    const dependencies = {
+      ...app.dependencies,
+      loadAttempt: async (id: string) => {
+        loaded.push(id);
+        return app.dependencies.loadAttempt(id);
+      },
+    };
+    const first = await huntAccountAttempts(
+      dependencies,
+      options({ maximumAttempts: 1, deferSearchUntilEnumerated: true }),
+    );
+    equal(first.enumerationComplete, false);
+    equal(first.selection.pendingReferences.length, 2);
+    equal(first.callsUsed, 0);
+    const second = await huntAccountAttempts(
+      dependencies,
+      options({ maximumAttempts: 1, deferSearchUntilEnumerated: true, retained: first.selection }),
+    );
+    equal(second.enumerationComplete, false);
+    equal(second.selection.pendingReferences.length, 1);
+    equal(second.callsUsed, 0);
+    const third = await huntAccountAttempts(
+      dependencies,
+      options({ maximumAttempts: 1, deferSearchUntilEnumerated: true, retained: second.selection }),
+    );
+    equal(third.enumerationComplete, true);
+    equal(third.reachedHead, true);
+    equal(third.selection.pendingReferences, []);
+    equal(
+      third.unresolvedAttempts.map((snapshot) => snapshot.invoice.id),
+      ["a", "b", "c"],
+    );
+    equal(loaded, ["a", "b", "c"]);
+    equal(third.callsUsed, 2);
+  } finally {
+    app.kv.close();
+  }
+});

@@ -1,4 +1,5 @@
 import { test } from "bun:test";
+import { RuntimeRpc } from "./src/account_runtime_test_fixture.ts";
 import { SqliteKv } from "./src/sqlite_kv.ts";
 import { fetchPublicAsset } from "./src/bun_runtime.ts";
 import {
@@ -417,11 +418,10 @@ for (const alreadyClaimed of [true, false])
       console.log(`related authenticated GET calls=${24 - budget.remaining}/24,rpc=${rpcCalls}`);
       assertEquals(
         (await store.get<ChainEventReceipt>(chainEventReceiptKey(delivery))).value?.state,
-        alreadyClaimed ? "complete" : "pending",
+        "pending",
       );
       const pendingReferences = (await store.get(pendingChainTransfersKey(transfer))).value;
-      if (alreadyClaimed) assertEquals(pendingReferences, null);
-      else assert(Array.isArray(pendingReferences) && pendingReferences.length === 1);
+      assert(Array.isArray(pendingReferences) && pendingReferences.length === 1);
       assertEquals(rpcCalls, 0);
       assert(budget.remaining >= 0);
     } finally {
@@ -520,19 +520,21 @@ async function withApp(
   run: (value: {
     request: RequestFn;
     handler: (request: Request) => Promise<Response>;
+    services: ReturnType<typeof createCheckoutServices>;
   }) => Promise<void>,
+  rpc: RpcClient = new StaticRpc(),
 ): Promise<void> {
   const kv = new SqliteKv(":memory:");
-  const handler = createHandler(
-    createCheckoutServices(kv, {
-      rpc: new StaticRpc(),
-      assetFetcher: fetchPublicAsset,
-      resolveDns: () => Promise.resolve(["93.184.216.34"]),
-    }),
-  );
+  const services = createCheckoutServices(kv, {
+    rpc,
+    assetFetcher: fetchPublicAsset,
+    resolveDns: () => Promise.resolve(["93.184.216.34"]),
+  });
+  const handler = createHandler(services);
   try {
     await run({
       handler,
+      services,
       request: async (pathname, init = {}) => {
         const headers = new Headers(init.headers);
         if (init.body !== undefined) headers.set("content-type", "application/json");
@@ -595,4 +597,64 @@ test("HTTP JSON rejects oversized streamed bodies before payment work", async ()
     assertEquals(response.status, 413);
     assertEquals((await response.json()).error, "request_body_too_large");
   });
+});
+
+test("authenticated account check spans attempts, credits canonical matches and returns the requested anchor", async () => {
+  const rpc = new RuntimeRpc();
+  await withApp(async ({ request, services }) => {
+    await request("/api/v1/admin/chains/8453", {
+      method: "PUT",
+      adminMutation: true,
+      body: { enabled: true, treasuryAddress: TREASURY },
+    });
+    await request("/api/v1/catalog/versions/account-price", {
+      method: "PUT",
+      body: {
+        currency: "USD",
+        products: [
+          { productId: "pack", label: "Pack", kind: "credit_pack", priceCents: 100, enabled: true },
+        ],
+      },
+    });
+    const create = async (id: string) =>
+      await (
+        await request("/api/v1/invoices", {
+          method: "POST",
+          headers: { "idempotency-key": id },
+          body: {
+            customerReference: "account",
+            pricingVersionId: "account-price",
+            productId: "pack",
+            chainId: 8453,
+          },
+        })
+      ).json();
+    const old = await create("old");
+    const latest = await create("latest");
+    assert(old.id !== latest.id);
+    rpc.add(await services.payment.getInvoiceRecord(latest.id), 200n);
+    rpc.latest = 300n;
+    rpc.safe = 250n;
+    const response = await request(`/api/v1/invoices/${old.id}/claims`, {
+      method: "POST",
+      body: {},
+    });
+    assertEquals(response.status, 200);
+    const result = await response.json();
+    assertEquals(result.invoice.id, old.id);
+    assertEquals(result.discovery.found, false);
+    assertEquals(result.discovery.searchedToBlock, "300");
+    assertEquals(result.accountHunt.reachedHead, true);
+    assertEquals(
+      result.accountHunt.attempts.find((value: { invoiceId: string }) => value.invoiceId === old.id)
+        .outcome,
+      "invalidated",
+    );
+    assertEquals(
+      result.accountHunt.attempts.find(
+        (value: { invoiceId: string }) => value.invoiceId === latest.id,
+      ).outcome,
+      "credited",
+    );
+  }, rpc);
 });

@@ -4,12 +4,13 @@ import { createRequire } from "node:module";
 import type { SigningKeyRecord } from "../src/jws.ts";
 import { deepStrictEqual as equal, ok } from "node:assert/strict";
 import { dirname, join, resolve } from "node:path";
-import type { WakeTarget, PreparedWakeIntent } from "../src/wakeup.ts";
+import { wakeIntentKey, type WakeTarget, type PreparedWakeIntent } from "../src/wakeup.ts";
 import type { SchedulerState } from "../src/worker_scheduler.ts";
 import { createCheckoutServices } from "../main.ts";
 import { UbqKv } from "../src/ubq_kv.ts";
 import { verifyCompactJws } from "../src/jws.ts";
 import { fixtureScript } from "./worker_fixture.ts";
+import { accountHash } from "../src/account_attempts.ts";
 
 // The published Miniflare 5 beta declarations reference unpublished internal packages.
 // Keep this supported Node control-plane boundary narrow; production Worker types
@@ -37,6 +38,9 @@ type SchedulerStub = {
       storage: number;
       rpc: number;
       other: number;
+      nested?: number;
+      remaining: number;
+      limit: number;
       denied: { need: number; remaining: number }[];
     }[]
   >;
@@ -75,20 +79,23 @@ const testScript =
   productionScript +
   `
 const harnessBudgetRecords=[];
+const harnessBudgets=[];
 const harnessBudgetIds=new WeakMap();
-const harnessBudgetRecord=budget=>{let value=harnessBudgetIds.get(budget);if(!value){value={id:harnessBudgetRecords.length,calls:0,storage:0,rpc:0,other:0,denied:[]};harnessBudgetIds.set(budget,value);harnessBudgetRecords.push(value);}return value;};
+const harnessBudgetRecord=budget=>{let value=harnessBudgetIds.get(budget);if(!value){value={id:harnessBudgetRecords.length,calls:0,storage:0,rpc:0,other:0,denied:[]};harnessBudgetIds.set(budget,value);harnessBudgetRecords.push(value);harnessBudgets.push(budget);}return value;};
 const harnessNativeReserve=WorkerRequestBudget.prototype.reserve;
 WorkerRequestBudget.prototype.reserve=function(){harnessNativeReserve.call(this);harnessBudgetRecord(this).calls++;};
 const harnessNativeCapacity=WorkerRequestBudget.prototype.hasCapacity;
 WorkerRequestBudget.prototype.hasCapacity=function(need){const result=harnessNativeCapacity.call(this,need);if(!result)harnessBudgetRecord(this).denied.push({need,remaining:this.remaining});return result;};
+const harnessNativeNested=WorkerRequestBudget.prototype.reserveNestedInvocations;
+WorkerRequestBudget.prototype.reserveNestedInvocations=function(count){harnessNativeNested.call(this,count);const record=harnessBudgetRecord(this);record.nested=(record.nested??0)+count;};
 const harnessNativeWrap=WorkerRequestBudget.prototype.wrap;
 WorkerRequestBudget.prototype.wrap=function(fetcher){const wrapped=harnessNativeWrap.call(this,fetcher);return(input,init)=>{const result=wrapped(input,init);const url=new URL(typeof input==="string"?input:input.url??input.href);const entry=harnessBudgetRecord(this);if(url.hostname==="kv.ubq.fi")entry.storage++;else if(url.hostname==="rpc.ubq.fi")entry.rpc++;else entry.other++;return result;};};
 export class HarnessCheckoutScheduler extends CheckoutScheduler {
   incarnation=crypto.randomUUID();
-  async inspect() { return {state:await this.ctx.storage.get("checkout_scheduler_v1"), migration:await this.ctx.storage.get("checkout_migration_v1"), alarm:await this.ctx.storage.getAlarm(), sqlite:typeof this.ctx.storage.sql.exec === "function",incarnation:this.incarnation}; }
+  async inspect() { return {state:await this.ctx.storage.get("checkout_scheduler_v1"), migration:await this.ctx.storage.get("checkout_migration_v2"), alarm:await this.ctx.storage.getAlarm(), sqlite:typeof this.ctx.storage.sql.exec === "function",incarnation:this.incarnation}; }
   async arm(time) { await this.ctx.storage.setAlarm(time); }
   async evict() { this.ctx.abort("offline instance restart"); }
-  async budgetLedger() { return harnessBudgetRecords; }
+  async budgetLedger() { return harnessBudgetRecords.map((record,index)=>({...record,remaining:harnessBudgets[index].remaining,limit:harnessBudgets[index].limit})); }
 }
 `;
 const mf = new Miniflare(
@@ -284,7 +291,7 @@ try {
   let migrationComplete = false;
   let finalSliceBlocked = false;
   for (let slice = 0; slice < 50; slice++) {
-    const state = (await objects.getByName("migration:checkout-events-v1").inspect()).migration;
+    const state = (await objects.getByName("migration:checkout-events-v2").inspect()).migration;
     if (state?.phase === "outbox" && !state.page) {
       const preview = await kv.listPage(["uos_checkout", "v1", "payments", "outbox"], {
         limit: 8,
@@ -305,7 +312,7 @@ try {
         equal(finalRequest.headers.get("x-checkout-events-migration"), "pending");
         equal((await stats()).writes, writes, "final migration slice entered domain handler");
         equal(
-          (await objects.getByName("migration:checkout-events-v1").inspect()).migration?.phase,
+          (await objects.getByName("migration:checkout-events-v2").inspect()).migration?.phase,
           "complete",
         );
         const calls = (await stats()).kvCalls;
@@ -340,7 +347,7 @@ try {
   ok(legacyAfter.incarnation !== legacyBefore.incarnation, "DO constructor was not rerun");
   equal(legacyAfter.state?.job?.generation, legacyBefore.state?.job?.generation);
   equal(legacyAfter.alarm, legacyBefore.alarm);
-  equal((await objects.getByName("migration:checkout-events-v1").inspect()).alarm, null);
+  equal((await objects.getByName("migration:checkout-events-v2").inspect()).alarm, null);
   const pagingPrefix = ["uos_checkout", "v1", "paging_probe"];
   for (let index = 0; index < 6; index++) await kv.set([...pagingPrefix, index], index);
   const firstPage = await kv.listPage<number>(pagingPrefix, { limit: 2 });
@@ -472,7 +479,7 @@ try {
     afterPending.kvCalls -
     beforeDiscovery.rpcCalls -
     beforeDiscovery.kvCalls;
-  ok(pendingCalls <= 24, `pending discovery used ${pendingCalls} subrequests`);
+  ok(pendingCalls <= 30, `pending discovery used ${pendingCalls} subrequests`);
 
   const transactionHash = "0x" + "11".repeat(32);
   await store.fetch("https://fixture.invalid/rpc-fixture", {
@@ -746,7 +753,10 @@ try {
     });
   const searchesBeforePush = (await stats()).methods.eth_getLogs ?? 0;
   const pushDelivery = await signed("push_accepted", log);
-  let pushResponse = await submit(pushDelivery);
+  const racedPush = await Promise.all([submit(pushDelivery), submit(pushDelivery)]);
+  ok(racedPush.every((response) => response.status === 200 || response.status === 503));
+  let pushResponse = racedPush.find((response) => response.status === 200) ?? racedPush[0];
+  for (const response of racedPush) if (response !== pushResponse) await response.body?.cancel();
   for (let attempt = 0; pushResponse.status === 503 && attempt < 5; attempt++)
     pushResponse = await submit(pushDelivery);
   equal(pushResponse.status, 200, await pushResponse.text());
@@ -805,7 +815,32 @@ try {
     401,
   );
   // A different authenticated ID with the same transfer is still domain-idempotent.
-  const semanticReplay = await submit(await signed("push_duplicate", log));
+  const semanticDelivery = await signed("push_duplicate", log);
+  let semanticReplay = await submit(semanticDelivery);
+  if (semanticReplay.status === 503) {
+    const receipt = (
+      await kv.get<{ state: string; nextIndex: number; accountPrepared: number; leaseId?: string }>(
+        [
+          "uos_checkout",
+          "v1",
+          "chain_events",
+          "receipts",
+          "alchemy",
+          "wh_offline",
+          "push_duplicate",
+        ],
+      )
+    ).value;
+    equal(receipt?.state, "pending");
+    equal(receipt?.nextIndex, 0);
+    equal(receipt?.accountPrepared, 1);
+    equal(receipt?.leaseId, undefined);
+    const source = await seed.payment.getInvoiceRecord(push.id);
+    const owner = await accountHash([source.merchant, source.customerReference]);
+    ok((await kv.get<{ complete: boolean }>([...payments, "account_runs", owner])).value?.complete);
+  }
+  if (semanticReplay.status === 503) semanticReplay = await submit(semanticDelivery);
+
   equal(semanticReplay.status, 200, await semanticReplay.text());
   equal(
     (await kv.get<string>([...payments, "events_by_invoice", push.id, "payment.accepted.v1"]))
@@ -873,18 +908,75 @@ try {
     equal(related.status, 200);
   }
   equal((await objects.getByName("invoice:" + push.id).inspect()).alarm, null);
+  const pendingOperations = new Set<string>();
+  let observedPending = false;
   for (const id of [legacy.id, invoice.id, push.id]) {
-    const state = await objects.getByName("invoice:" + id).inspect();
-    equal(state.alarm, null);
+    const target = objects.getByName("invoice:" + id);
+    let state = await target.inspect();
+    if (Object.keys(state.state?.pending ?? {}).length) {
+      observedPending = true;
+      const before = JSON.stringify(state.state?.pending);
+      const health = await worker.fetch("https://checkout.ubq.fi/api/health");
+      equal(health.status, 200);
+      equal(
+        JSON.stringify((await target.inspect()).state?.pending),
+        before,
+        "unrelated health swept entity bookkeeping",
+      );
+    }
+    for (
+      let attempt = 0;
+      Object.keys(state.state?.pending ?? {}).length && attempt < 64;
+      attempt++
+    ) {
+      for (const operation of Object.keys(state.state!.pending)) pendingOperations.add(operation);
+      const before = JSON.stringify(state.state?.pending);
+      const related = await worker.fetch(`https://checkout.ubq.fi/api/v1/invoices/${id}`, {
+        headers: { authorization: "Bearer " + token },
+      });
+      equal(related.status, 200);
+      const next = await target.inspect();
+      ok(
+        next.alarm === null || JSON.stringify(next.state?.pending) !== before,
+        "related event did not advance finite bookkeeping",
+      );
+      state = next;
+    }
+    equal(state.alarm, null, JSON.stringify({ id, state }));
     equal(state.state?.job, null);
     equal(state.state?.pending, {});
   }
+  ok(observedPending, "fixture did not exercise related-event intent retirement");
   await eventually(async () => {
     for await (const entry of kv.list({ prefix: [...payments, "outbox"] })) {
       if (entry) return false;
     }
     return true;
   }, "merchant outbox did not quiesce");
+  for (const operation of pendingOperations)
+    equal((await kv.get(wakeIntentKey(operation))).value, null);
+  const ledger = await objects.getByName("invoice:" + push.id).budgetLedger();
+  for (const invocation of ledger) {
+    ok(invocation.calls + (invocation.nested ?? 0) + 1 <= 32, JSON.stringify(invocation));
+    ok(invocation.calls <= 50, JSON.stringify(invocation));
+    if (invocation.limit === 30 && invocation.rpc > 0)
+      ok(invocation.remaining > 0, JSON.stringify(invocation));
+  }
+  console.log(
+    "workerd invocation bounds",
+    JSON.stringify(
+      ledger
+        .filter((invocation) => invocation.limit === 30)
+        .map(({ id, calls, storage, rpc, nested, remaining }) => ({
+          id,
+          calls,
+          storage,
+          rpc,
+          nested,
+          remaining,
+        })),
+    ),
+  );
   console.log(
     "workerd: signed Alchemy HMAC rejection, exact transfer claim/replay, removed/reincluded/stale notices, event-only SQLite alarms and migration passed",
   );

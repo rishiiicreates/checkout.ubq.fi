@@ -1,4 +1,6 @@
 import type { Kv, KvAtomic, KvCommitResult, KvEntry, KvKey, KvPage } from "./kv.ts";
+import { adoptAccountAttempt, markAccountIndexComplete } from "./account_store.ts";
+import type { InvoiceRecord } from "./payment_types.ts";
 import {
   StaleWakeupError,
   wakeTargetKey,
@@ -375,6 +377,15 @@ export class BunDelayedQueue implements WakeupPort {
         );
         this.requireOpen();
         for (const source of page.entries) {
+          if (kind === "invoice") {
+            const adopted = await adoptAccountAttempt(
+              this.options.kv,
+              source as KvEntry<InvoiceRecord>,
+              async () => !this.closed,
+            );
+            if (!adopted) throw new Error("account_index_adoption_conflict");
+            this.requireOpen();
+          }
           const target: WakeTarget = {
             kind,
             id: source.value.id,
@@ -386,6 +397,11 @@ export class BunDelayedQueue implements WakeupPort {
         }
         cursor = page.cursor;
       } while (cursor);
+      if (kind === "invoice") {
+        this.requireOpen();
+        await markAccountIndexComplete(this.options.kv);
+        this.requireOpen();
+      }
     }
   }
 }

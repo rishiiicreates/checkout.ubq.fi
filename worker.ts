@@ -36,6 +36,7 @@ function services(env: Env, budget: WorkerRequestBudget, isCurrent?: () => Promi
       },
     }),
     async ensure(target: WakeTarget) {
+      budget.reserveNestedInvocations(7);
       budget.reserve();
       await env.CHECKOUT_SCHEDULER.getByName(wakeTargetKey(target)).adopt(target);
     },
@@ -60,7 +61,7 @@ export class CheckoutScheduler extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.scheduler = createWorkerScheduler(ctx.storage, (isCurrent, existingBudget) => {
-      const budget = existingBudget ?? new WorkerRequestBudget(24, AbortSignal.timeout(20_000));
+      const budget = existingBudget ?? new WorkerRequestBudget(28, AbortSignal.timeout(20_000));
       const app = services(env, budget, isCurrent);
       return { kv: app.kv, runner: createEntityJobRunner(app, { budget }), budget };
     });
@@ -71,8 +72,7 @@ export class CheckoutScheduler extends DurableObject<Env> {
   }
   async adopt(target: WakeTarget): Promise<void> {
     this.requireEntity(target);
-    // The caller already spends at most 24 calls. At most 7 nested KV calls plus
-    // the original Worker invocation remain within the separate limit of 32 invocations.
+    // Every caller charges this full nested allowance before issuing adopt().
     const budget = new WorkerRequestBudget(7, AbortSignal.timeout(20_000));
     await this.scheduler.ensure(target, budget);
   }
@@ -86,6 +86,7 @@ export class CheckoutScheduler extends DurableObject<Env> {
       kv: app.kv,
       budget,
       adopt: async (target) => {
+        budget.reserveNestedInvocations(7);
         budget.reserve();
         await this.env.CHECKOUT_SCHEDULER.getByName(wakeTargetKey(target)).adopt(target);
       },
@@ -104,7 +105,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const budget = new WorkerRequestBudget(
-        24,
+        30,
         AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]),
       );
       // Chain authentication precedes every KV operation and ordinary-request bootstrap.

@@ -3,6 +3,7 @@ import { deepStrictEqual as equal, ok } from "node:assert/strict";
 import { createPaymentService } from "./payment_service.ts";
 import { createPersistentJwsSigner } from "./jws.ts";
 import {
+  discoverInvoicePayment,
   discoveryStateKey,
   invoiceMatchesTransfer,
   type DiscoveryState,
@@ -253,7 +254,7 @@ test("the Worker budget retains completion headroom for partial results and late
   const app = await setup();
   try {
     app.rpc.latest = 5000n;
-    const budget = new WorkerRequestBudget(24);
+    const budget = new WorkerRequestBudget(28);
     // Authentication and the merchant ownership read share the same invocation.
     for (let index = 0; index < 4; index++) budget.reserve();
     const storage = countedKv(app.kv, budget);
@@ -269,18 +270,25 @@ test("the Worker budget retains completion headroom for partial results and late
       searchedToBlock: "1099",
     });
     ok(budget.remaining >= 0);
-    const low = new WorkerRequestBudget(24);
-    for (let index = 0; index < 14; index++) low.reserve();
+    const low = new WorkerRequestBudget(28);
+    // Leave less than the admission minimum after the initial storage read.
+    for (let index = 0; index < 16; index++) low.reserve();
+    const lowRpc: RpcClient = {
+      batch: (chain, calls) => {
+        low.reserve();
+        return app.rpc.batch(chain, calls);
+      },
+    };
     const before = app.rpc.calls;
     const yielded = await app
-      .restart(countedKv(app.kv, low), rpc, low)
+      .restart(countedKv(app.kv, low), lowRpc, low)
       .discoverPayment(app.invoice.id);
     equal(yielded.discovery, { found: false, searchedToBlock: "1099" });
     equal(app.rpc.calls, before);
     ok(low.remaining >= 0);
     const found = app.rpc.add(app.invoice, 1150n);
     app.rpc.hidden.add(found.transactionHash);
-    const retryBudget = new WorkerRequestBudget(24);
+    const retryBudget = new WorkerRequestBudget(28);
     const retryRpc: RpcClient = {
       batch: (chain, calls) => {
         retryBudget.reserve();
@@ -293,7 +301,7 @@ test("the Worker budget retains completion headroom for partial results and late
     equal(pending.discovery, { found: false, searchedToBlock: "1099" });
     ok(retryBudget.remaining >= 0);
     app.rpc.hidden.clear();
-    const foundBudget = new WorkerRequestBudget(24);
+    const foundBudget = new WorkerRequestBudget(28);
     for (let index = 0; index < 4; index++) foundBudget.reserve();
     const foundRpc: RpcClient = {
       batch: (chain, calls) => {
@@ -313,7 +321,7 @@ test("the Worker budget retains completion headroom for partial results and late
   }
 });
 
-for (const maximum of [8, 12]) {
+for (const maximum of [12, 16]) {
   test(`optional head retry preserves mandatory payment writes with budget ${maximum}`, async () => {
     const app = await setup();
     try {
@@ -340,8 +348,8 @@ for (const maximum of [8, 12]) {
         .claimPayment(app.invoice.id, coordinates(transfer));
       equal(result.invoice.status, "confirming");
       equal(result.eventJws, undefined);
-      equal(requests.length, maximum === 8 ? 1 : 2);
-      if (maximum === 12) equal(requests[1], ["safe", "finalized"]);
+      equal(requests.length, maximum === 12 ? 1 : 2);
+      if (maximum === 16) equal(requests[1], ["safe", "finalized"]);
       ok(budget.remaining > 0);
       equal((await app.service.getInvoice(app.invoice.id)).paymentId, result.invoice.paymentId);
     } finally {
@@ -356,7 +364,7 @@ test("real service-adapter calls keep intent prearming and a zero-search-budget 
     app.rpc.latest = 5000n;
     app.rpc.add(app.invoice, 1150n);
     await app.kv.set(discoveryStateKey(app.invoice.id), { searchedThrough: 1099n });
-    const budget = new WorkerRequestBudget(24);
+    const budget = new WorkerRequestBudget(28);
     for (let index = 0; index < 6; index++) budget.reserve(); // four auth calls, ownership, migration RPC
     let storageCalls = 0,
       prepareCalls = 0,
@@ -435,7 +443,7 @@ test("real service-adapter calls keep intent prearming and a zero-search-budget 
     ok(budget.remaining > 0);
     equal(prepareCalls, 1);
     console.log(
-      `intent discovery calls: storage=${storageCalls},rpc=${rpcCalls},prearm=${prepareCalls},prior=6,total=${24 - budget.remaining},ceiling=24`,
+      `intent discovery calls: storage=${storageCalls},rpc=${rpcCalls},prearm=${prepareCalls},prior=6,total=${28 - budget.remaining},ceiling=28`,
     );
   } finally {
     app.kv.close();
@@ -562,8 +570,8 @@ async function setup() {
     client: RpcClient = rpc,
     budget?: WorkerRequestBudget,
     wakeups?: WakeupPort,
-  ) =>
-    createPaymentService({
+  ) => {
+    const base = createPaymentService({
       kv: storage,
       rpc: client,
       clock,
@@ -573,6 +581,29 @@ async function setup() {
       discovery: { budget },
       wakeups,
     });
+    // These unit cases exercise the retained per-invoice backup algorithm directly.
+    // HTTP account-hunt behavior has endpoint and workerd acceptance elsewhere.
+    return {
+      ...base,
+      discoverPayment: (id: unknown) =>
+        discoverInvoicePayment(
+          {
+            kv: storage,
+            rpc: client,
+            clock,
+            claim: (invoiceId, input) => base.claimPayment(invoiceId, input),
+            existingEvent: async (invoice) =>
+              ["provisionally_paid", "settled", "finalized", "reverted"].includes(invoice.status)
+                ? (await base.listOutbox()).find((event) => event.invoiceId === invoice.id)
+                    ?.compactJws
+                : undefined,
+          },
+          id,
+          { budget },
+        ),
+    };
+  };
+
   const service = restart();
   await service.configureChain(8453, { enabled: true, treasuryAddress: treasury });
   await service.publishCatalogVersion({ merchantId: "merchant" }, "prices", {
@@ -674,7 +705,7 @@ class DiscoveryRpc implements RpcClient {
           )
         : null,
     };
-    const scan = calls.find((call) => call.id === "transfer_logs");
+    const scan = calls.find((call) => call.method === "eth_getLogs");
     if (scan) {
       const filter = scan.params[0] as { fromBlock: string; toBlock: string };
       const from = BigInt(filter.fromBlock),
@@ -686,7 +717,23 @@ class DiscoveryRpc implements RpcClient {
         .map(log);
       await this.beforeLogs?.();
     }
-    return calls.map((call) => ({ jsonrpc: "2.0", id: call.id, result: values[call.id] }));
+    return calls.map((call) => ({
+      jsonrpc: "2.0",
+      id: call.id,
+      result:
+        call.method === "eth_getLogs"
+          ? (() => {
+              const range = call.params[0] as { fromBlock: string; toBlock: string };
+              return this.transfers
+                .filter(
+                  (candidate) =>
+                    candidate.blockNumber >= BigInt(range.fromBlock) &&
+                    candidate.blockNumber <= BigInt(range.toBlock),
+                )
+                .map(log);
+            })()
+          : values[call.id],
+    }));
   }
 }
 
