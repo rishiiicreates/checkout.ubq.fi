@@ -131,13 +131,7 @@ export type InvoiceRecord = {
 };
 
 export type PaymentPhase =
-  | "confirming"
-  | "accepted"
-  | "settled"
-  | "finalized"
-  | "late"
-  | "duplicate"
-  | "reverted";
+  "confirming" | "accepted" | "settled" | "finalized" | "late" | "duplicate" | "reverted";
 
 export type PaymentRecord = {
   schemaVersion: 1;
@@ -171,10 +165,7 @@ export type ChainHeadRecord = {
   updatedAt: string;
 };
 
-export type PaymentEventType =
-  | "payment.accepted.v1"
-  | "payment.settled.v1"
-  | "payment.reverted.v1";
+export type PaymentEventType = "payment.accepted.v1" | "payment.settled.v1" | "payment.reverted.v1";
 
 export type PaymentEventPayload = {
   iss: string;
@@ -218,24 +209,22 @@ export type OutboxEventRecord = {
   deliveredAt?: string;
 };
 
-export type InvoiceJson =
-  & Omit<
-    InvoiceRecord,
-    | "schemaVersion"
-    | "merchant"
-    | "customerReference"
-    | "idempotencyKey"
-    | "listAmountUnits"
-    | "paidAmountUnits"
-    | "discountUnits"
-    | "minimumBlock"
-  >
-  & {
-    listAmountUnits: string;
-    paidAmountUnits: string;
-    discountUnits: string;
-    minimumBlock: string;
-  };
+export type InvoiceJson = Omit<
+  InvoiceRecord,
+  | "schemaVersion"
+  | "merchant"
+  | "customerReference"
+  | "idempotencyKey"
+  | "listAmountUnits"
+  | "paidAmountUnits"
+  | "discountUnits"
+  | "minimumBlock"
+> & {
+  listAmountUnits: string;
+  paidAmountUnits: string;
+  discountUnits: string;
+  minimumBlock: string;
+};
 
 export function invoiceJson(invoice: InvoiceRecord): InvoiceJson {
   const {
@@ -310,14 +299,22 @@ export function boundedText(value: unknown, field: string, maximumLength = 256):
 }
 
 export function isOpenInvoiceStatus(status: InvoiceStatus): boolean {
-  return status === "awaiting_payment" || status === "confirming" ||
-    status === "provisionally_paid" || status === "settled";
+  return (
+    status === "awaiting_payment" ||
+    status === "confirming" ||
+    status === "provisionally_paid" ||
+    status === "settled"
+  );
 }
 
 export function compareCatalogProducts(a: CatalogProduct, b: CatalogProduct): number {
-  return compareCodePoints(a.productId, b.productId) || compareCodePoints(a.kind, b.kind) ||
-    compareCodePoints(a.label, b.label) || a.priceCents - b.priceCents ||
-    Number(a.enabled) - Number(b.enabled);
+  return (
+    compareCodePoints(a.productId, b.productId) ||
+    compareCodePoints(a.kind, b.kind) ||
+    compareCodePoints(a.label, b.label) ||
+    a.priceCents - b.priceCents ||
+    Number(a.enabled) - Number(b.enabled)
+  );
 }
 
 function compareCodePoints(a: string, b: string): number {
@@ -335,38 +332,41 @@ export function normalizeCatalogProjection(input: unknown): CatalogProjection {
   }
 
   const productIds = new Set<string>();
-  const products = record.products.map((value): CatalogProduct => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new PaymentDomainError("invalid_catalog_product");
-    }
-    const product = value as Record<string, unknown>;
-    const productId = boundedText(product.productId, "product_id", 128);
-    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(productId)) {
-      throw new PaymentDomainError("invalid_product_id");
-    }
-    if (productIds.has(productId)) throw new PaymentDomainError("duplicate_product_id");
-    productIds.add(productId);
-    const label = boundedText(product.label, "product_label", 200);
-    if (product.kind !== "credit_pack" && product.kind !== "prepaid_plan") {
-      throw new PaymentDomainError("invalid_product_kind");
-    }
-    if (
-      typeof product.priceCents !== "number" || !Number.isSafeInteger(product.priceCents) ||
-      product.priceCents < MINIMUM_PRODUCT_PRICE_CENTS
-    ) {
-      throw new PaymentDomainError("invalid_product_price_cents");
-    }
-    if (typeof product.enabled !== "boolean") {
-      throw new PaymentDomainError("invalid_product_enabled");
-    }
-    return {
-      productId,
-      label,
-      kind: product.kind,
-      priceCents: product.priceCents,
-      enabled: product.enabled,
-    };
-  }).sort(compareCatalogProducts);
+  const products = record.products
+    .map((value): CatalogProduct => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new PaymentDomainError("invalid_catalog_product");
+      }
+      const product = value as Record<string, unknown>;
+      const productId = boundedText(product.productId, "product_id", 128);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(productId)) {
+        throw new PaymentDomainError("invalid_product_id");
+      }
+      if (productIds.has(productId)) throw new PaymentDomainError("duplicate_product_id");
+      productIds.add(productId);
+      const label = boundedText(product.label, "product_label", 200);
+      if (product.kind !== "credit_pack" && product.kind !== "prepaid_plan") {
+        throw new PaymentDomainError("invalid_product_kind");
+      }
+      if (
+        typeof product.priceCents !== "number" ||
+        !Number.isSafeInteger(product.priceCents) ||
+        product.priceCents < MINIMUM_PRODUCT_PRICE_CENTS
+      ) {
+        throw new PaymentDomainError("invalid_product_price_cents");
+      }
+      if (typeof product.enabled !== "boolean") {
+        throw new PaymentDomainError("invalid_product_enabled");
+      }
+      return {
+        productId,
+        label,
+        kind: product.kind,
+        priceCents: product.priceCents,
+        enabled: product.enabled,
+      };
+    })
+    .sort(compareCatalogProducts);
 
   return { currency: "USD", products };
 }

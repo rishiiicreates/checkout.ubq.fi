@@ -3,3 +3,9 @@ coverage/
 .deploy-root/
 .deno-kv/
 .codex-worktrees/
+node_modules/
+.worker-build/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.uos-checkout.sqlite*

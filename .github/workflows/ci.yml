@@ -8,19 +8,29 @@ permissions:
   contents: read
 
 jobs:
-  deno:
+  bun:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.3
 
-      - uses: denoland/setup-deno@v2
+      # Cloudflare's Wrangler/Miniflare control plane requires supported Node.
+      - uses: actions/setup-node@v6
         with:
-          deno-version: v2.x
+          node-version: 24.20.0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run deploy:types
+      - run: git diff --exit-code -- worker-configuration.d.ts
+      - run: bun run check
+      - run: bun run deploy:dry-run
 
       - uses: foundry-rs/foundry-toolchain@v1.9.0
         with:
           version: stable
 
-      - run: deno task check
-
-      - run: deno task test:anvil
+      - run: bun run test:anvil

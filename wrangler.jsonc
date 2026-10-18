@@ -1,0 +1,67 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "checkout-ubq-fi",
+  "account_id": "5c0228bee348f4cf48829ffe21b61fe9",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-18",
+  "compatibility_flags": ["global_fetch_strictly_public", "no_cots_on_external_fetch"],
+  "workers_dev": true,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+  },
+  "services": [
+    {
+      "binding": "UOS_KV",
+      "service": "ubq-kv",
+    },
+  ],
+  "secrets": {
+    "required": ["CHECKOUT_KV_SERVICE_TOKEN"],
+  },
+  "triggers": {
+    "crons": ["* * * * *"],
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01,
+    },
+  },
+  "env": {
+    "candidate": {
+      "name": "checkout-ubq-fi-candidate",
+      "workers_dev": true,
+      "routes": [],
+      "triggers": {
+        "crons": [],
+      },
+      "services": [
+        {
+          "binding": "UOS_KV",
+          "service": "ubq-kv",
+        },
+      ],
+      "secrets": {
+        "required": ["CHECKOUT_KV_SERVICE_TOKEN"],
+      },
+      "version_metadata": {
+        "binding": "UOS_VERSION",
+      },
+    },
+  },
+  "routes": [
+    {
+      "pattern": "checkout.ubq.fi/*",
+      "zone_name": "ubq.fi",
+    },
+  ],
+  "version_metadata": {
+    "binding": "UOS_VERSION",
+  },
+}

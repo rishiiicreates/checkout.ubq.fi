@@ -1,3 +1,6 @@
+import { test } from "bun:test";
+import { SqliteKv } from "./src/sqlite_kv.ts";
+import { fetchPublicAsset } from "./src/bun_runtime.ts";
 import {
   type CheckoutServices,
   createCheckoutServices,
@@ -10,7 +13,7 @@ import type { JsonRpcBatchItem, JsonRpcCall, RpcClient } from "./src/rpc.ts";
 
 const TREASURY = "0x1111111111111111111111111111111111111111";
 
-Deno.test("local operator configures Checkout without a bootstrap password", async () => {
+test("local operator configures Checkout without a bootstrap password", async () => {
   await withApp(async ({ request }) => {
     const session = await request("/api/v1/admin/session");
     assertEquals(session.status, 200);
@@ -73,7 +76,7 @@ Deno.test("local operator configures Checkout without a bootstrap password", asy
   });
 });
 
-Deno.test("merchant API publishes an immutable catalog and creates an idempotent exact invoice", async () => {
+test("merchant API publishes an immutable catalog and creates an idempotent exact invoice", async () => {
   await withApp(async ({ request }) => {
     await request("/api/v1/admin/chains/8453", {
       method: "PUT",
@@ -85,13 +88,15 @@ Deno.test("merchant API publishes an immutable catalog and creates an idempotent
       method: "PUT",
       body: {
         currency: "USD",
-        products: [{
-          productId: "pack:starter",
-          label: "Starter",
-          kind: "credit_pack",
-          priceCents: 2_000,
-          enabled: true,
-        }],
+        products: [
+          {
+            productId: "pack:starter",
+            label: "Starter",
+            kind: "credit_pack",
+            priceCents: 2_000,
+            enabled: true,
+          },
+        ],
       },
     });
     assertEquals(catalog.status, 200);
@@ -128,7 +133,7 @@ Deno.test("merchant API publishes an immutable catalog and creates an idempotent
   });
 });
 
-Deno.test("reading an invoice never performs expiration writes", async () => {
+test("reading an invoice never performs expiration writes", async () => {
   let reads = 0;
   let expirations = 0;
   const services = {
@@ -159,7 +164,7 @@ Deno.test("reading an invoice never performs expiration writes", async () => {
   assertEquals(expirations, 0);
 });
 
-Deno.test("public origins cannot forge loopback trust", async () => {
+test("public origins cannot forge loopback trust", async () => {
   await withApp(async ({ handler }) => {
     const forged = await handler(
       new Request("https://checkout.ubq.fi/api/v1/invoices", {
@@ -182,7 +187,7 @@ Deno.test("public origins cannot forge loopback trust", async () => {
   });
 });
 
-Deno.test("health, JWKS, and branded static assets are public", async () => {
+test("health, JWKS, and branded static assets are public", async () => {
   await withApp(async ({ request }) => {
     const health = await request("/api/health");
     assertEquals(await health.json(), { status: "ready" });
@@ -198,7 +203,7 @@ Deno.test("health, JWKS, and branded static assets are public", async () => {
   });
 });
 
-Deno.test("webhook delivery paginates, isolates failures, forbids redirects, and carries a timeout", async () => {
+test("webhook delivery paginates, isolates failures, forbids redirects, and carries a timeout", async () => {
   const failed: string[] = [];
   const delivered: string[] = [];
   const attempts: string[] = [];
@@ -247,16 +252,19 @@ Deno.test("webhook delivery paginates, isolates failures, forbids redirects, and
 });
 
 async function withApp(
-  run: (
-    value: { request: RequestFn; handler: (request: Request) => Promise<Response> },
-  ) => Promise<void>,
+  run: (value: {
+    request: RequestFn;
+    handler: (request: Request) => Promise<Response>;
+  }) => Promise<void>,
 ): Promise<void> {
-  const path = await Deno.makeTempFile({ prefix: "checkout-http-", suffix: ".sqlite" });
-  const kv = await Deno.openKv(path);
-  const handler = createHandler(createCheckoutServices(kv, {
-    rpc: new StaticRpc(),
-    resolveDns: () => Promise.resolve(["93.184.216.34"]),
-  }));
+  const kv = new SqliteKv(":memory:");
+  const handler = createHandler(
+    createCheckoutServices(kv, {
+      rpc: new StaticRpc(),
+      assetFetcher: fetchPublicAsset,
+      resolveDns: () => Promise.resolve(["93.184.216.34"]),
+    }),
+  );
   try {
     await run({
       handler,
@@ -274,7 +282,6 @@ async function withApp(
     });
   } finally {
     kv.close();
-    await Deno.remove(path).catch(() => {});
   }
 }
 
@@ -290,15 +297,17 @@ type RequestFn = (
 
 class StaticRpc implements RpcClient {
   batch(_chainId: 1 | 10 | 8453, calls: readonly JsonRpcCall[]): Promise<JsonRpcBatchItem[]> {
-    return Promise.resolve(calls.map((call) => ({
-      jsonrpc: "2.0",
-      id: call.id,
-      result: {
-        number: "0x64",
-        hash: `0x${"ab".repeat(32)}`,
-        timestamp: "0x669fb640",
-      },
-    })));
+    return Promise.resolve(
+      calls.map((call) => ({
+        jsonrpc: "2.0",
+        id: call.id,
+        result: {
+          number: "0x64",
+          hash: `0x${"ab".repeat(32)}`,
+          timestamp: "0x669fb640",
+        },
+      })),
+    );
   }
 }
 
@@ -311,3 +320,14 @@ function assertEquals(actual: unknown, expected: unknown): void {
     throw new Error(`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}.`);
   }
 }
+
+test("HTTP JSON rejects oversized streamed bodies before payment work", async () => {
+  await withApp(async ({ request }) => {
+    const response = await request("/api/v1/catalog/versions/oversized", {
+      method: "PUT",
+      body: { padding: "x".repeat(128 * 1024) },
+    });
+    assertEquals(response.status, 413);
+    assertEquals((await response.json()).error, "request_body_too_large");
+  });
+});

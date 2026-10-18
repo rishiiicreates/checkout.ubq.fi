@@ -1,0 +1,10 @@
+node_modules/
+bun.lock
+.codex-worktrees/
+.worker-build/
+.wrangler/
+worker-configuration.d.ts
+public/
+demo/app.js
+demo/styles.css
+demo/index.html

@@ -1,9 +1,12 @@
+import { SqliteKv } from "./sqlite_kv.ts";
+import { test } from "bun:test";
+import type { Kv } from "./kv.ts";
 import { createMerchantAuthService, MerchantAuthError } from "./merchant_auth.ts";
 import { LOCAL_PEER_HEADER } from "./admin_auth.ts";
 
 const NOW = Date.parse("2026-07-21T12:00:00.000Z");
 
-Deno.test("merchant key is shown once, scoped, and revocable", async () => {
+test("merchant key is shown once, scoped, and revocable", async () => {
   await withKv(async (kv) => {
     const service = createMerchantAuthService(kv, {
       now: () => NOW,
@@ -39,7 +42,7 @@ Deno.test("merchant key is shown once, scoped, and revocable", async () => {
   });
 });
 
-Deno.test("loopback trust requires the internally supplied peer marker", async () => {
+test("loopback trust requires the internally supplied peer marker", async () => {
   await withKv(async (kv) => {
     const service = createMerchantAuthService(kv, { now: () => NOW, resolveDns: publicDns });
     await assertRejects(
@@ -67,7 +70,7 @@ Deno.test("loopback trust requires the internally supplied peer marker", async (
   });
 });
 
-Deno.test("merchant records can be retrieved without exposing key material", async () => {
+test("merchant records can be retrieved without exposing key material", async () => {
   await withKv(async (kv) => {
     const service = createMerchantAuthService(kv, { now: () => NOW, resolveDns: publicDns });
     assertEquals(await service.getMerchant("linkedin-scraper-2025"), null);
@@ -82,7 +85,7 @@ Deno.test("merchant records can be retrieved without exposing key material", asy
   });
 });
 
-Deno.test("merchant webhooks reject local targets and DNS answers in private ranges", async () => {
+test("merchant webhooks reject local targets and DNS answers in private ranges", async () => {
   await withKv(async (kv) => {
     const privateDns = createMerchantAuthService(kv, {
       now: () => NOW,
@@ -122,14 +125,12 @@ Deno.test("merchant webhooks reject local targets and DNS answers in private ran
   });
 });
 
-async function withKv(run: (kv: Deno.Kv) => Promise<void>): Promise<void> {
-  const path = await Deno.makeTempFile({ prefix: "checkout-merchant-auth-", suffix: ".sqlite" });
-  const kv = await Deno.openKv(path);
+async function withKv(run: (kv: Kv) => Promise<void>): Promise<void> {
+  const kv = new SqliteKv(":memory:");
   try {
     await run(kv);
   } finally {
     kv.close();
-    await Deno.remove(path).catch(() => undefined);
   }
 }
 
