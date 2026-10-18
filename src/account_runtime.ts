@@ -233,7 +233,10 @@ export async function runAccountHunt(options: {
     context: ChainTransferContext,
     attribution: Attribution,
   ): Promise<void>;
-  refresh(entry: KvEntryMaybe<InvoiceRecord>, context: ChainTransferContext): Promise<void>;
+  refresh(
+    entry: KvEntryMaybe<InvoiceRecord>,
+    context: ChainTransferContext,
+  ): Promise<KvCheck[] | null>;
   invalidate(
     entry: KvEntryMaybe<InvoiceRecord>,
     state: KvEntryMaybe<AttemptState>,
@@ -241,15 +244,22 @@ export async function runAccountHunt(options: {
     context: ChainTransferContext,
     checks: KvCheck[],
   ): Promise<boolean>;
-}): Promise<{ accountHunt: AccountHuntJson; anchor: InvoiceJson }> {
+}): Promise<{
+  accountHunt: AccountHuntJson;
+  anchor: InvoiceJson;
+  anchorVersionstamp?: string | null;
+}> {
   const { kv, budget } = options;
   const anchor = options.anchor.value!;
   const account = accountKeyForInvoice(anchor, anchor.merchant);
   const owner = await accountHash(account);
   const deadline = options.deadline ?? Date.now() + 20_000;
   const room = (calls: number) => Date.now() < deadline && (budget?.hasCapacity(calls) ?? true);
-  const pending = (diagnostic: string): { accountHunt: AccountHuntJson; anchor: InvoiceJson } => ({
+  const pending = (
+    diagnostic: string,
+  ): { accountHunt: AccountHuntJson; anchor: InvoiceJson; anchorVersionstamp?: string | null } => ({
     anchor: invoiceJson(anchor),
+    anchorVersionstamp: options.anchor.versionstamp,
     accountHunt: {
       complete: false,
       reachedHead: false,
@@ -281,7 +291,11 @@ export async function runAccountHunt(options: {
     stored.value.membership === membership.versionstamp &&
     stored.value.response
   )
-    return { accountHunt: stored.value.response, anchor: invoiceJson(anchor) };
+    return {
+      accountHunt: stored.value.response,
+      anchor: invoiceJson(anchor),
+      anchorVersionstamp: options.anchor.versionstamp,
+    };
   if (stored.value?.lease && stored.value.lease.until > Date.now())
     return pending("account_hunt_busy");
   const run: Run =
@@ -318,7 +332,7 @@ export async function runAccountHunt(options: {
     entry = { key: entry.key, value: run, versionstamp: committed.versionstamp };
   }
   const release = budget?.reserveForCompletion(5);
-  const verifiedThisEvent = new Set<string>();
+  const verifiedThisEvent = new Map<string, KvCheck[]>();
   let resolutionComplete = true;
   const scoped = (): ChainTransferContext => ({
     budget,
@@ -375,7 +389,18 @@ export async function runAccountHunt(options: {
           canRequest: () => room(4),
         },
       );
-      run.result.observations.unshift(...carried);
+      run.result.observations.unshift(
+        ...carried.map((observed) => ({
+          ...observed,
+          candidateInvoiceIds: run
+            .result!.unresolvedAttempts.filter(
+              ({ invoice }) =>
+                invoice.chainId === observed.chainId &&
+                invoiceMatchesTransfer(invoice, { ...observed.log }),
+            )
+            .map(({ invoice }) => invoice.id),
+        })),
+      );
       run.versions = Object.fromEntries(
         run.result.selection.snapshots.map((snapshot) => [
           snapshot.invoice.id,
@@ -508,10 +533,20 @@ export async function runAccountHunt(options: {
           continue;
         const invoice = await kv.get<InvoiceRecord>(storedInvoiceKey(selected.invoice.id));
         if (invoice.value?.paymentId && invoice.value.status !== "reverted") {
-          await options.refresh(invoice, scoped());
-          verifiedThisEvent.add(selected.invoice.id);
+          const verified = await options.refresh(invoice, scoped());
+          if (verified) verifiedThisEvent.set(selected.invoice.id, verified);
           const changed = await kv.get<InvoiceRecord>(invoice.key);
           (run.versions ??= {})[selected.invoice.id] = changed.versionstamp;
+          if (!changed.value?.paymentId || changed.value.status === "reverted") {
+            // Matching excluded this payment-bearing snapshot. Preserve every observation
+            // and replay against the refreshed state before any reservation can be released.
+            run.restart = true;
+            run.offset = 0;
+            resolutionComplete = false;
+            result.diagnostics = [...new Set([...result.diagnostics, "account_matching_changed"])];
+            await save();
+            break;
+          }
         }
         run.refreshed.push(selected.invoice.id);
         await save();
@@ -562,8 +597,8 @@ export async function runAccountHunt(options: {
             : Date.parse(record.value!.createdAt) > Date.parse(invoice.value!.createdAt);
         });
         if (!later) continue;
-        let creditChecks: KvCheck[] = [];
-        if (!verifiedThisEvent.has(later.value!.id)) {
+        let creditChecks = verifiedThisEvent.get(later.value!.id);
+        if (!creditChecks) {
           if (!room(options.context ? 12 : 9)) {
             resolutionComplete = false;
             break;
@@ -574,7 +609,7 @@ export async function runAccountHunt(options: {
             break;
           }
           creditChecks = verified;
-          verifiedThisEvent.add(later.value!.id);
+          verifiedThisEvent.set(later.value!.id, verified);
         }
         // All observed matches were canonically processed; current known payments never reach here.
         if (
@@ -615,9 +650,15 @@ export async function runAccountHunt(options: {
       run.refreshed.length === snapshots.length;
     run.complete = run.complete && resolutionComplete;
 
-    const returned = records.find((record) => record.value?.id === anchor.id)?.value ?? anchor;
-    const response: { anchor: InvoiceJson; accountHunt: AccountHuntJson } = {
+    const returnedEntry = records.find((record) => record.value?.id === anchor.id);
+    const returned = returnedEntry?.value ?? anchor;
+    const response: {
+      anchor: InvoiceJson;
+      accountHunt: AccountHuntJson;
+      anchorVersionstamp?: string | null;
+    } = {
       anchor: invoiceJson(returned),
+      anchorVersionstamp: returnedEntry?.versionstamp ?? options.anchor.versionstamp,
       accountHunt: {
         complete: run.complete,
         pending: !run.complete,

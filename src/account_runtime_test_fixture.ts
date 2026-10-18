@@ -2,6 +2,7 @@ import {
   TRANSFER_TOPIC,
   type RpcClient,
   type JsonRpcCall,
+  type JsonRpcBatchItem,
   type DiscoveredTransferLog,
 } from "./rpc.ts";
 import type { InvoiceRecord } from "./payment_types.ts";
@@ -27,7 +28,7 @@ export class RuntimeRpc implements RpcClient {
     this.logs.push(log);
     return log;
   }
-  async batch(_chain: number, calls: readonly JsonRpcCall[]) {
+  async batch(_chain: number, calls: readonly JsonRpcCall[]): Promise<JsonRpcBatchItem[]> {
     const receiptCall = calls.find((call) => call.id === "receipt");
     const observed = this.logs.find((log) => log.transactionHash === receiptCall?.params[0]);
     const block = (number: bigint) => ({
