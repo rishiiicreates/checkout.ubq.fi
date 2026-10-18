@@ -1,0 +1,242 @@
+import type { Clock } from "./payment_catalog.ts";
+import type { Kv, KvKey } from "./kv.ts";
+import type { ClaimPaymentInput, ClaimPaymentResult } from "./payment_service.ts";
+import {
+  boundedText,
+  invoiceJson,
+  PaymentDomainError,
+  type InvoiceRecord,
+} from "./payment_types.ts";
+import {
+  chainHeads,
+  discoverTransferLogs,
+  RpcVerificationError,
+  type DiscoveredTransferLog,
+  type RpcClient,
+} from "./rpc.ts";
+import { WorkerBudgetError, type WorkerRequestBudget } from "./worker_budget.ts";
+
+const PREFIX = ["uos_checkout", "v1", "payments"];
+const SCAN_BLOCKS = 1000n;
+const OVERLAP_BLOCKS = 128n;
+const LEASE_MS = 30_000;
+const COMPLETION_CALLS = 6;
+
+export type DiscoveryOptions = { budget?: WorkerRequestBudget; deadline?: number };
+export type DiscoveryState = { searchedThrough?: bigint; leaseId?: string; leaseUntil?: number };
+
+export function discoveryStateKey(invoiceId: string): KvKey {
+  return [...PREFIX, "discovery", invoiceId];
+}
+
+export function hasCurrentPayment(invoice: Pick<InvoiceRecord, "paymentId" | "status">): boolean {
+  return Boolean(invoice.paymentId) && invoice.status !== "reverted";
+}
+
+export function invoiceMatchesTransfer(
+  invoice: InvoiceRecord,
+  log: DiscoveredTransferLog,
+): boolean {
+  return (
+    (!invoice.paymentId || invoice.status === "reverted") &&
+    invoice.minimumBlock <= log.blockNumber &&
+    invoice.tokenAddress.toLowerCase() === log.tokenAddress.toLowerCase() &&
+    invoice.treasuryAddress.toLowerCase() === log.recipientAddress.toLowerCase() &&
+    invoice.paidAmountUnits === log.amountUnits
+  );
+}
+
+/** Discovery owns only this invoice's progress, never either reconciliation cursor. */
+export async function discoverInvoicePayment(
+  dependencies: {
+    kv: Kv;
+    rpc: RpcClient;
+    clock: Clock;
+    claim: (invoiceId: string, input: ClaimPaymentInput) => Promise<ClaimPaymentResult>;
+    existingEvent: (invoice: InvoiceRecord) => Promise<string | undefined>;
+  },
+  invoiceIdInput: unknown,
+  options: DiscoveryOptions = {},
+): Promise<ClaimPaymentResult> {
+  const { kv, rpc, clock } = dependencies;
+  const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
+  const invoiceKey = [...PREFIX, "invoices", invoiceId];
+  const stateKey = discoveryStateKey(invoiceId);
+  const [invoiceEntry, state] = await kv.getMany<[InvoiceRecord, DiscoveryState]>([
+    invoiceKey,
+    stateKey,
+  ]);
+  if (!invoiceEntry.value) throw new PaymentDomainError("invoice_not_found");
+  const invoice = invoiceEntry.value;
+  const mayStart = (calls: number) =>
+    (options.budget?.hasCapacity(calls) ?? true) && Date.now() < (options.deadline ?? Infinity);
+  if (hasCurrentPayment(invoice)) return result(invoice, state.value?.searchedThrough);
+  if ((state.value?.leaseUntil ?? 0) > clock.now().getTime() || !mayStart(12)) {
+    return currentResult();
+  }
+  const leaseId = crypto.randomUUID();
+  const leased: DiscoveryState = {
+    ...state.value,
+    leaseId,
+    leaseUntil: clock.now().getTime() + LEASE_MS,
+  };
+  if (!(await kv.atomic().check(invoiceEntry, state).set(stateKey, leased).commit()).ok) {
+    return currentResult();
+  }
+  let claimed: ClaimPaymentResult | undefined;
+  let watchedInvoice = invoice;
+  const releaseBudget = options.budget?.reserveForCompletion(COMPLETION_CALLS);
+  try {
+    const heads = await chainHeads(rpc, invoice.chainId);
+    if (!(await currentForClaim())) throw new DiscoveryYield();
+    const head = heads.safeBlock ?? heads.finalizedBlock ?? heads.latestBlock;
+    const overlap =
+      state.value?.searchedThrough === undefined
+        ? invoice.minimumBlock
+        : state.value.searchedThrough + 1n - OVERLAP_BLOCKS;
+    const fromBlock = overlap > invoice.minimumBlock ? overlap : invoice.minimumBlock;
+    const toBlock = head < fromBlock + SCAN_BLOCKS - 1n ? head : fromBlock + SCAN_BLOCKS - 1n;
+    const logs =
+      toBlock < fromBlock
+        ? []
+        : await discoverTransferLogs(
+            rpc,
+            invoice.chainId,
+            invoice.tokenAddress,
+            invoice.treasuryAddress,
+            fromBlock,
+            toBlock,
+          );
+    let incomplete = false;
+    for (const log of logs) {
+      if (!invoiceMatchesTransfer(watchedInvoice, log)) continue;
+      if (!mayStart(8) || !(await currentForClaim())) {
+        incomplete = true;
+        break;
+      }
+      try {
+        claimed = await dependencies.claim(invoiceId, {
+          transactionHash: log.transactionHash,
+          logIndex: log.logIndex.toString(),
+          observedBlockNumber: log.blockNumber.toString(),
+          observedBlockHash: log.blockHash,
+        });
+        watchedInvoice = {
+          ...watchedInvoice,
+          paymentId: claimed.invoice.paymentId,
+          status: claimed.invoice.status,
+        };
+        // A concurrent coordinate claim can refresh into a reorg-cleared state.
+        if (hasCurrentPayment(claimed.invoice)) break;
+      } catch (error) {
+        // An indexed log can precede its canonical receipt. Never skip its chunk.
+        if (error instanceof RpcVerificationError) {
+          incomplete = true;
+          continue;
+        }
+        if (
+          error instanceof PaymentDomainError &&
+          ["payment_locator_already_claimed", "payment_before_minimum_block"].includes(error.code)
+        )
+          continue;
+        throw error;
+      }
+    }
+    const owned = await kv.get<DiscoveryState>(stateKey);
+    if (
+      !incomplete &&
+      !claimed?.invoice.paymentId &&
+      owned.value?.leaseId === leaseId &&
+      (owned.value.leaseUntil ?? 0) > clock.now().getTime()
+    ) {
+      await kv
+        .atomic()
+        .check(invoiceEntry, owned)
+        .set(stateKey, {
+          ...owned.value,
+          searchedThrough:
+            owned.value.searchedThrough !== undefined && owned.value.searchedThrough > toBlock
+              ? owned.value.searchedThrough
+              : toBlock,
+        } satisfies DiscoveryState)
+        .commit();
+    }
+  } catch (error) {
+    if (!(error instanceof WorkerBudgetError) && !(error instanceof DiscoveryYield)) throw error;
+  } finally {
+    releaseBudget?.();
+    const owned = await kv.get<DiscoveryState>(stateKey);
+    if (owned.value?.leaseId === leaseId) {
+      const atomic = kv.atomic().check(owned);
+      await (
+        owned.value.searchedThrough === undefined
+          ? atomic.delete(stateKey)
+          : atomic.set(stateKey, {
+              searchedThrough: owned.value.searchedThrough,
+            } satisfies DiscoveryState)
+      ).commit();
+    }
+  }
+  return currentResult(claimed);
+
+  async function currentForClaim(): Promise<boolean> {
+    if (clock.now().getTime() >= leased.leaseUntil!) return false;
+    const [current, owned] = await kv.getMany<[InvoiceRecord, DiscoveryState]>([
+      invoiceKey,
+      stateKey,
+    ]);
+    if (!current.value || clock.now().getTime() >= leased.leaseUntil!) return false;
+    watchedInvoice = current.value;
+    if (owned.value?.leaseId === leaseId) return true;
+    // A coordinate claim followed by a reorg starts a new invoice lifecycle.
+    // Reacquire from absence; never run through a successor's lease.
+    if (owned.value !== null) return false;
+    return (
+      await kv
+        .atomic()
+        .check(current, owned)
+        .set(stateKey, {
+          leaseId,
+          leaseUntil: leased.leaseUntil,
+        } satisfies DiscoveryState)
+        .commit()
+    ).ok;
+  }
+
+  async function currentResult(previous?: ClaimPaymentResult): Promise<ClaimPaymentResult> {
+    const [current, committed] = await kv.getMany<[InvoiceRecord, DiscoveryState]>([
+      invoiceKey,
+      stateKey,
+    ]);
+    if (!current.value) throw new PaymentDomainError("invoice_not_found");
+    return result(current.value, committed.value?.searchedThrough, previous);
+  }
+
+  async function result(
+    current: InvoiceRecord,
+    searchedThrough?: bigint,
+    previous?: ClaimPaymentResult,
+  ): Promise<ClaimPaymentResult> {
+    const samePhase =
+      previous?.invoice.paymentId === current.paymentId &&
+      previous?.invoice.status === current.status &&
+      previous?.invoice.acceptedAt === current.acceptedAt &&
+      previous?.invoice.settledAt === current.settledAt &&
+      previous?.invoice.revertedAt === current.revertedAt;
+    const eventJws = samePhase
+      ? previous?.eventJws
+      : (options.budget?.hasCapacity(4) ?? true)
+        ? await dependencies.existingEvent(current)
+        : undefined;
+    return {
+      invoice: invoiceJson(current),
+      ...(eventJws ? { eventJws } : {}),
+      discovery: {
+        found: hasCurrentPayment(current),
+        ...(searchedThrough === undefined ? {} : { searchedToBlock: searchedThrough.toString() }),
+      },
+    };
+  }
+}
+
+class DiscoveryYield extends Error {}

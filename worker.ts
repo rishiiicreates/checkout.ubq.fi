@@ -20,13 +20,14 @@ function services(env: Env, budget: WorkerRequestBudget) {
       return env.ASSETS.fetch(request);
     },
     fetch: network,
+    discovery: { budget, deadline: Date.now() + 20_000 },
   });
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
-      const budget = new WorkerRequestBudget(40, request.signal);
+      const budget = new WorkerRequestBudget(24, request.signal);
       // Edge requests never supply local socket authority, regardless of Host.
       const response = await createHandler(services(env, budget))(withPeerAddress(request, ""));
       return identifyRelease(response, env);

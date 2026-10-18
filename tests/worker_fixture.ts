@@ -6,6 +6,7 @@ let transfer = null;
 let version = 0;
 let writes = 0;
 let rpcCalls = 0;
+let kvCalls = 0;
 const encode = key => "u1|" + key.map(p => typeof p === "string" ? "s"+p.length+":"+p : typeof p === "number" ? "n:"+p : "b:"+(p?1:0)).join("|");
 const get = key => { const entry=entries.get(JSON.stringify(key)); return entry && (!entry.expires || entry.expires>Date.now()) ? entry : null; };
 const set = (key,value,expireInMs) => { const entry={key,value,versionstamp:String(version),expires:expireInMs?Date.now()+expireInMs:null}; entries.set(JSON.stringify(key),entry); };
@@ -16,7 +17,7 @@ export default {
     if(url.pathname==="/relay-log") return Response.json(delivery);
     if(url.hostname==="cloudflare-dns.com") return Response.json({Status:0,Answer:url.searchParams.get("type")==="A"?[{type:1,data:"93.184.216.34"}]:[]});
     if(url.hostname==="merchant.example") { delivery={url:request.url,...await request.json()}; return new Response(null,{status:204}); }
-    if(url.pathname==="/stats") return Response.json({rpcCalls,writes,entries:entries.size});
+    if(url.pathname==="/stats") return Response.json({rpcCalls,kvCalls,writes,entries:entries.size});
     if(url.hostname==="rpc.ubq.fi") {
       rpcCalls++;
       const calls=await request.json();
@@ -25,9 +26,14 @@ export default {
       const blockNumber=transfer?BigInt(transfer.blockNumber):100n;
       const hexBlock="0x"+blockNumber.toString(16);
       const receipt=transfer?{transactionHash:transfer.transactionHash,blockNumber:hexBlock,blockHash,status:"0x1",logs:[{address:transfer.tokenAddress,transactionHash:transfer.transactionHash,blockNumber:hexBlock,blockHash,logIndex:"0x7",removed:false,topics:["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x"+"0".repeat(24)+"33".repeat(20),"0x"+"0".repeat(24)+transfer.treasuryAddress.slice(2)],data:"0x"+BigInt(transfer.amountUnits).toString(16).padStart(64,"0")}]}:null;
-      return Response.json(calls.map(call=>({id:call.id,jsonrpc:"2.0",result:call.method==="eth_getLogs"?[]:call.method==="eth_getTransactionReceipt"?receipt:block(transfer?(call.id==="event_block"?blockNumber:call.id==="latest"?blockNumber+3n:blockNumber-1n):100n)})));
+      return Response.json(calls.map(call=>({id:call.id,jsonrpc:"2.0",result:
+        call.method==="eth_getLogs" ? (receipt&&BigInt(call.params[0].fromBlock)<=blockNumber&&BigInt(call.params[0].toBlock)>=blockNumber?receipt.logs:[]) :
+        call.method==="eth_getTransactionReceipt" ? receipt :
+        transfer?.unavailableHeadTags&&(call.id==="safe"||call.id==="finalized") ? null :
+        block(transfer?(call.id==="event_block"?blockNumber:call.id==="latest"?blockNumber+3n:blockNumber-1n):100n)})));
     }
     if(request.headers.get("authorization")!=="Bearer offline-service-token") return Response.json({ok:false,error:"unauthorized"},{status:401});
+    kvCalls++;
     const body=await request.json();
     if(url.pathname==="/kv/get") return Response.json({ok:true,entry:get(body.key)});
     if(url.pathname==="/kv/getMany") return Response.json({ok:true,entries:body.keys.map(get)});

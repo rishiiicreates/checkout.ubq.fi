@@ -1,4 +1,5 @@
 import { WorkerBudgetError } from "./src/worker_budget.ts";
+import type { DiscoveryOptions } from "./src/payment_discovery.ts";
 import type { FetchLike } from "./src/rpc.ts";
 import type { Kv } from "./src/kv.ts";
 import {
@@ -50,6 +51,7 @@ type CheckoutServiceOptions = {
   signer?: CompactJwsSigner;
   resolveDns?: (hostname: string, recordType: "A" | "AAAA") => Promise<string[]>;
   webhookSender?: CheckoutServices["webhookSender"];
+  discovery?: DiscoveryOptions;
 };
 
 export function createCheckoutServices(
@@ -68,6 +70,7 @@ export function createCheckoutServices(
       kv,
       rpc,
       signer,
+      discovery: options.discovery,
     }),
     fetcher,
     assetFetcher: options.assetFetcher ?? (async () => new Response(null, { status: 404 })),
@@ -248,6 +251,18 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
     const invoiceId = decodeURIComponent(claimMatch[1]);
     await requireMerchantInvoice(services, principal.merchant.id, invoiceId);
     const body = await requestJson(request);
+    const keys = Object.keys(body);
+    if (keys.length === 0) return json(await services.payment.discoverPayment(invoiceId));
+    if (
+      keys.length !== 4 ||
+      keys.some(
+        (key) =>
+          !["transactionHash", "logIndex", "observedBlockNumber", "observedBlockHash"].includes(
+            key,
+          ),
+      )
+    )
+      throw new HttpError(400, "invalid_claim_input");
     return json(
       await services.payment.claimPayment(invoiceId, {
         transactionHash: body.transactionHash,

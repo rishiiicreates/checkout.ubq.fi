@@ -208,6 +208,33 @@ try {
   });
   equal(((await read.json()) as { id: string }).id, invoice.id);
 
+  const counts = async () =>
+    (await (await store.fetch("https://fixture.invalid/stats")).json()) as {
+      rpcCalls: number;
+      kvCalls: number;
+    };
+  const discover = () =>
+    worker.fetch(`https://checkout.ubq.fi/api/v1/invoices/${invoice.id}/claims`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: "{}",
+    });
+  const beforeDiscovery = await counts();
+  const pending = await discover();
+  equal(pending.status, 200);
+  equal(
+    ((await pending.json()) as { discovery: { found: boolean; searchedToBlock: string } })
+      .discovery,
+    { found: false, searchedToBlock: "100" },
+  );
+  const afterPending = await counts();
+  const pendingCalls =
+    afterPending.rpcCalls +
+    afterPending.kvCalls -
+    beforeDiscovery.rpcCalls -
+    beforeDiscovery.kvCalls;
+  ok(pendingCalls <= 24, `pending discovery used ${pendingCalls} subrequests`);
+
   const transactionHash = "0x" + "11".repeat(32);
   await store.fetch("https://fixture.invalid/rpc-fixture", {
     method: "POST",
@@ -218,8 +245,29 @@ try {
       treasuryAddress: invoice.treasuryAddress,
       amountUnits: invoice.paidAmountUnits,
       blockNumber: invoice.minimumBlock,
+      unavailableHeadTags: true,
     }),
   });
+  const discovered = await discover();
+  equal(discovered.status, 200);
+  const discovery = (await discovered.json()) as {
+    invoice: { status: string };
+    eventJws: string;
+    discovery: { found: boolean };
+  };
+  equal(discovery.discovery.found, true);
+  equal(discovery.invoice.status, "provisionally_paid");
+  equal(
+    ((await verifyCompactJws(discovery.eventJws, jwks)).payload as { type: string }).type,
+    "payment.accepted.v1",
+  );
+  const afterFound = await counts();
+  const foundCalls =
+    afterFound.rpcCalls + afterFound.kvCalls - afterPending.rpcCalls - afterPending.kvCalls;
+  ok(foundCalls <= 24, `found discovery used ${foundCalls} subrequests`);
+  console.log(
+    `workerd discovery subrequests: pending=${pendingCalls}, found=${foundCalls}, ceiling=24`,
+  );
   const claim = () =>
     worker.fetch(`https://checkout.ubq.fi/api/v1/invoices/${invoice.id}/claims`, {
       method: "POST",
@@ -302,7 +350,7 @@ try {
       .rpcCalls > 0,
   );
   console.log(
-    "workerd: routes, socket-marker stripping, assets/CSP/HEAD, Auth Hub redirect, authenticated merchant invoice/idempotency, canonical payment transition and signed replay, persistent JWKS, D1 protocol and cron/JWS delivery passed; all upstreams isolated",
+    "workerd: routes, socket-marker stripping, assets/CSP/HEAD, Auth Hub redirect, authenticated merchant invoice/idempotency, empty-body discovery within budget, canonical payment transition and signed replay, persistent JWKS, D1 protocol and cron/JWS delivery passed; all upstreams isolated",
   );
 } finally {
   await mf.dispose();

@@ -1,6 +1,12 @@
 import type { KvKey, Kv, KvEntryMaybe, KvAtomic } from "./kv.ts";
 import { type CompactJwsSigner } from "./jws.ts";
 import {
+  discoverInvoicePayment,
+  discoveryStateKey,
+  invoiceMatchesTransfer,
+  type DiscoveryOptions,
+} from "./payment_discovery.ts";
+import {
   catalogVersionKey,
   type Clock,
   getCatalogVersion,
@@ -77,6 +83,7 @@ export type PaymentServiceOptions = {
   clock?: Clock;
   idGenerator?: IdGenerator;
   discountStart?: () => bigint;
+  discovery?: DiscoveryOptions;
 };
 
 export type MerchantContext = {
@@ -104,6 +111,7 @@ export type ClaimPaymentInput = {
 export type ClaimPaymentResult = {
   invoice: InvoiceJson;
   eventJws?: string;
+  discovery?: { found: boolean; searchedToBlock?: string };
 };
 
 type OpenInvoiceIndex = {
@@ -173,6 +181,18 @@ export function createPaymentService(options: PaymentServiceOptions) {
     listInvoices: (limit?: number) => listInvoices(kv, limit),
     getInvoiceRecord: (invoiceId: unknown) => invoiceRecord(kv, invoiceId),
     claimPayment: (invoiceId: unknown, input: ClaimPaymentInput) => claimPayment(invoiceId, input),
+    discoverPayment: (invoiceId: unknown) =>
+      discoverInvoicePayment(
+        {
+          kv,
+          rpc,
+          clock,
+          claim: claimPayment,
+          existingEvent: signedExistingEvent,
+        },
+        invoiceId,
+        options.discovery,
+      ),
     refreshInvoice: (invoiceId: unknown) => refreshInvoice(invoiceId),
     expireInvoice: (invoiceId: unknown) => expireInvoice(invoiceId),
     markManualReview: (invoiceId: unknown) => markManualReview(invoiceId),
@@ -407,11 +427,12 @@ export function createPaymentService(options: PaymentServiceOptions) {
         : boundedText(input.observedBlockHash, "observed_block_hash", 66);
     const locatorKey = paymentLocatorKey(invoice.chainId, transactionHash, logIndex);
     const existingLocator = await kv.get<LocatorIndex>(locatorKey);
-    if (existingLocator.value) {
-      if (existingLocator.value.invoiceId !== invoice.id) {
-        throw new PaymentDomainError("payment_locator_already_claimed");
-      }
-      if (invoice.status === "reverted") {
+    if (existingLocator.value && existingLocator.value.invoiceId !== invoice.id) {
+      throw new PaymentDomainError("payment_locator_already_claimed");
+    }
+    if (invoice.status === "reverted" && invoice.paymentId) {
+      const payment = await kv.get<PaymentRecord>(paymentKey(invoice.paymentId));
+      if (payment.value?.transactionHash === transactionHash) {
         return reincludeRevertedPayment(
           invoiceEntry,
           existingLocator,
@@ -421,9 +442,11 @@ export function createPaymentService(options: PaymentServiceOptions) {
           observedBlockHash,
         );
       }
+    }
+    if (existingLocator.value) {
       const refreshed = await refreshInvoice(invoice.id);
       if (refreshed.eventJws) return refreshed;
-      return { ...refreshed, eventJws: await signedExistingEvent(invoice.id) };
+      return { ...refreshed, eventJws: await signedExistingEvent(refreshed.invoice) };
     }
 
     const evidence = await verifyTransferBatch(rpc, invoice.chainId, {
@@ -454,11 +477,25 @@ export function createPaymentService(options: PaymentServiceOptions) {
     observedBlockHash: string | undefined,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
-    if (!invoice.paymentId || locatorEntry.value?.paymentId !== invoice.paymentId) {
+    if (!invoice.paymentId) throw new PaymentDomainError("payment_record_not_found");
+    const paymentEntry = await kv.get<PaymentRecord>(paymentKey(invoice.paymentId));
+    const payment = paymentEntry.value;
+    if (!payment || payment.transactionHash !== transactionHash)
+      throw new PaymentDomainError("payment_record_not_found");
+    const locatorChanged = payment.logIndex !== logIndex;
+    if (locatorChanged && locatorEntry.value)
+      throw new PaymentDomainError("payment_locator_already_claimed");
+    const previousLocator = locatorChanged
+      ? await kv.get<LocatorIndex>(
+          paymentLocatorKey(invoice.chainId, payment.transactionHash, payment.logIndex),
+        )
+      : locatorEntry;
+    if (
+      previousLocator.value?.invoiceId !== invoice.id ||
+      previousLocator.value?.paymentId !== invoice.paymentId
+    ) {
       throw new PaymentDomainError("payment_record_not_found");
     }
-    const paymentEntry = await kv.get<PaymentRecord>(paymentKey(invoice.paymentId));
-    if (!paymentEntry.value) throw new PaymentDomainError("payment_record_not_found");
     const evidence = await verifyTransferBatch(rpc, invoice.chainId, {
       transactionHash,
       logIndex,
@@ -524,8 +561,15 @@ export function createPaymentService(options: PaymentServiceOptions) {
       .check(openEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(nextPayment.id), nextPayment)
+      .delete(discoveryStateKey(invoice.id))
+      .set(locatorEntry.key, {
+        invoiceId: invoice.id,
+        paymentId: invoice.paymentId,
+        duplicate: false,
+      } satisfies LocatorIndex)
       .set(headKey(invoice.chainId), heads)
       .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id);
+    if (locatorChanged) atomic = atomic.check(previousLocator).delete(previousLocator.key);
     if (openEntry.value === null) {
       atomic = atomic.set(openKey, {
         invoiceId: invoice.id,
@@ -612,6 +656,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       .check(openEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(paymentId), payment)
+      .delete(discoveryStateKey(invoice.id))
       .set(locatorKey, {
         invoiceId: invoice.id,
         paymentId,
@@ -840,6 +885,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         .check(paymentEntry)
         .check(locatorEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
+        .delete(discoveryStateKey(invoice.id))
         .delete(paymentKey(payment.id))
         .delete(locatorKey);
       if (expired && openEntry.value?.invoiceId === invoice.id) {
@@ -877,6 +923,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         .check(paymentEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
         .set(paymentKey(payment.id), nextPayment)
+        .delete(discoveryStateKey(invoice.id))
         .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id),
       event,
     );
@@ -986,19 +1033,31 @@ export function createPaymentService(options: PaymentServiceOptions) {
     } as DeliveryEventRecord;
   }
 
-  async function signedExistingEvent(invoiceId: string): Promise<string | undefined> {
-    const invoice = await invoiceRecord(kv, invoiceId);
+  async function signedExistingEvent(
+    invoice: InvoiceRecord | InvoiceJson,
+  ): Promise<string | undefined> {
+    if (!invoice.paymentId) return undefined;
     const types: PaymentEventType[] =
       invoice.status === "reverted"
         ? ["payment.reverted.v1"]
         : invoice.status === "settled" || invoice.status === "finalized"
           ? ["payment.settled.v1", "payment.accepted.v1"]
-          : ["payment.accepted.v1"];
+          : invoice.status === "provisionally_paid"
+            ? ["payment.accepted.v1"]
+            : [];
     for (const type of types) {
-      const eventId = (await kv.get<string>(eventByInvoiceKey(invoiceId, type))).value;
+      const eventId = (await kv.get<string>(eventByInvoiceKey(invoice.id, type))).value;
       if (!eventId) continue;
       const event = (await kv.get<DeliveryEventRecord>(eventKey(eventId))).value;
-      if (event) return signEventForDelivery(signer, event, clock.now());
+      const occurredAt =
+        type === "payment.reverted.v1"
+          ? invoice.revertedAt
+          : type === "payment.settled.v1"
+            ? invoice.settledAt
+            : invoice.acceptedAt;
+      if (event?.paymentId === invoice.paymentId && event.createdAt === occurredAt) {
+        return signEventForDelivery(signer, event, clock.now());
+      }
     }
     return undefined;
   }
@@ -1064,14 +1123,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         )
       ).flat();
       for (const log of logs) {
-        const invoice = watch.invoices.find(
-          (candidate) =>
-            (!candidate.paymentId || candidate.status === "reverted") &&
-            candidate.minimumBlock <= log.blockNumber &&
-            candidate.tokenAddress.toLowerCase() === log.tokenAddress.toLowerCase() &&
-            candidate.treasuryAddress.toLowerCase() === log.recipientAddress.toLowerCase() &&
-            candidate.paidAmountUnits === log.amountUnits,
-        );
+        const invoice = watch.invoices.find((candidate) => invoiceMatchesTransfer(candidate, log));
         if (!invoice) continue;
         try {
           await claimPayment(invoice.id, {

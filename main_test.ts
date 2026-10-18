@@ -164,6 +164,63 @@ test("reading an invoice never performs expiration writes", async () => {
   assertEquals(expirations, 0);
 });
 
+test("claims accept an empty discovery object or exactly four coordinates after authorization", async () => {
+  await withApp(async ({ request, handler }) => {
+    await request("/api/v1/admin/chains/8453", {
+      method: "PUT",
+      adminMutation: true,
+      body: { enabled: true, treasuryAddress: TREASURY },
+    });
+    await request("/api/v1/catalog/versions/claim-prices", {
+      method: "PUT",
+      body: {
+        currency: "USD",
+        products: [
+          { productId: "pack", label: "Pack", kind: "credit_pack", priceCents: 500, enabled: true },
+        ],
+      },
+    });
+    const created = await request("/api/v1/invoices", {
+      method: "POST",
+      headers: { "idempotency-key": "discovery" },
+      body: {
+        customerReference: "claim-customer",
+        pricingVersionId: "claim-prices",
+        productId: "pack",
+        chainId: 8453,
+      },
+    });
+    assertEquals(created.status, 201);
+    const invoice = await created.json();
+    const path = `/api/v1/invoices/${invoice.id}/claims`;
+    const found = await request(path, { method: "POST", body: {} });
+    assertEquals(found.status, 200);
+    assertEquals((await found.json()).discovery, { found: false, searchedToBlock: "100" });
+    const coordinates = {
+      transactionHash: "invalid",
+      logIndex: "0",
+      observedBlockNumber: "100",
+      observedBlockHash: `0x${"ab".repeat(32)}`,
+    };
+    for (const body of [
+      { transactionHash: "invalid" },
+      { ...coordinates, extra: true },
+      { unrelated: true },
+    ]) {
+      const rejected = await request(path, { method: "POST", body });
+      assertEquals(rejected.status, 400);
+      assertEquals(await rejected.json(), { error: "invalid_claim_input" });
+    }
+    const coordinateClaim = await request(path, { method: "POST", body: coordinates });
+    assertEquals(coordinateClaim.status, 400);
+    assertEquals(await coordinateClaim.json(), { error: "invalid_transaction_hash" });
+    const unauthorized = await handler(
+      new Request(`https://checkout.ubq.fi${path}`, { method: "POST", body: '{"extra":true}' }),
+    );
+    assertEquals(unauthorized.status, 401);
+  });
+});
+
 test("public origins cannot forge loopback trust", async () => {
   await withApp(async ({ handler }) => {
     const forged = await handler(
