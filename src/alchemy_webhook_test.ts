@@ -113,12 +113,27 @@ test("signed createdAt enforces application freshness at the old and future boun
   }
 });
 
+test("the official nine-digit timestamp is signed verbatim and normalized to milliseconds", async () => {
+  const input = payload();
+  input.createdAt = "2024-01-23T07:42:26.411977228Z";
+  const { body, signature } = await delivery(input);
+  const verified = await verifyAlchemyWebhookDelivery(body, signature, {
+    ...OPTIONS,
+    now: new Date("2024-01-23T07:42:26.411Z"),
+  });
+  expect(verified.createdAt).toBe("2024-01-23T07:42:26.411Z");
+  expect(verified.bodySha256).toBe(
+    hex(new Uint8Array(await crypto.subtle.digest("SHA-256", body))),
+  );
+});
+
 test("timestamps require a valid UTC date rather than permissive Date.parse input", async () => {
   for (const createdAt of [
     "yesterday",
     "2026-10-18",
     "2026-02-30T04:00:00.000Z",
     "2026-10-18T04:00:00+00:00",
+    "2026-10-18T04:00:00.1234567890Z",
   ]) {
     const input = payload();
     input.createdAt = createdAt;
@@ -146,10 +161,21 @@ test("same event identity preserves raw body hash changes and removed inclusion 
   ).not.toBe(original.deliveryId);
 });
 
+test("the documented erc20 category uses the same canonical log decoding as token", async () => {
+  const input = payload();
+  input.event.activity[0].category = "erc20";
+  const { body, signature } = await delivery(input);
+  const verified = await verifyAlchemyWebhookDelivery(body, signature, OPTIONS);
+  expect(verified.transfers[0].amountUnits).toBe(AMOUNT);
+  expect(verified.transfers[0].transactionHash).toBe(TRANSACTION_HASH);
+});
+
 test("irrelevant native transfers, ERC721, and other token events do not become ERC20 observations", async () => {
   const input = payload();
   input.event.activity.push({ ...activity(), category: "external" });
+  input.event.activity.push({ ...activity(), category: "erc721" });
   const nft = activity();
+  nft.category = "erc20";
   nft.log.topics.push(`0x${"0".repeat(64)}`);
   input.event.activity.push(nft);
   const otherEvent = activity();

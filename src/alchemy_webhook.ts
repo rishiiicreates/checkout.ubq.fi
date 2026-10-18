@@ -101,7 +101,7 @@ export async function verifyAlchemyWebhookDelivery(
 function parseActivity(value: unknown, chainId: SupportedChainId): ChainTransferEvent | null {
   const activity = object(value);
   if (typeof activity.category !== "string") throw new ChainWebhookError("invalid_chain_activity");
-  if (activity.category !== "token") return null;
+  if (activity.category !== "token" && activity.category !== "erc20") return null;
   const log = object(activity.log);
   if (!Array.isArray(log.topics)) throw new ChainWebhookError("invalid_chain_transfer_topics");
   // Address Activity also includes NFTs. ERC721 Transfer has four topics; other events differ.
@@ -144,7 +144,7 @@ function identifier(value: unknown): string {
 function timestamp(value: unknown, now: Date): string {
   if (
     typeof value !== "string" ||
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value) ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value) ||
     !Number.isFinite(Date.parse(value)) ||
     !Number.isFinite(now.getTime())
   ) {
