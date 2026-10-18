@@ -218,12 +218,12 @@ export async function huntAccountAttempts(
           attempt.invoice.minimumBlock - 1n > floor ? attempt.invoice.minimumBlock - 1n : floor,
         0n,
       );
-    for (const group of chainGroups) group.targetHead = latest;
     if (latest < creationFloor) {
       for (const group of chainGroups) group.reason = "latest_before_attempt_snapshot";
       diagnostics.add(`latest_before_attempt_snapshot:${chainId}`);
       continue;
     }
+    for (const group of chainGroups) group.targetHead = latest;
     try {
       const result = await huntTransferLogs(
         rpc,

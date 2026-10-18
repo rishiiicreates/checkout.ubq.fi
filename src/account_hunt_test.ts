@@ -4,6 +4,7 @@ import { accountAttemptDescriptor } from "./account_attempts.ts";
 import {
   huntAccountAttempts,
   type AccountHuntOptions,
+  type AccountHuntResult,
   type LoadedAccountAttempt,
 } from "./account_hunt.ts";
 import type { InvoiceRecord, SupportedChainId } from "./payment_types.ts";
@@ -328,6 +329,79 @@ test("failed or corrupt latest heads and known creation-floor contradictions nev
     app.kv.close();
   }
 });
+
+for (const mixed of [false, true]) {
+  test(`a rejected latest capture remains retryable after retention (mixed attempts=${mixed})`, async () => {
+    const newer = invoice({ id: "newer", minimumBlock: 101n, paidAmountUnits: 900n });
+    const older = invoice({ id: "older" });
+    const ethereum = invoice({ id: "ethereum", chainId: 1 });
+    const app = await setup(mixed ? [older, newer, ethereum] : [newer]);
+    try {
+      app.rpc.heads.set(8453, 99n);
+      app.rpc.heads.set(1, 20n);
+      app.rpc.logs.set(1, [transfer(ethereum, 5n)]);
+      const rejected = await huntAccountAttempts(app.dependencies, options());
+      equal(rejected.enumerationComplete, true);
+      equal(rejected.reachedHead, false);
+      const base = rejected.groups.find((group) => group.chainId === 8453)!;
+      equal(base.reason, "latest_before_attempt_snapshot");
+      equal(base.ranges, []);
+      equal(base.reachedHead, false);
+      equal(app.rpc.calls.filter((call) => call.chainId === 8453).length, 1);
+      if (mixed) {
+        equal(rejected.groups.find((group) => group.chainId === 1)?.targetHead, 20n);
+        equal(rejected.groups.find((group) => group.chainId === 1)?.reachedHead, true);
+        equal(
+          rejected.observations.map((observation) => observation.candidateInvoiceIds),
+          [["ethereum"]],
+        );
+      }
+
+      const retainedKey = ["m14", "retained-hunt"];
+      await app.kv.set(retainedKey, rejected);
+      const retained = (await app.kv.get<AccountHuntResult>(retainedKey)).value!;
+      equal(retained.groups.find((group) => group.chainId === 8453)?.targetHead, undefined);
+      equal(retained.observations, rejected.observations);
+      app.rpc.calls.length = 0;
+      app.rpc.heads.set(8453, 103n);
+      app.rpc.logs.set(
+        8453,
+        mixed ? [transfer(older, 10n), transfer(newer, 102n)] : [transfer(newer, 102n)],
+      );
+      const resumed = await huntAccountAttempts(
+        {
+          ...app.dependencies,
+          loadAttempt: async () => {
+            throw new Error("retained attempts must not reload");
+          },
+        },
+        options({ retained: retained.selection }),
+      );
+      equal(resumed.pagesRead, 0);
+      equal(resumed.attemptReads, 0);
+      equal(resumed.reachedHead, true);
+      const recovered = resumed.groups.find((group) => group.chainId === 8453)!;
+      equal(recovered.targetHead, 103n);
+      equal(recovered.searchedToBlock, 103n);
+      equal(recovered.reachedHead, true);
+      equal(
+        recovered.ranges.map((range) => [range.fromBlock, range.toBlock, range.status]),
+        [[mixed ? 1n : 101n, 103n, "complete"]],
+      );
+      equal(
+        resumed.observations.flatMap((observation) => observation.candidateInvoiceIds).sort(),
+        mixed ? ["ethereum", "newer", "older"] : ["newer"],
+      );
+      equal(
+        app.rpc.calls.filter((call) => call.chainId === 8453).map((call) => call.calls[0].method),
+        ["eth_getBlockByNumber", "eth_getLogs"],
+      );
+      equal(resumed.diagnostics, []);
+    } finally {
+      app.kv.close();
+    }
+  });
+}
 
 test("caller guards preserve protected capacity across reads and RPC continuations", async () => {
   const app = await setup([invoice({ id: "a" }), invoice({ id: "b" })]);
