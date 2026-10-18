@@ -623,8 +623,21 @@ export function createPaymentService(options: PaymentServiceOptions) {
     if (
       !event.removed &&
       ((hasCurrentPaymentRecord(invoice) && sameInclusion) || locator.value?.duplicate)
-    )
+    ) {
+      if (sameInclusion && !locator.value?.duplicate && options.wakeups?.ensure) {
+        // The signed receipt is attributed to this exact recorded inclusion. Replan
+        // its canonical known-payment job; never wake unrelated notices by pathname.
+        if (!room(11) || !(await context.isCurrent())) return deferred(id);
+        await options.wakeups.ensure({
+          kind: "invoice",
+          id,
+          dueAt: Date.parse(invoice.expiresAt),
+          reason: "expiry",
+        });
+        if (!(await context.isCurrent())) return deferred(id);
+      }
       return ignored(id);
+    }
     const additionalTransfer = Boolean(payment && !sameTransaction);
     const mutationCalls =
       event.removed || (hasCurrentPaymentRecord(invoice) && sameTransaction && !sameInclusion)
