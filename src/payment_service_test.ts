@@ -121,6 +121,7 @@ test("finalized amount reservations become reusable only after the quarantine wi
     await service.claimPayment(first.id, claim(hash(1), 100n));
     rpc.setHeads(103n, 100n, null);
     await service.refreshInvoice(first.id);
+    await service.refreshInvoice(first.id);
     rpc.setHeads(103n, 100n, 100n);
     assertEquals((await service.refreshInvoice(first.id)).invoice.status, "finalized");
 
@@ -255,8 +256,10 @@ test("late inclusion is quarantined but pre-expiry inclusion can be accepted aft
     clock.advance(2 * 60 * 60 * 1000);
     assertEquals((await service.expireInvoice(onTime.id)).status, "expired");
     const onTimeClaim = await service.claimPayment(onTime.id, claim(hash(11), 104n));
-    assertEquals(onTimeClaim.invoice.status, "provisionally_paid");
-    assert(onTimeClaim.eventJws);
+    assertEquals(onTimeClaim.invoice.status, "confirming");
+    assertEquals(onTimeClaim.eventJws, undefined);
+    rpc.setHeads(107n, 104n, null);
+    assert((await service.refreshInvoice(onTime.id)).eventJws);
     const idempotentOpen = await service.createInvoice(context("on-time-retry"), {
       customerReference: "on-time-customer",
       pricingVersionId: "prices",
@@ -267,7 +270,7 @@ test("late inclusion is quarantined but pre-expiry inclusion can be accepted aft
   });
 });
 
-test("three sealed blocks accept, safe settles, finalized records, and stale heads do not latch", async () => {
+test("latest depth stays confirming, safe accepts once, and actual heads settle and finalize", async () => {
   await withService(async ({ service, rpc, kv }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -291,7 +294,19 @@ test("three sealed blocks accept, safe settles, finalized records, and stale hea
     assertEquals(confirming.invoice.status, "confirming");
     assertEquals(confirming.eventJws, undefined);
 
+    const confirmingVersion = (
+      await kv.get(["uos_checkout", "v1", "payments", "invoices", invoice.id])
+    ).versionstamp;
     rpc.setHeads(103n, null, null);
+    const sealed = await service.refreshInvoice(invoice.id);
+    assertEquals(sealed.invoice.status, "confirming");
+    assertEquals(sealed.eventJws, undefined);
+    assertEquals(
+      (await kv.get(["uos_checkout", "v1", "payments", "invoices", invoice.id])).versionstamp,
+      confirmingVersion,
+    );
+    assertEquals((await service.listOutbox()).length, 0);
+    rpc.setHeads(103n, 100n, null);
     const accepted = await service.refreshInvoice(invoice.id);
     assertEquals(accepted.invoice.status, "provisionally_paid");
     assert(accepted.eventJws);
@@ -388,7 +403,9 @@ test("reorg before provisional returns to awaiting; reorg after provisional emit
       includedAt: new Date("2026-07-21T12:06:00.000Z"),
     });
     rpc.setHeads(106n, null, null);
-    const accepted = await service.claimPayment(after.id, claim(hash(31), 103n));
+    await service.claimPayment(after.id, claim(hash(31), 103n));
+    rpc.setHeads(106n, 103n, null);
+    const accepted = await service.refreshInvoice(after.id);
     assertEquals(accepted.invoice.status, "provisionally_paid");
     rpc.hideReceipt(hash(31));
     const incomplete = await service.refreshInvoice(after.id);
@@ -425,8 +442,13 @@ test("claim replay and a second exact transfer never emit a second acceptance", 
       includedAt: new Date("2026-07-21T12:05:00.000Z"),
     });
     rpc.setHeads(103n, null, null);
-    const first = await service.claimPayment(invoice.id, claim(hash(40), 100n));
+    const seen = await service.claimPayment(invoice.id, claim(hash(40), 100n));
+    assertEquals(seen.invoice.status, "confirming");
+    assertEquals(seen.eventJws, undefined);
+    rpc.setHeads(103n, null, 100n);
+    const first = await service.refreshInvoice(invoice.id);
     assert(first.eventJws);
+    rpc.setHeads(103n, null, null);
     const replay = await service.claimPayment(invoice.id, claim(hash(40), 100n));
     assert(replay.eventJws);
     const firstPayload = (await verifyCompactJws(first.eventJws!, await service.jwks()))
@@ -469,7 +491,9 @@ test("a reverted locator can reappear canonically and emit a new acceptance life
       includedAt: new Date("2026-07-21T12:05:00.000Z"),
     });
     rpc.setHeads(103n, null, null);
-    const first = await service.claimPayment(invoice.id, claim(transactionHash, 100n));
+    await service.claimPayment(invoice.id, claim(transactionHash, 100n));
+    rpc.setHeads(103n, 100n, null);
+    const first = await service.refreshInvoice(invoice.id);
     const firstClaims = (await verifyCompactJws(first.eventJws!, await service.jwks()))
       .payload as Record<string, unknown>;
 
@@ -478,7 +502,7 @@ test("a reverted locator can reappear canonically and emit a new acceptance life
     assertEquals(reverted.invoice.status, "reverted");
 
     rpc.reincludeTransfer(transactionHash, 101n);
-    rpc.setHeads(104n, null, null);
+    rpc.setHeads(104n, 101n, null);
     const watch = await service.reconcileHourly(8453, 104n);
     assertEquals(
       watch.invoices.map((candidate) => candidate.id),
@@ -547,8 +571,8 @@ test("hourly reconciliation discovers matching treasury transfers and claims the
     rpc.setHeads(103n, null, null);
     const range = await service.reconcileHourly(8453, 103n);
     assertEquals(range.fromBlock, 100n);
-    assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
-    assertEquals((await service.listOutbox()).length, 1);
+    assertEquals((await service.getInvoice(invoice.id)).status, "confirming");
+    assertEquals((await service.listOutbox()).length, 0);
   });
 });
 
@@ -583,6 +607,8 @@ test("outbox retries after JWS expiry keep stable event identity and isolate poi
       });
       rpc.setHeads(blockNumber + 3n, null, null);
       await service.claimPayment(invoice.id, claim(transactionHash, blockNumber));
+      rpc.setHeads(blockNumber + 3n, blockNumber, null);
+      await service.refreshInvoice(invoice.id);
     }
 
     const initial = await service.listOutbox();
@@ -629,7 +655,7 @@ test("reconciliation overlaps the cursor and finds a transfer introduced behind 
     rpc.setHeads(105n, 104n, 103n);
     const watch = await service.reconcileHourly(8453, 105n);
     assertEquals(watch.fromBlock, 100n);
-    assertEquals((await service.getInvoice(invoice.id)).status, "settled");
+    assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
   });
 });
 
@@ -664,6 +690,7 @@ test("disabled chains drain outstanding invoices and terminal invoices leave the
     });
     rpc.setHeads(103n, 100n, 100n);
     await service.reconcileHourly(8453, 103n);
+    await service.refreshInvoice(invoice.id);
     await service.refreshInvoice(invoice.id);
     await service.refreshInvoice(invoice.id);
     assertEquals((await service.getInvoice(invoice.id)).status, "finalized");
@@ -715,7 +742,9 @@ test("treasury rejects zero and token addresses and events target the invoice me
       includedAt: new Date("2026-07-21T12:10:00.000Z"),
     });
     rpc.setHeads(103n, null, null);
-    const accepted = await service.claimPayment(invoice.id, claim(hash(64), 100n));
+    await service.claimPayment(invoice.id, claim(hash(64), 100n));
+    rpc.setHeads(103n, 100n, null);
+    const accepted = await service.refreshInvoice(invoice.id);
     const payload = (await verifyCompactJws(accepted.eventJws!, await service.jwks()))
       .payload as Record<string, unknown>;
     assertEquals(payload.aud, merchant);

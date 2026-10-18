@@ -73,7 +73,6 @@ const CHAIN_SETTINGS_PREFIX: KvKey = [...PREFIX, "chain_settings"];
 
 const EVENT_ISSUER = "https://checkout.ubq.fi";
 const EVENT_TTL_SECONDS = 24 * 60 * 60;
-const SEALED_BLOCKS_REQUIRED = 3n;
 const RECONCILIATION_OVERLAP_BLOCKS = 128n;
 const OUTBOX_INITIAL_BACKOFF_MS = 60_000;
 const OUTBOX_MAX_BACKOFF_MS = 24 * 60 * 60 * 1000;
@@ -179,6 +178,24 @@ export function createPaymentService(options: PaymentServiceOptions) {
   const clock = options.clock ?? systemClock;
   const idGenerator = options.idGenerator ?? { next: () => crypto.randomUUID() };
   const discountStart = options.discountStart ?? randomDiscountStart;
+  function verificationRpc(context?: ChainTransferContext, completionCalls = 5): RpcClient {
+    return {
+      async batch(chainId, calls, limits) {
+        const headRetry = calls.every(({ id }) => ["latest", "safe", "finalized"].includes(id));
+        if (headRetry && context && !(await context.isCurrent())) throw new StaleWakeupError();
+        const budget = context?.budget ?? options.discovery?.budget;
+        if (
+          calls.every(({ id }) => id === "safe" || id === "finalized") &&
+          budget &&
+          // Fenced ingress can also read its receipt before each of the three commit phases.
+          !budget.hasCapacity(completionCalls + 1 + (context ? 3 : 0))
+        ) {
+          return calls.map(({ id }) => ({ jsonrpc: "2.0", id, result: null }));
+        }
+        return rpc.batch(chainId, calls, limits);
+      },
+    };
+  }
   return {
     publishCatalogVersion: (
       context: MerchantContext,
@@ -276,12 +293,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     ) {
       if (!evidence) throw new PaymentDomainError("confirmation_evidence_required");
       const times = confirmationMilestones(invoice.chainId, evidence.blockTimestamp.getTime());
-      const expected =
-        invoice.status === "confirming"
-          ? times.sealedAt
-          : invoice.status === "provisionally_paid"
-            ? times.safeAt
-            : times.finalizedAt;
+      const expected = invoice.status === "settled" ? times.finalizedAt : times.safeAt;
       target = {
         ...target,
         dueAt: Math.max(clock.now().getTime(), expected),
@@ -671,7 +683,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       return { ...refreshed, eventJws: await signedExistingEvent(refreshed.invoice) };
     }
 
-    const evidence = await verifyTransferBatch(rpc, invoice.chainId, {
+    const evidence = await verifyTransferBatch(verificationRpc(context), invoice.chainId, {
       transactionHash,
       logIndex,
       observedBlockNumber,
@@ -721,7 +733,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     ) {
       throw new PaymentDomainError("payment_record_not_found");
     }
-    const evidence = await verifyTransferBatch(rpc, invoice.chainId, {
+    const evidence = await verifyTransferBatch(verificationRpc(context), invoice.chainId, {
       transactionHash,
       logIndex,
       observedBlockNumber,
@@ -737,8 +749,6 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const timestamp = clock.now().toISOString();
     const headsEntry = await kv.get<ChainHeadRecord>(headKey(invoice.chainId));
     const heads = mergeHeads(invoice.chainId, headsEntry.value, evidence, timestamp);
-    // Ingress records one canonical phase; its already-prearmed confirmation job accepts later.
-    const sealed = !context && heads.latestBlock >= evidence.blockNumber + SEALED_BLOCKS_REQUIRED;
     const openKey = openInvoiceKey(
       invoice.merchant,
       invoice.customerReference,
@@ -749,8 +759,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const conflictingOpen = openEntry.value !== null && openEntry.value.invoiceId !== invoice.id;
     const nextInvoice: InvoiceRecord = {
       ...invoice,
-      status: sealed ? "provisionally_paid" : "confirming",
-      acceptedAt: sealed ? timestamp : undefined,
+      status: "confirming",
+      acceptedAt: undefined,
       settledAt: undefined,
       finalizedAt: undefined,
       revertedAt: undefined,
@@ -768,16 +778,13 @@ export function createPaymentService(options: PaymentServiceOptions) {
       blockNumber: evidence.blockNumber,
       blockHash: evidence.blockHash,
       blockTimestamp: evidence.blockTimestamp.toISOString(),
-      phase: sealed ? "accepted" : "confirming",
-      acceptedAt: sealed ? timestamp : undefined,
+      phase: "confirming",
+      acceptedAt: undefined,
       settledAt: undefined,
       finalizedAt: undefined,
       revertedAt: undefined,
       updatedAt: timestamp,
     };
-    const event = sealed
-      ? await makeEvent("payment.accepted.v1", nextInvoice, nextPayment, timestamp)
-      : undefined;
     let atomic = kv
       .atomic()
       .check(invoiceEntry)
@@ -802,8 +809,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         requestFingerprint: invoiceRequestFingerprint(invoice),
       } satisfies OpenInvoiceIndex);
     }
-    if (event) atomic = addEventMutations(atomic, event);
-    if (!(await commitInvoice(atomic, nextInvoice, event, evidence, context)).ok) {
+    if (!(await commitInvoice(atomic, nextInvoice, undefined, evidence, context)).ok) {
       if (context) throw new StaleWakeupError();
       return claimPayment(
         invoice.id,
@@ -816,7 +822,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         context,
       );
     }
-    return { invoice: invoiceJson(nextInvoice), eventJws: event?.compactJws };
+    return { invoice: invoiceJson(nextInvoice) };
   }
 
   async function recordPrimaryPayment(
@@ -860,26 +866,13 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
     const conflictingOpen =
       !includedLate && openEntry.value !== null && openEntry.value.invoiceId !== invoice.id;
-    let nextInvoice: InvoiceRecord = {
+    const nextInvoice: InvoiceRecord = {
       ...invoice,
       paymentId,
       status: includedLate ? "late_payment" : conflictingOpen ? "manual_review" : "confirming",
       updatedAt: timestamp,
     };
     payment.phase = includedLate ? "late" : conflictingOpen ? "duplicate" : "confirming";
-
-    let event: OutboxEventRecord | undefined;
-    if (
-      !includedLate &&
-      !conflictingOpen &&
-      !context &&
-      heads.latestBlock >= evidence.blockNumber + SEALED_BLOCKS_REQUIRED
-    ) {
-      nextInvoice = { ...nextInvoice, status: "provisionally_paid", acceptedAt: timestamp };
-      payment.phase = "accepted";
-      payment.acceptedAt = timestamp;
-      event = await makeEvent("payment.accepted.v1", nextInvoice, payment, timestamp);
-    }
 
     let atomic = kv
       .atomic()
@@ -907,8 +900,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     if (includedLate || conflictingOpen) {
       atomic = atomic.delete(invoiceByChainKey(invoice.chainId, invoice.id));
     }
-    if (event) atomic = addEventMutations(atomic, event);
-    const committed = await commitInvoice(atomic, nextInvoice, event, evidence, context);
+    const committed = await commitInvoice(atomic, nextInvoice, undefined, evidence, context);
     if (!committed.ok) {
       if (context) throw new StaleWakeupError();
       return claimPayment(
@@ -922,7 +914,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
         context,
       );
     }
-    return { invoice: invoiceJson(nextInvoice), eventJws: event?.compactJws };
+    return { invoice: invoiceJson(nextInvoice) };
   }
 
   async function recordDuplicatePayment(
@@ -1003,7 +995,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
 
     let evidence: VerifiedTransfer;
     try {
-      evidence = await verifyTransferBatch(rpc, invoice.chainId, {
+      evidence = await verifyTransferBatch(verificationRpc(context, 9), invoice.chainId, {
         transactionHash: payment.transactionHash,
         logIndex: payment.logIndex,
         observedBlockNumber: payment.blockNumber,
@@ -1031,7 +1023,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
 
     if (
       invoice.status === "confirming" &&
-      heads.latestBlock >= payment.blockNumber + SEALED_BLOCKS_REQUIRED
+      ((heads.safeBlock !== null && heads.safeBlock >= payment.blockNumber) ||
+        (heads.finalizedBlock !== null && heads.finalizedBlock >= payment.blockNumber))
     ) {
       nextInvoice = {
         ...invoice,
@@ -1043,8 +1036,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
       event = await makeEvent("payment.accepted.v1", nextInvoice, nextPayment, timestamp);
     } else if (
       invoice.status === "provisionally_paid" &&
-      heads.safeBlock !== null &&
-      heads.safeBlock >= payment.blockNumber
+      ((heads.safeBlock !== null && heads.safeBlock >= payment.blockNumber) ||
+        (heads.finalizedBlock !== null && heads.finalizedBlock >= payment.blockNumber))
     ) {
       nextInvoice = { ...invoice, status: "settled", settledAt: timestamp, updatedAt: timestamp };
       nextPayment = { ...payment, phase: "settled", settledAt: timestamp, updatedAt: timestamp };
@@ -1068,6 +1061,21 @@ export function createPaymentService(options: PaymentServiceOptions) {
       };
     } else {
       if (!headAdvanced(headsEntry.value, heads)) return { invoice: invoiceJson(invoice) };
+    }
+
+    if (nextInvoice === invoice) {
+      // Head movement alone neither replaces the payment generation nor rearms a spent milestone.
+      const atomic = kv
+        .atomic()
+        .check(invoiceEntry, paymentEntry, headsEntry)
+        .set(headKey(invoice.chainId), heads);
+      if (context?.fence) atomic.check(context.fence);
+      if (context && !(await context.isCurrent())) throw new StaleWakeupError();
+      if (!(await atomic.commit()).ok) {
+        if (context) throw new StaleWakeupError();
+        return refreshInvoice(invoice.id, context, undefined, inconclusive);
+      }
+      return { invoice: invoiceJson(invoice) };
     }
 
     const openKey = openInvoiceKey(

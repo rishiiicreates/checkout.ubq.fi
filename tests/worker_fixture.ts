@@ -26,7 +26,7 @@ export default {
       const calls=await request.json();
       for(const call of calls) methods[call.method]=(methods[call.method]??0)+1;
       const blockHash=transfer?.blockHash??("0x"+"ab".repeat(32));
-      const block=number=>({number:"0x"+number.toString(16),hash:transfer?.canonicalHash??blockHash,timestamp:"0x"+Math.floor(Date.now()/1000).toString(16)});
+      const block=number=>({number:"0x"+number.toString(16),hash:transfer?.canonicalHash??blockHash,timestamp:"0x"+(transfer?.includedAt??Math.floor(Date.now()/1000)).toString(16)});
       const blockNumber=transfer?BigInt(transfer.blockNumber):100n;
       const hexBlock="0x"+blockNumber.toString(16);
       const receipt=transfer?{transactionHash:transfer.transactionHash,blockNumber:hexBlock,blockHash,status:"0x1",logs:[{address:transfer.tokenAddress,transactionHash:transfer.transactionHash,blockNumber:hexBlock,blockHash,logIndex:"0x"+Number(transfer.logIndex??7).toString(16),removed:false,topics:["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x"+"0".repeat(24)+"33".repeat(20),"0x"+"0".repeat(24)+transfer.treasuryAddress.slice(2)],data:"0x"+BigInt(transfer.amountUnits).toString(16).padStart(64,"0")}]}:null;
@@ -34,7 +34,7 @@ export default {
         call.method==="eth_getLogs" ? (receipt&&BigInt(call.params[0].fromBlock)<=blockNumber&&BigInt(call.params[0].toBlock)>=blockNumber?receipt.logs:[]) :
         call.method==="eth_getTransactionReceipt" ? receipt :
         transfer?.unavailableHeadTags&&(call.id==="safe"||call.id==="finalized") ? null :
-        block(transfer?(call.id==="event_block"?blockNumber:call.id==="latest"?blockNumber+3n:blockNumber-1n):100n)})));
+        block(transfer?(call.id==="event_block"?blockNumber:call.id==="latest"?blockNumber+3n:call.id==="safe"&&transfer.safeBlock!==undefined?BigInt(transfer.safeBlock):blockNumber-1n):100n)})));
     }
     if(request.headers.get("authorization")!=="Bearer offline-service-token") return Response.json({ok:false,error:"unauthorized"},{status:401});
     kvCalls++;
