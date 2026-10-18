@@ -10,6 +10,15 @@ import {
 } from "./main.ts";
 import { LOCAL_PEER_HEADER } from "./src/admin_auth.ts";
 import type { JsonRpcBatchItem, JsonRpcCall, RpcClient } from "./src/rpc.ts";
+import type { Kv } from "./src/kv.ts";
+import {
+  chainEventReceiptKey,
+  pendingChainTransfersKey,
+  processChainEventDelivery,
+  type ChainEventReceipt,
+} from "./src/chain_ingress.ts";
+import type { VerifiedChainEventDelivery } from "./src/chain_events.ts";
+import { WorkerRequestBudget } from "./src/worker_budget.ts";
 
 const TREASURY = "0x1111111111111111111111111111111111111111";
 
@@ -253,6 +262,172 @@ test("unsigned chain ingress fails before any storage or payment callback", asyn
     kv.close();
   }
 });
+
+for (const alreadyClaimed of [true, false])
+  test(`authenticated related GET handles pending chain receipt within24 calls (claimed=${alreadyClaimed})`, async () => {
+    const store = new SqliteKv();
+    try {
+      const seed = createCheckoutServices(store, {
+        rpc: new StaticRpc(),
+        resolveDns: async () => ["93.184.216.34"],
+      });
+      await seed.merchantAuth.upsertMerchant({
+        id: "related",
+        name: "Related",
+        settlementWebhookUrl: "https://merchant.example/events",
+      });
+      const { token } = await seed.merchantAuth.createKey({
+        merchantId: "related",
+        label: "Related",
+      });
+      await seed.payment.configureChain(8453, { enabled: true, treasuryAddress: TREASURY });
+      await seed.payment.publishCatalogVersion({ merchantId: "related" }, "related-prices", {
+        currency: "USD",
+        products: [
+          { productId: "pack", label: "Pack", kind: "credit_pack", priceCents: 500, enabled: true },
+        ],
+      });
+      const created = await seed.payment.createInvoice(
+        { merchantId: "related", idempotencyKey: "related" },
+        {
+          customerReference: "customer",
+          pricingVersionId: "related-prices",
+          productId: "pack",
+          chainId: 8453,
+        },
+      );
+      const invoice = await seed.payment.getInvoiceRecord(created.id);
+      const prefix = ["uos_checkout", "v1", "payments"];
+      const transfer = {
+        chainId: 8453 as const,
+        transactionHash: `0x${"11".repeat(32)}`,
+        logIndex: 7,
+        blockNumber: invoice.minimumBlock,
+        blockHash: `0x${"ab".repeat(32)}`,
+        tokenAddress: invoice.tokenAddress,
+        payerAddress: `0x${"33".repeat(20)}`,
+        recipientAddress: invoice.treasuryAddress,
+        amountUnits: invoice.paidAmountUnits,
+        removed: false,
+      };
+      const instant = new Date().toISOString();
+      if (alreadyClaimed)
+        await store
+          .atomic()
+          .set([...prefix, "invoices", invoice.id], {
+            ...invoice,
+            status: "confirming",
+            paymentId: "related-payment",
+          })
+          .set([...prefix, "payment_locators", 8453, transfer.transactionHash, transfer.logIndex], {
+            invoiceId: invoice.id,
+            paymentId: "related-payment",
+            duplicate: false,
+          })
+          .set([...prefix, "payment_records", "related-payment"], {
+            schemaVersion: 1,
+            id: "related-payment",
+            invoiceId: invoice.id,
+            chainId: 8453,
+            transactionHash: transfer.transactionHash,
+            logIndex: 7,
+            payer: transfer.payerAddress,
+            tokenAddress: transfer.tokenAddress,
+            treasuryAddress: transfer.recipientAddress,
+            amountUnits: transfer.amountUnits,
+            blockNumber: transfer.blockNumber,
+            blockHash: transfer.blockHash,
+            blockTimestamp: instant,
+            phase: "confirming",
+            firstObservedAt: instant,
+            updatedAt: instant,
+          })
+          .commit();
+      const delivery: VerifiedChainEventDelivery = {
+        provider: "alchemy",
+        subscriptionId: "hook",
+        eventId: "related-event",
+        deliveryId: "related-delivery",
+        createdAt: instant,
+        bodySha256: "a".repeat(64),
+        transfers: [transfer],
+      };
+      await processChainEventDelivery(delivery, {
+        kv: store,
+        minimumTransferCalls: 0,
+        processTransfer: async () => ({ terminal: false }),
+      });
+      assertEquals(
+        (await store.get<ChainEventReceipt>(chainEventReceiptKey(delivery))).value?.state,
+        "pending",
+      );
+      const budget = new WorkerRequestBudget(24);
+      budget.reserve(); // The completed migration object's one HTTP binding call.
+      const kv: Kv = {
+        get: (key) => {
+          budget.reserve();
+          return store.get(key);
+        },
+        getMany: (keys) => {
+          budget.reserve();
+          return store.getMany(keys);
+        },
+        set: (key, value, options) => {
+          budget.reserve();
+          return store.set(key, value, options);
+        },
+        delete: (key) => {
+          budget.reserve();
+          return store.delete(key);
+        },
+        list: () => {
+          throw new Error("related recovery must not list");
+        },
+        listPage: () => {
+          throw new Error("related recovery must not page");
+        },
+        atomic: () => {
+          const atomic = store.atomic();
+          const commit = atomic.commit.bind(atomic);
+          atomic.commit = () => {
+            budget.reserve();
+            return commit();
+          };
+          return atomic;
+        },
+        close: () => {},
+      };
+      let rpcCalls = 0;
+      const services = createCheckoutServices(kv, {
+        budget,
+        chainWebhookKeys: "{}",
+        rpc: {
+          batch: async () => {
+            rpcCalls++;
+            throw new Error("already-claimed cleanup must not query RPC");
+          },
+        },
+      });
+      const response = await createHandler(services)(
+        new Request(`https://checkout.ubq.fi/api/v1/invoices/${invoice.id}`, {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      );
+      assertEquals(response.status, 200);
+      console.log(`related authenticated GET calls=${24 - budget.remaining}/24,rpc=${rpcCalls}`);
+      assertEquals(
+        (await store.get<ChainEventReceipt>(chainEventReceiptKey(delivery))).value?.state,
+        alreadyClaimed ? "complete" : "pending",
+      );
+      const pendingReferences = (await store.get(pendingChainTransfersKey(transfer))).value;
+      if (alreadyClaimed) assertEquals(pendingReferences, null);
+      else assert(Array.isArray(pendingReferences) && pendingReferences.length === 1);
+      assertEquals(rpcCalls, 0);
+      assert(budget.remaining >= 0);
+    } finally {
+      store.close();
+    }
+  });
 
 test("public origins cannot forge loopback trust", async () => {
   await withApp(async ({ handler }) => {

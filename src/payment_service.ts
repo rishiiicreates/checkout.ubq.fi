@@ -361,7 +361,13 @@ export function createPaymentService(options: PaymentServiceOptions) {
       return ignored(id);
     if (!event.removed && hasCurrentPaymentRecord(invoice) && sameInclusion) return ignored(id);
     if (payment && !sameTransaction) return ignored(id);
-    if (!room(5) || !(await context.isCurrent())) return deferred(id);
+    const mutationCalls =
+      event.removed || (hasCurrentPaymentRecord(invoice) && sameTransaction && !sameInclusion)
+        ? 12
+        : invoice.status === "reverted" && invoice.paymentId
+          ? 11
+          : 10;
+    if (!room(mutationCalls) || !(await context.isCurrent())) return deferred(id);
     try {
       if (
         event.removed ||

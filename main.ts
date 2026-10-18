@@ -354,7 +354,8 @@ async function relatedInvoiceEvent(
   invoice: InvoiceJson,
 ): Promise<void> {
   try {
-    if (services.chainWebhookKeys && (services.budget?.hasCapacity(18) ?? true)) {
+    // Receipt/reference reads, lookup/admission, and four protected completion calls need thirteen.
+    if (services.chainWebhookKeys && (services.budget?.hasCapacity(13) ?? true)) {
       await recoverPendingChainTransfers(
         {
           chainId: invoice.chainId,
@@ -365,7 +366,7 @@ async function relatedInvoiceEvent(
         {
           kv: services.kv,
           budget: services.budget,
-          minimumTransferCalls: 12,
+          minimumTransferCalls: 3,
           processTransfer: services.payment.processChainTransfer,
         },
       );
