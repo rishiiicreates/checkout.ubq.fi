@@ -107,6 +107,83 @@ Deno.test("duplicate workers acquire one persisted lease and a restart recovers 
   }
 });
 
+Deno.test("D1 recovery wakes deliver and expire unrelated jobs while an invoice handler stalls", async () => {
+  const store = new JsonKvService();
+  const kv = new UbqKv({
+    url: "https://kv.example",
+    token: "offline",
+    fetchImpl: store.fetch,
+  }) as unknown as Deno.Kv;
+  let now = 0;
+  let invoiceCalls = 0;
+  const completed: string[] = [];
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  let timerId = 0;
+  const queue = createWorkQueue({
+    kv,
+    clock: { now: () => new Date(now) },
+    setTimer: (callback, delay) => {
+      timers.set(++timerId, { callback, delay });
+      return timerId;
+    },
+    clearTimer: (id) => {
+      timers.delete(id);
+    },
+    handle: async (work) => {
+      if (work.id === "stalled") {
+        invoiceCalls++;
+        if (invoiceCalls === 1) {
+          entered.resolve();
+          await release.promise;
+          return now + 60_000;
+        }
+      }
+      completed.push(work.id);
+      return undefined;
+    },
+  });
+  try {
+    await scheduleWork(kv.atomic(), "reconcile_invoice", "stalled", 0, now).commit();
+    await scheduleWork(kv.atomic(), "deliver_event", "delivery", 1_000, now).commit();
+    await scheduleWork(kv.atomic(), "expire_invoice", "expiry", 2_000, now).commit();
+    await queue.start();
+    await tick();
+    fire(timers);
+    await entered.promise;
+    await tick();
+    assertEquals(timers.size, 1, "a running handler must retain an independent recovery wake");
+    assertEquals([...timers.values()][0].delay, 1_000);
+    now = 1_000;
+    fire(timers);
+    await tick();
+    assertEquals(completed, ["delivery"]);
+    now = 2_000;
+    fire(timers);
+    await tick();
+    assertEquals(completed, ["delivery", "expiry"]);
+    assertEquals(invoiceCalls, 1);
+    assertEquals([...timers.values()][0].delay, 58_000);
+    now = 60_000;
+    fire(timers);
+    await tick();
+    assertEquals(
+      invoiceCalls,
+      2,
+      "the persisted lease recovers without another request or restart",
+    );
+    assertEquals(completed, ["delivery", "expiry", "stalled"]);
+    assertEquals(timers.size, 0);
+    assertEquals(store.records.size, 0);
+  } finally {
+    release.resolve();
+    await queue.stop();
+  }
+  assertEquals(store.records.size, 0, "the stale handler cannot recreate completed work");
+  assertEquals(timers.size, 0);
+});
+
 Deno.test("native KV commits domain state, work, and durable wake atomically", async () => {
   const kv = await Deno.openKv(":memory:");
   const completed = Promise.withResolvers<void>();

@@ -19,6 +19,47 @@ const RECIPIENT = `0x${"44".repeat(20)}`;
 const TOKEN = CHAIN_CONFIGURATIONS[8453].tokenAddress;
 const AMOUNT = 999_999n;
 
+Deno.test("RPC deadlines abort stalled fetches and response bodies", async (t) => {
+  const calls = [{ id: "latest", method: "eth_blockNumber", params: [] }];
+  await t.step("a fetch that ignores cancellation still settles by its deadline", async () => {
+    let signal: AbortSignal | null | undefined;
+    const release = Promise.withResolvers<Response>();
+    const client = new HttpRpcClient((_input, init) => {
+      signal = init?.signal;
+      return release.promise;
+    }, 10);
+    try {
+      await assertRejectsRpcCode(() => client.batch(8453, calls), "rpc_timeout");
+      assertEquals(signal?.aborted, true);
+    } finally {
+      release.resolve(Response.json([]));
+    }
+  });
+  await t.step("a received response body shares the request deadline", async () => {
+    let signal: AbortSignal | null | undefined;
+    let cancelled = false;
+    const client = new HttpRpcClient((_input, init) => {
+      signal = init?.signal;
+      return Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("["));
+              signal?.addEventListener("abort", () => {
+                cancelled = true;
+                controller.error(signal?.reason);
+              }, { once: true });
+            },
+          }),
+        ),
+      );
+    }, 10);
+    await assertRejectsRpcCode(() => client.batch(8453, calls), "rpc_timeout");
+    assertEquals(signal?.aborted, true);
+    assertEquals(cancelled, true);
+  });
+});
+
 Deno.test("payment evidence is verified from one HTTP JSON batch", async () => {
   let requestCount = 0;
   let requestUrl = "";

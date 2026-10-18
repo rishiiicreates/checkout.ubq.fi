@@ -127,6 +127,9 @@ export function createWorkQueue(options: {
         leaseUntil: now + LEASE_MS,
       };
       if (!(await putWork(kv.atomic().check(entry), leased, now).commit()).ok) continue;
+      // D1 has no native lease wake. Keep the next persisted due time armed
+      // independently of this handler, including recovery if it never settles.
+      notify();
       let nextDue: number | undefined;
       try {
         nextDue = await handle(leased);

@@ -30,7 +30,10 @@ export type FetchLike = (
 ) => Promise<Response>;
 
 export class HttpRpcClient implements RpcClient {
-  constructor(private readonly fetcher: FetchLike = fetch) {}
+  constructor(
+    private readonly fetcher: FetchLike = fetch,
+    private readonly timeoutMs = 10_000,
+  ) {}
 
   async batch(
     chainId: SupportedChainId,
@@ -43,25 +46,44 @@ export class HttpRpcClient implements RpcClient {
       method: call.method,
       params: call.params,
     }));
-    let response: Response;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new RpcError("rpc_timeout");
+        reject(error);
+        controller.abort(error);
+      }, this.timeoutMs);
+    });
     try {
-      response = await this.fetcher(`${RPC_ORIGIN}/${chainId}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    } catch (error) {
-      throw new RpcError("rpc_transport_failed", error);
+      let response: Response;
+      try {
+        response = await Promise.race([
+          this.fetcher(`${RPC_ORIGIN}/${chainId}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          }),
+          deadline,
+        ]);
+      } catch (error) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        throw new RpcError("rpc_transport_failed", error);
+      }
+      if (!response.ok) throw new RpcError(`rpc_http_${response.status}`);
+      let parsed: unknown;
+      try {
+        parsed = await Promise.race([response.json(), deadline]);
+      } catch (error) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        throw new RpcError("rpc_invalid_json", error);
+      }
+      if (!Array.isArray(parsed)) throw new RpcError("rpc_batch_response_required");
+      return parsed as JsonRpcBatchItem[];
+    } finally {
+      clearTimeout(timer!);
     }
-    if (!response.ok) throw new RpcError(`rpc_http_${response.status}`);
-    let parsed: unknown;
-    try {
-      parsed = await response.json();
-    } catch (error) {
-      throw new RpcError("rpc_invalid_json", error);
-    }
-    if (!Array.isArray(parsed)) throw new RpcError("rpc_batch_response_required");
-    return parsed as JsonRpcBatchItem[];
   }
 }
 

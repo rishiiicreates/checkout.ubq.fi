@@ -5,7 +5,13 @@ import {
   type PaymentService,
 } from "./payment_service.ts";
 import { type InvoiceRecord, PaymentDomainError } from "./payment_types.ts";
-import { type JsonRpcBatchItem, type JsonRpcCall, type RpcClient, TRANSFER_TOPIC } from "./rpc.ts";
+import {
+  HttpRpcClient,
+  type JsonRpcBatchItem,
+  type JsonRpcCall,
+  type RpcClient,
+  TRANSFER_TOPIC,
+} from "./rpc.ts";
 import { createWorkQueue, workKey, type WorkRecord } from "./work_queue.ts";
 
 const MERCHANT = "linkedin-scraper-2025";
@@ -1115,6 +1121,32 @@ Deno.test("invoice jobs back off through the expired watch window and then stop"
     assertEquals(recovered.discovery?.found, true);
     assertEquals(recovered.invoice.status, "provisionally_paid");
     assert((await kv.get(workKey("reconcile_invoice", invoice.id))).value);
+  });
+});
+
+Deno.test("expiry completes when HTTP RPC stalls instead of returning an error", async () => {
+  await withService(async ({ service, rpc, clock }) => {
+    const invoice = await createTestInvoice(service, "expiry-rpc-timeout");
+    let signal: AbortSignal | null | undefined;
+    const release = Promise.withResolvers<Response>();
+    const client = new HttpRpcClient((_input, init) => {
+      signal = init?.signal;
+      return release.promise;
+    }, 10);
+    rpc.batch = (chainId, calls) => client.batch(chainId, calls);
+    clock.advance(60 * 60_000);
+    try {
+      await service.runInvoiceWork({
+        type: "expire_invoice",
+        id: invoice.id,
+        dueAt: clock.now().getTime(),
+        attempts: 0,
+      });
+      assertEquals(signal?.aborted, true);
+      assertEquals((await service.getInvoice(invoice.id)).status, "expired");
+    } finally {
+      release.resolve(Response.json([]));
+    }
   });
 });
 

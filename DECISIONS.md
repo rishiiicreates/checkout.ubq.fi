@@ -62,12 +62,9 @@ explicit later claim remains available after the watch ends. This replaces indef
 polling and the former hourly sweep; no periodic maintenance runs when no eligible invoice or
 undelivered event remains. Finalized invoices had no indefinite reorg monitor in the previous job.
 
-The hosted D1 adapter has CRUD/list/atomic operations but no native queue methods and no range
-selectors. Its runtime uses a single one-shot timer for the earliest persisted work record, and it
-has no timer or store scan while idle. Genuine Deno KV additionally receives wake messages in the
-same atomic operation as domain/job writes so suspended instances can wake. Local native queue tests
-prove the API behavior; deployed isolate scheduling remains untested. No extra infrastructure or
-environment setting is required, and the former cron and interval entrypoints are removed.
+The hosted D1 adapter has CRUD/list/atomic operations but no native queue methods and no range selectors. Its runtime uses a single one-shot timer for the earliest persisted work record, including lease expiry. Each acquired lease rearms that timer independently of handler completion, so unrelated due work and abandoned leases recover while another handler stalls. It has no timer or store scan while idle. Genuine Deno KV additionally receives wake messages in the same atomic operation as domain/job writes so suspended instances can wake. Local native queue tests prove the API behavior; deployed isolate scheduling remains untested. No extra infrastructure or environment setting is required, and the former cron and interval entrypoints are removed.
+
+Each HTTP RPC batch has one 10-second deadline covering both the fetch and response body. Expiry discovery treats a timeout as RPC unavailability and still expires an unpaid invoice. The deadline aborts the request and bounds the caller even if an injected fetch implementation ignores cancellation; existing persisted lease checks fence stale handler completion.
 
 Webhook work rereads the event after acquiring its lease, signs a fresh JWS with stable event
 identity, and retires delivery only after a saved success. Failures use the existing exponential
