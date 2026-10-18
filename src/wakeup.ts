@@ -24,7 +24,12 @@ export type EntityJobRunner = {
 
 /** Drivers append their durable enqueue or prepared-intent fence to this same CAS. */
 export type WakeupPort = {
-  commit(atomic: KvAtomic, targets: readonly WakeTarget[]): Promise<KvCommitResult>;
+  ensure?(target: WakeTarget): Promise<void>;
+  commit(
+    atomic: KvAtomic,
+    targets: readonly WakeTarget[],
+    isCurrent?: () => Promise<boolean>,
+  ): Promise<KvCommitResult>;
 };
 export type WakeIntent = {
   schemaVersion: 1;
@@ -84,7 +89,9 @@ export function createIntentWakeupPort(options: {
   isCurrent?: () => Promise<boolean>;
 }): WakeupPort {
   return {
-    async commit(atomic, requested) {
+    async commit(atomic, requested, current) {
+      const isCurrent = async () =>
+        (!options.isCurrent || (await options.isCurrent())) && (!current || (await current()));
       const targets = [
         ...new Map(requested.map((target) => [wakeTargetKey(target), target])).values(),
       ];
@@ -93,7 +100,7 @@ export function createIntentWakeupPort(options: {
       // No synchronous confirmation/ACK is necessary: each target is already armed.
       if (options.budget && !options.budget.hasCapacity(targets.length + 2))
         throw new WorkerBudgetError();
-      await requireCurrent(options.isCurrent);
+      await requireCurrent(isCurrent);
       const operationId = crypto.randomUUID();
       const key = wakeIntentKey(operationId);
       const intent: WakeIntent = {
@@ -110,9 +117,9 @@ export function createIntentWakeupPort(options: {
         .set(key, intent)
         .commit();
       if (!prepared.ok) return prepared;
-      await requireCurrent(options.isCurrent);
+      await requireCurrent(isCurrent);
       await options.transport.prepare({ ...intent, key, versionstamp: prepared.versionstamp });
-      await requireCurrent(options.isCurrent);
+      await requireCurrent(isCurrent);
       return atomic
         .check({ key, versionstamp: prepared.versionstamp })
         .set(key, { ...intent, state: "committed" } satisfies WakeIntent)

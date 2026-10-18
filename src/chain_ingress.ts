@@ -8,7 +8,7 @@ import {
   type ChainTransferEvent,
   type VerifiedChainEventDelivery,
 } from "./chain_events.ts";
-import type { Kv, KvEntry, KvKey } from "./kv.ts";
+import type { Kv, KvCheck, KvEntry, KvKey } from "./kv.ts";
 import { type Clock, systemClock } from "./payment_catalog.ts";
 import type { SupportedChainId } from "./payment_types.ts";
 import { WorkerBudgetError, type WorkerRequestBudget } from "./worker_budget.ts";
@@ -25,6 +25,8 @@ export type ChainTransferMatch = {
   amountUnits: bigint;
 };
 export type ChainTransferContext = {
+  /** The payment transaction checks this same receipt version before committing. */
+  fence?: KvCheck;
   budget?: WorkerRequestBudget;
   deadline: number;
   /** Costs one KV read; check before asynchronous canonical mutation phases. */
@@ -181,7 +183,14 @@ async function processReceipt(
       if (!(await isCurrent())) return pending(processed);
       let terminal = false;
       try {
-        terminal = (await options.processTransfer(event, { budget, deadline, isCurrent })).terminal;
+        terminal = (
+          await options.processTransfer(event, {
+            budget,
+            deadline,
+            isCurrent,
+            fence: { key: owned.key, versionstamp: owned.versionstamp },
+          })
+        ).terminal;
       } catch {
         // Transient verification, budget failure, or a crash after domain commit resumes this item.
         return pending(processed);
@@ -255,7 +264,7 @@ export async function handleAlchemyChainWebhook(
     const body = await readBody(request);
     let hint: unknown;
     try {
-      hint = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+      hint = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body));
     } catch {
       throw new ChainWebhookError("invalid_chain_webhook_json");
     }

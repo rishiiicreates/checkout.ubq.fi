@@ -404,6 +404,107 @@ test("real service-adapter calls keep intent prearming and a zero-search-budget 
   }
 });
 
+test("chain push uses the reserved invoice treasury snapshot and records one confirmation phase", async () => {
+  const app = await setup();
+  try {
+    app.rpc.latest = 115n;
+    const transfer = app.rpc.add(app.invoice, 110n);
+    await app.service.configureChain(8453, {
+      enabled: false,
+      treasuryAddress: `0x${"55".repeat(20)}`,
+    });
+    const event = { ...transfer, chainId: 8453 as const, removed: false };
+    const context = { deadline: Date.now() + 20000, isCurrent: async () => true };
+    equal((await app.service.processChainTransfer(event, context)).terminal, true);
+    equal((await app.service.getInvoice(app.invoice.id)).status, "confirming");
+    equal((await app.service.listOutbox()).length, 0);
+    equal((await app.service.processChainTransfer(event, context)).disposition, "ignored");
+    const publicReplay = await app.service.claimPayment(app.invoice.id, coordinates(transfer));
+    equal(publicReplay.invoice.status, "provisionally_paid");
+    ok(publicReplay.eventJws);
+  } finally {
+    app.kv.close();
+  }
+});
+
+test("out-of-order reinclusion uses two receipt phases and ignores the older removed hint", async () => {
+  const app = await setup();
+  try {
+    app.rpc.latest = 115n;
+    const transfer = app.rpc.add(app.invoice, 110n);
+    const original = { ...transfer, chainId: 8453 as const, removed: true };
+    const accepted = await app.service.claimPayment(app.invoice.id, coordinates(transfer));
+    transfer.blockNumber = 120n;
+    transfer.blockHash = hash(1120);
+    transfer.logIndex = 7;
+    app.rpc.latest = 125n;
+    const event = { ...transfer, chainId: 8453 as const, removed: false };
+    const context = { deadline: Date.now() + 20000, isCurrent: async () => true };
+    equal((await app.service.processChainTransfer(event, context)).terminal, false);
+    equal((await app.service.getInvoice(app.invoice.id)).status, "reverted");
+    equal((await app.service.processChainTransfer(event, context)).terminal, true);
+    const current = await app.service.getInvoice(app.invoice.id);
+    equal(current.status, "confirming");
+    equal(current.paymentId, accepted.invoice.paymentId);
+    equal((await app.service.processChainTransfer(original, context)).disposition, "ignored");
+    equal((await app.service.getInvoice(app.invoice.id)).status, "confirming");
+  } finally {
+    app.kv.close();
+  }
+});
+
+test("an exact removed hint canonically reverts a finalized payment without a background monitor", async () => {
+  const app = await setup();
+  try {
+    app.rpc.latest = 115n;
+    const transfer = app.rpc.add(app.invoice, 110n);
+    await app.service.claimPayment(app.invoice.id, coordinates(transfer));
+    app.rpc.safe = 110n;
+    app.rpc.finalized = 110n;
+    await app.service.refreshInvoice(app.invoice.id);
+    await app.service.refreshInvoice(app.invoice.id);
+    equal((await app.service.getInvoice(app.invoice.id)).status, "finalized");
+    app.rpc.reorged.add(transfer.transactionHash);
+    const result = await app.service.processChainTransfer(
+      { ...transfer, chainId: 8453, removed: true },
+      { deadline: Date.now() + 20000, isCurrent: async () => true },
+    );
+    equal(result.terminal, true);
+    equal((await app.service.getInvoice(app.invoice.id)).status, "reverted");
+  } finally {
+    app.kv.close();
+  }
+});
+
+test("receipt ownership is checked in the payment CAS after canonical RPC returns", async () => {
+  const app = await setup();
+  try {
+    app.rpc.latest = 115n;
+    const transfer = app.rpc.add(app.invoice, 110n);
+    const key = ["uos_checkout", "v1", "chain_events", "receipts", "test"];
+    const stamp = await app.kv.set(key, "first");
+    const batch = app.rpc.batch.bind(app.rpc);
+    app.rpc.batch = async (chain, calls) => {
+      const result = await batch(chain, calls);
+      if (calls.some((call) => call.id === "receipt")) await app.kv.set(key, "successor");
+      return result;
+    };
+    const result = await app.service.processChainTransfer(
+      { ...transfer, chainId: 8453, removed: false },
+      {
+        deadline: Date.now() + 20000,
+        isCurrent: async () => true,
+        fence: { key, versionstamp: stamp.versionstamp },
+      },
+    );
+    equal(result.terminal, false);
+    equal((await app.service.getInvoice(app.invoice.id)).paymentId, undefined);
+    equal((await app.kv.get(key)).value, "successor");
+  } finally {
+    app.kv.close();
+  }
+});
+
 async function setup() {
   const kv = new SqliteKv();
   const rpc = new DiscoveryRpc();

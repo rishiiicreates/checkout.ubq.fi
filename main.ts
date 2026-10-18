@@ -1,4 +1,5 @@
-import { WorkerBudgetError } from "./src/worker_budget.ts";
+import { WorkerBudgetError, type WorkerRequestBudget } from "./src/worker_budget.ts";
+import { handleAlchemyChainWebhook, recoverPendingChainTransfers } from "./src/chain_ingress.ts";
 import type { DiscoveryOptions } from "./src/payment_discovery.ts";
 import type { WakeupPort } from "./src/wakeup.ts";
 import type { FetchLike } from "./src/rpc.ts";
@@ -35,6 +36,9 @@ const OUTBOX_MAX_EVENTS_PER_RUN = 1_000;
 type MerchantAuthService = ReturnType<typeof createMerchantAuthService>;
 
 export type CheckoutServices = {
+  chainWebhookKeys?: string;
+  budget?: WorkerRequestBudget;
+  wakeups?: WakeupPort;
   kv: Kv;
   rpc: RpcClient;
   adminAuth: AdminAuthService;
@@ -50,6 +54,8 @@ export type CheckoutServices = {
 };
 
 type CheckoutServiceOptions = {
+  chainWebhookKeys?: string;
+  budget?: WorkerRequestBudget;
   fetch?: FetchLike;
   assetFetcher?: CheckoutServices["assetFetcher"];
   rpc?: RpcClient;
@@ -68,6 +74,9 @@ export function createCheckoutServices(
   const signer = options.signer ?? createPersistentJwsSigner(kv);
   const rpc = options.rpc ?? new HttpRpcClient(fetcher);
   return {
+    chainWebhookKeys: options.chainWebhookKeys,
+    budget: options.budget,
+    wakeups: options.wakeups,
     kv,
     rpc,
     adminAuth: createAdminAuthService(kv, { fetch: fetcher }),
@@ -103,6 +112,15 @@ export function createHandler(services: CheckoutServices): (request: Request) =>
 
 async function route(request: Request, services: CheckoutServices): Promise<Response> {
   const url = new URL(request.url);
+  if (url.pathname === "/api/v1/chain-events/alchemy" && request.method === "POST") {
+    return handleAlchemyChainWebhook(request, {
+      webhookKeys: services.chainWebhookKeys,
+      kv: services.kv,
+      budget: services.budget,
+      minimumTransferCalls: 12,
+      processTransfer: services.payment.processChainTransfer,
+    });
+  }
 
   if (url.pathname === "/api/health" && request.method === "GET") {
     return json({ status: "ready" });
@@ -241,6 +259,7 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
         chainId: body.chainId,
       },
     );
+    await relatedInvoiceEvent(services, invoice);
     return json(invoice, { status: 201 });
   }
 
@@ -249,7 +268,9 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
     const principal = await services.merchantAuth.authenticate(request, ["invoice:read"]);
     const invoiceId = decodeURIComponent(invoiceMatch[1]);
     await requireMerchantInvoice(services, principal.merchant.id, invoiceId);
-    return json(await services.payment.getInvoice(invoiceId));
+    const invoice = await services.payment.getInvoice(invoiceId);
+    await relatedInvoiceEvent(services, invoice);
+    return json(invoice);
   }
 
   const claimMatch = url.pathname.match(/^\/api\/v1\/invoices\/([^/]+)\/claims$/);
@@ -259,7 +280,11 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
     await requireMerchantInvoice(services, principal.merchant.id, invoiceId);
     const body = await requestJson(request);
     const keys = Object.keys(body);
-    if (keys.length === 0) return json(await services.payment.discoverPayment(invoiceId));
+    if (keys.length === 0) {
+      const result = await services.payment.discoverPayment(invoiceId);
+      await relatedInvoiceEvent(services, result.invoice);
+      return json(result);
+    }
     if (
       keys.length !== 4 ||
       keys.some(
@@ -270,14 +295,14 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
       )
     )
       throw new HttpError(400, "invalid_claim_input");
-    return json(
-      await services.payment.claimPayment(invoiceId, {
-        transactionHash: body.transactionHash,
-        logIndex: body.logIndex,
-        observedBlockNumber: body.observedBlockNumber,
-        observedBlockHash: body.observedBlockHash,
-      }),
-    );
+    const result = await services.payment.claimPayment(invoiceId, {
+      transactionHash: body.transactionHash,
+      logIndex: body.logIndex,
+      observedBlockNumber: body.observedBlockNumber,
+      observedBlockHash: body.observedBlockHash,
+    });
+    await relatedInvoiceEvent(services, result.invoice);
+    return json(result);
   }
 
   if (request.method === "GET" || request.method === "HEAD") {
@@ -322,6 +347,41 @@ async function adminOverview(services: CheckoutServices) {
     keys: merchant ? await services.merchantAuth.listKeys(merchant.id) : [],
     invoices,
   };
+}
+
+async function relatedInvoiceEvent(
+  services: CheckoutServices,
+  invoice: InvoiceJson,
+): Promise<void> {
+  try {
+    if (services.chainWebhookKeys && (services.budget?.hasCapacity(18) ?? true)) {
+      await recoverPendingChainTransfers(
+        {
+          chainId: invoice.chainId,
+          tokenAddress: invoice.tokenAddress,
+          recipientAddress: invoice.treasuryAddress,
+          amountUnits: BigInt(invoice.paidAmountUnits),
+        },
+        {
+          kv: services.kv,
+          budget: services.budget,
+          minimumTransferCalls: 12,
+          processTransfer: services.payment.processChainTransfer,
+        },
+      );
+    }
+    if (services.wakeups?.ensure && (services.budget?.hasCapacity(1) ?? true)) {
+      await services.wakeups.ensure({
+        kind: "invoice",
+        id: invoice.id,
+        dueAt: Date.parse(invoice.expiresAt),
+        reason: "expiry",
+      });
+    }
+  } catch {
+    // The successful domain response remains valid; the next related event may retry repair.
+    console.error(JSON.stringify({ message: "checkout_related_event_pending" }));
+  }
 }
 
 export async function runHourlyMaintenance(

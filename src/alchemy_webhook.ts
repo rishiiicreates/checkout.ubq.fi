@@ -55,7 +55,7 @@ export async function verifyAlchemyWebhookDelivery(
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body));
   } catch {
     throw new ChainWebhookError("invalid_chain_webhook_json");
   }

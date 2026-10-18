@@ -221,6 +221,39 @@ test("claims accept an empty discovery object or exactly four coordinates after 
   });
 });
 
+test("unsigned chain ingress fails before any storage or payment callback", async () => {
+  const kv = new SqliteKv();
+  try {
+    let reads = 0,
+      mutations = 0;
+    const get = kv.get.bind(kv);
+    kv.get = (key) => {
+      reads++;
+      return get(key);
+    };
+    const services = createCheckoutServices(kv, {
+      chainWebhookKeys: JSON.stringify({
+        hook: { network: "BASE_MAINNET", signingKey: "offline" },
+      }),
+    });
+    services.payment.processChainTransfer = async () => {
+      mutations++;
+      return { terminal: true, disposition: "ignored" };
+    };
+    const response = await createHandler(services)(
+      new Request("https://checkout.ubq.fi/api/v1/chain-events/alchemy", {
+        method: "POST",
+        body: JSON.stringify({ webhookId: "hook" }),
+      }),
+    );
+    assertEquals(response.status, 401);
+    assertEquals(reads, 0);
+    assertEquals(mutations, 0);
+  } finally {
+    kv.close();
+  }
+});
+
 test("public origins cannot forge loopback trust", async () => {
   await withApp(async ({ handler }) => {
     const forged = await handler(

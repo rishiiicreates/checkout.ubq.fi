@@ -22,11 +22,20 @@ const OVERLAP_BLOCKS = 128n;
 const LEASE_MS = 30_000;
 const COMPLETION_CALLS = 3;
 
-export type DiscoveryOptions = { budget?: WorkerRequestBudget; deadline?: number };
+export type DiscoveryOptions = {
+  budget?: WorkerRequestBudget;
+  deadline?: number;
+  expiryToBlock?: bigint;
+  isCurrent?: () => Promise<boolean>;
+};
 export type DiscoveryState = { searchedThrough?: bigint; leaseId?: string; leaseUntil?: number };
 
 export function discoveryStateKey(invoiceId: string): KvKey {
   return [...PREFIX, "discovery", invoiceId];
+}
+
+export function expiryDiscoveryStateKey(invoiceId: string): KvKey {
+  return [...PREFIX, "expiry_passes", invoiceId];
 }
 
 export function hasCurrentPayment(invoice: Pick<InvoiceRecord, "paymentId" | "status">): boolean {
@@ -61,7 +70,12 @@ export async function discoverInvoicePayment(
   const { kv, rpc, clock } = dependencies;
   const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
   const invoiceKey = [...PREFIX, "invoices", invoiceId];
-  const stateKey = discoveryStateKey(invoiceId);
+  if (options.expiryToBlock !== undefined && options.expiryToBlock < 0n)
+    throw new PaymentDomainError("invalid_expiry_snapshot");
+  const stateKey =
+    options.expiryToBlock === undefined
+      ? discoveryStateKey(invoiceId)
+      : expiryDiscoveryStateKey(invoiceId);
   const [invoiceEntry, state] = await kv.getMany<[InvoiceRecord, DiscoveryState]>([
     invoiceKey,
     stateKey,
@@ -87,13 +101,17 @@ export async function discoverInvoicePayment(
   let watchedInvoice = invoice;
   const releaseBudget = options.budget?.reserveForCompletion(COMPLETION_CALLS);
   try {
-    const heads = await chainHeads(rpc, invoice.chainId);
+    const heads =
+      options.expiryToBlock === undefined ? await chainHeads(rpc, invoice.chainId) : null;
     if (!(await currentForClaim())) throw new DiscoveryYield();
-    const head = heads.safeBlock ?? heads.finalizedBlock ?? heads.latestBlock;
+    const head =
+      options.expiryToBlock ?? heads!.safeBlock ?? heads!.finalizedBlock ?? heads!.latestBlock;
     const overlap =
       state.value?.searchedThrough === undefined
         ? invoice.minimumBlock
-        : state.value.searchedThrough + 1n - OVERLAP_BLOCKS;
+        : state.value.searchedThrough +
+          1n -
+          (options.expiryToBlock === undefined ? OVERLAP_BLOCKS : 0n);
     const fromBlock = overlap > invoice.minimumBlock ? overlap : invoice.minimumBlock;
     const toBlock = head < fromBlock + SCAN_BLOCKS - 1n ? head : fromBlock + SCAN_BLOCKS - 1n;
     const logs =
@@ -142,11 +160,11 @@ export async function discoverInvoicePayment(
         throw error;
       }
     }
-    const owned = await kv.get<DiscoveryState>(stateKey);
+    const owned = claimed?.invoice.paymentId ? null : await kv.get<DiscoveryState>(stateKey);
     if (
       !incomplete &&
       !claimed?.invoice.paymentId &&
-      owned.value?.leaseId === leaseId &&
+      owned?.value?.leaseId === leaseId &&
       (owned.value.leaseUntil ?? 0) > clock.now().getTime()
     ) {
       await kv
@@ -165,21 +183,34 @@ export async function discoverInvoicePayment(
     if (!(error instanceof WorkerBudgetError) && !(error instanceof DiscoveryYield)) throw error;
   } finally {
     releaseBudget?.();
-    const owned = await kv.get<DiscoveryState>(stateKey);
+    const [owned, currentInvoice] = await kv.getMany<[DiscoveryState, InvoiceRecord]>([
+      stateKey,
+      invoiceKey,
+    ]);
     if (owned.value?.leaseId === leaseId) {
       const atomic = kv.atomic().check(owned);
+      const { leaseId: _leaseId, leaseUntil: _leaseUntil, ...progress } = owned.value;
+      const paidExpiry =
+        options.expiryToBlock !== undefined &&
+        currentInvoice.value &&
+        hasCurrentPayment(currentInvoice.value);
+      if (paidExpiry)
+        atomic
+          .check(currentInvoice)
+          .set(stateKey, { ...progress, status: "paid", completedAt: clock.now().getTime() });
       await (
-        owned.value.searchedThrough === undefined
-          ? atomic.delete(stateKey)
-          : atomic.set(stateKey, {
-              searchedThrough: owned.value.searchedThrough,
-            } satisfies DiscoveryState)
+        paidExpiry
+          ? atomic
+          : Object.keys(progress).length
+            ? atomic.set(stateKey, progress)
+            : atomic.delete(stateKey)
       ).commit();
     }
   }
   return currentResult(claimed);
 
   async function currentForClaim(): Promise<boolean> {
+    if (options.isCurrent && !(await options.isCurrent())) return false;
     if (clock.now().getTime() >= leased.leaseUntil!) return false;
     const [current, owned] = await kv.getMany<[InvoiceRecord, DiscoveryState]>([
       invoiceKey,
