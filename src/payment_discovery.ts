@@ -1,5 +1,5 @@
 import type { Clock } from "./payment_catalog.ts";
-import type { Kv, KvKey } from "./kv.ts";
+import type { Kv, KvEntryMaybe, KvKey } from "./kv.ts";
 import type { ClaimPaymentInput, ClaimPaymentResult } from "./payment_service.ts";
 import {
   boundedText,
@@ -61,7 +61,11 @@ export async function discoverInvoicePayment(
     kv: Kv;
     rpc: RpcClient;
     clock: Clock;
-    claim: (invoiceId: string, input: ClaimPaymentInput) => Promise<ClaimPaymentResult>;
+    claim: (
+      invoiceId: string,
+      input: ClaimPaymentInput,
+      invoiceEntry?: KvEntryMaybe<InvoiceRecord>,
+    ) => Promise<ClaimPaymentResult>;
     existingEvent: (invoice: InvoiceRecord) => Promise<string | undefined>;
   },
   invoiceIdInput: unknown,
@@ -99,6 +103,7 @@ export async function discoverInvoicePayment(
   }
   let claimed: ClaimPaymentResult | undefined;
   let watchedInvoice = invoice;
+  let watchedEntry = invoiceEntry;
   const releaseBudget = options.budget?.reserveForCompletion(COMPLETION_CALLS);
   try {
     const heads =
@@ -133,12 +138,16 @@ export async function discoverInvoicePayment(
         break;
       }
       try {
-        claimed = await dependencies.claim(invoiceId, {
-          transactionHash: log.transactionHash,
-          logIndex: log.logIndex.toString(),
-          observedBlockNumber: log.blockNumber.toString(),
-          observedBlockHash: log.blockHash,
-        });
+        claimed = await dependencies.claim(
+          invoiceId,
+          {
+            transactionHash: log.transactionHash,
+            logIndex: log.logIndex.toString(),
+            observedBlockNumber: log.blockNumber.toString(),
+            observedBlockHash: log.blockHash,
+          },
+          watchedEntry,
+        );
         watchedInvoice = {
           ...watchedInvoice,
           paymentId: claimed.invoice.paymentId,
@@ -218,6 +227,7 @@ export async function discoverInvoicePayment(
     ]);
     if (!current.value || clock.now().getTime() >= leased.leaseUntil!) return false;
     watchedInvoice = current.value;
+    watchedEntry = current;
     if (owned.value?.leaseId === leaseId) return true;
     // A coordinate claim followed by a reorg starts a new invoice lifecycle.
     // Reacquire from absence; never run through a successor's lease.

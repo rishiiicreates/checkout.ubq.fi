@@ -209,15 +209,19 @@ export function createPaymentService(options: PaymentServiceOptions) {
           kv,
           rpc,
           clock,
-          claim:
-            search?.expiryToBlock === undefined
-              ? claimPayment
-              : (id, input) =>
-                  claimPayment(id, input, {
+          claim: (id, input, invoiceEntry) =>
+            claimPayment(
+              id,
+              input,
+              search?.expiryToBlock === undefined
+                ? undefined
+                : {
                     budget: options.discovery?.budget,
                     deadline: options.discovery?.deadline ?? Date.now() + 20_000,
                     isCurrent: search.isCurrent ?? (async () => true),
-                  }),
+                  },
+              { invoiceEntry },
+            ),
           existingEvent: signedExistingEvent,
         },
         invoiceId,
@@ -656,10 +660,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       }
     }
     if (existingLocator.value) {
-      const refreshed = await refreshInvoice(invoice.id, context, {
-        invoiceEntry,
-        paymentEntry: snapshot?.paymentEntry,
-      });
+      const refreshed = await refreshInvoice(invoice.id, context);
       if (refreshed.eventJws) return refreshed;
       return { ...refreshed, eventJws: await signedExistingEvent(refreshed.invoice) };
     }

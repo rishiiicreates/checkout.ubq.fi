@@ -320,7 +320,7 @@ test("real service-adapter calls keep intent prearming and a zero-search-budget 
     app.rpc.add(app.invoice, 1150n);
     await app.kv.set(discoveryStateKey(app.invoice.id), { searchedThrough: 1099n });
     const budget = new WorkerRequestBudget(24);
-    for (let index = 0; index < 5; index++) budget.reserve(); // auth/ownership plus migration RPC
+    for (let index = 0; index < 6; index++) budget.reserve(); // four auth calls, ownership, migration RPC
     let storageCalls = 0,
       prepareCalls = 0,
       rpcCalls = 0;
@@ -397,7 +397,7 @@ test("real service-adapter calls keep intent prearming and a zero-search-budget 
     ok(budget.remaining >= 0);
     equal(prepareCalls, 2);
     console.log(
-      `intent discovery calls: storage=${storageCalls},rpc=${rpcCalls},prearm=${prepareCalls},prior=5,total=${24 - budget.remaining},ceiling=24`,
+      `intent discovery calls: storage=${storageCalls},rpc=${rpcCalls},prearm=${prepareCalls},prior=6,total=${24 - budget.remaining},ceiling=24`,
     );
   } finally {
     app.kv.close();
