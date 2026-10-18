@@ -34,7 +34,12 @@ export const bunServiceOptions = {
 /** Only the established local reverse proxy may reconstruct the canonical HTTPS origin. */
 export function withBunIngress(request: Request, peerAddress: string): Request {
   const url = new URL(request.url);
-  const loopback = peerAddress === "127.0.0.1" || peerAddress === "::1";
+  // Default dual-stack listeners can report an IPv4 loopback socket in either mapped form.
+  const normalizedPeer =
+    peerAddress === "::ffff:127.0.0.1" || peerAddress === "::ffff:7f00:1"
+      ? "127.0.0.1"
+      : peerAddress;
+  const loopback = normalizedPeer === "127.0.0.1" || normalizedPeer === "::1";
   if (
     loopback &&
     url.protocol === "http:" &&
@@ -43,5 +48,5 @@ export function withBunIngress(request: Request, peerAddress: string): Request {
   ) {
     url.protocol = "https:";
   }
-  return withPeerAddress(request, peerAddress, url.toString());
+  return withPeerAddress(request, normalizedPeer, url.toString());
 }
