@@ -27,7 +27,7 @@ export function putWork(
   // The hosted D1 adapter deliberately has no queue API. Native KV can persist
   // the wake in the same transaction, including a wake for abandoned leases.
   if (typeof atomic.enqueue === "function") {
-    atomic = atomic.enqueue({ type: WAKE_TYPE }, {
+    atomic = atomic.enqueue({ type: WAKE_TYPE, key: workKey(work.type, work.id) }, {
       delay: Math.max(0, availableAt(work) - now),
     });
   }
@@ -109,16 +109,17 @@ export function createWorkQueue(options: {
     });
   }
 
-  function runDue(): Promise<void> {
-    const operation = drainDue();
+  function runDue(key?: Deno.KvKey): Promise<void> {
+    const operation = drainDue(key);
     active.add(operation);
     operation.then(() => active.delete(operation), () => active.delete(operation));
     return operation;
   }
 
-  async function drainDue(): Promise<void> {
-    for (const candidate of (await entries()).slice(0, 100)) {
-      const entry = await kv.get<WorkRecord>(candidate.key);
+  async function drainDue(key?: Deno.KvKey): Promise<void> {
+    const keys = key ? [key] : (await entries()).slice(0, 100).map((entry) => entry.key);
+    for (const candidate of keys) {
+      const entry = await kv.get<WorkRecord>(candidate);
       const now = clock.now().getTime();
       if (!entry.value || availableAt(entry.value) > now) continue;
       const leased: WorkRecord = {
@@ -164,7 +165,14 @@ export function createWorkQueue(options: {
       started = true;
       if (native) {
         listener = kv.listenQueue(async (message) => {
-          if (started && message?.type === WAKE_TYPE) await runDue();
+          // Startup rearms every persisted record with a keyed wake, covering
+          // older unkeyed messages without scanning the backlog for each one.
+          if (
+            started && message?.type === WAKE_TYPE && Array.isArray(message.key) &&
+            message.key.length === WORK_PREFIX.length + 2 &&
+            WORK_PREFIX.every((part, index) => message.key[index] === part) &&
+            typeof message.key[3] === "string" && typeof message.key[4] === "string"
+          ) await runDue(message.key);
         }).catch((error) => {
           if (started) onError(error);
         });

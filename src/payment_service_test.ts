@@ -1,4 +1,5 @@
 import { createPersistentJwsSigner, verifyCompactJws } from "./jws.ts";
+import { JsonKvService } from "./kv_test_fixture.ts";
 import {
   createPaymentService,
   type InvoiceCreationContext,
@@ -13,6 +14,7 @@ import {
   TRANSFER_TOPIC,
 } from "./rpc.ts";
 import { createWorkQueue, workKey, type WorkRecord } from "./work_queue.ts";
+import { UbqKv } from "./ubq_kv.ts";
 
 const MERCHANT = "linkedin-scraper-2025";
 const TREASURY = `0x${"44".repeat(20)}`;
@@ -1148,6 +1150,136 @@ Deno.test("expiry completes when HTTP RPC stalls instead of returning an error",
       release.resolve(Response.json([]));
     }
   });
+});
+
+Deno.test("D1 scheduler wakes committed payment jobs when discovery lease cleanup rejects", async () => {
+  const store = new JsonKvService();
+  let injectCleanupFailure = false;
+  let failCleanup = false;
+  let cleanupFailures = 0;
+  const kv = new UbqKv({
+    url: "https://kv.example",
+    token: "offline",
+    fetchImpl: async (input, init) => {
+      const request = new Request(input, init);
+      const body = await request.clone().json();
+      const path = new URL(request.url).pathname;
+      if (failCleanup && path === "/kv/get" && body.key[3] === "discovery_state") {
+        failCleanup = false;
+        cleanupFailures++;
+        throw new Error("offline lease cleanup failed");
+      }
+      const response = await store.fetch(request);
+      if (
+        injectCleanupFailure && path === "/kv/atomic" &&
+        body.mutations.some((mutation: { key: unknown[] }) =>
+          mutation.key[3] === "payment_records"
+        ) &&
+        (await response.clone().json()).ok
+      ) failCleanup = true;
+      return response;
+    },
+  }) as unknown as Deno.Kv;
+  const clock = new MutableClock("2026-07-21T12:00:00.000Z");
+  const rpc = new MockRpc();
+  let id = 0;
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  let timerId = 0;
+  const delivered: string[] = [];
+  const errors: unknown[] = [];
+  let onHandled: (() => void) | undefined;
+  const service = createPaymentService({
+    kv,
+    rpc,
+    signer: createPersistentJwsSigner(kv, clock),
+    clock,
+    discountStart: () => 1n,
+    idGenerator: { next: () => `cleanup-${++id}` },
+    onWork: () => queue.notify(),
+  });
+  const queue = createWorkQueue({
+    kv,
+    clock,
+    setTimer: (callback, delay) => {
+      timers.set(++timerId, { callback, delay });
+      return timerId;
+    },
+    clearTimer: (id) => {
+      timers.delete(id);
+    },
+    handle: async (job) => {
+      try {
+        if (job.type !== "deliver_event") return await service.runInvoiceWork(job);
+        await service.markOutboxDelivered(job.id);
+        delivered.push(job.id);
+        return undefined;
+      } finally {
+        onHandled?.();
+      }
+    },
+    onError: (error) => errors.push(error),
+  });
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  try {
+    await service.configureChain(8453, { enabled: true, treasuryAddress: TREASURY });
+    const invoice = await createTestInvoice(service, "cleanup-after-watch");
+    clock.advance(60 * 60_000);
+    await queue.runDue();
+    clock.advance(24 * 60 * 60_000);
+    await queue.runDue();
+    assertEquals((await service.getInvoice(invoice.id)).status, "expired");
+    assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
+    assertEquals((await kv.get(workKey("expire_invoice", invoice.id))).value, null);
+    await queue.start();
+    await tick();
+    assertEquals(timers.size, 0);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash: hash(98),
+      blockNumber: 100n,
+      includedAt: new Date("2026-07-21T12:30:00Z"),
+    });
+    rpc.setHeads(103n, null, null);
+    injectCleanupFailure = true;
+    let rejection: string | undefined;
+    try {
+      await service.discoverPayment(invoice.id);
+    } catch (error) {
+      rejection = String(error);
+    }
+    injectCleanupFailure = false;
+    assertEquals(rejection, "Error: offline lease cleanup failed");
+    assertEquals(cleanupFailures, 1);
+    assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
+    assert((await kv.get(workKey("reconcile_invoice", invoice.id))).value);
+    const outbox = await service.listOutbox();
+    assertEquals(outbox.length, 1);
+    assert((await kv.get(workKey("deliver_event", outbox[0].id))).value);
+    await tick();
+    console.log("cleanup_failure_scheduler", { cleanupFailures, timers: timers.size });
+    assertEquals(timers.size, 1);
+    rpc.setHeads(103n, 100n, 100n);
+    for (let step = 0; step < 6 && timers.size > 0; step++) {
+      assertEquals(timers.size, 1);
+      const handled = Promise.withResolvers<void>();
+      onHandled = handled.resolve;
+      const [timer, next] = [...timers][0];
+      timers.delete(timer);
+      clock.advance(next.delay);
+      next.callback();
+      await handled.promise;
+      await tick();
+      onHandled = undefined;
+    }
+    assertEquals(delivered[0], outbox[0].id);
+    assertEquals(delivered.length, 2);
+    assertEquals((await service.getInvoice(invoice.id)).status, "finalized");
+    assertEquals((await kv.get(workKey("reconcile_invoice", invoice.id))).value, null);
+    assertEquals((await kv.get(workKey("deliver_event", outbox[0].id))).value, null);
+    assertEquals(timers.size, 0);
+    assertEquals(errors, []);
+  } finally {
+    await queue.stop();
+  }
 });
 
 Deno.test("expiry discovery RPC failure expires the invoice and a follow-up still recovers payment", async () => {

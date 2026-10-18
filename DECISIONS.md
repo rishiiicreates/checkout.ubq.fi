@@ -72,6 +72,12 @@ retry from one minute to a 24-hour cap. Ordinary repeated or concurrent jobs do 
 events. A crash after a recipient accepts but before the saved acknowledgement can repeat delivery,
 so the merchant must deduplicate by event ID/JWS `jti`.
 
+## 2026-10-18: scheduler notification and native wake dispatch
+
+Work-producing service operations notify the scheduler when they settle, including when discovery commits payment and webhook jobs before a later lease-cleanup read rejects. An idle D1 scheduler therefore rearms persisted work even though the caller receives the cleanup error.
+
+Native KV wake messages carry the exact work key and read only that record through the existing compare-and-swap lease path. Startup scans persisted work once and rearms keyed wakes for pending retries and abandoned lease deadlines; old unkeyed messages need no backlog scan because startup replaces their wake coverage. Duplicate and early wakes leave active leases and future work intact. The D1 adapter retains its single earliest-work timer and existing scan behavior.
+
 ## 2026-10-17: JSON KV value encoding and conflict handling
 
 The canonical KV service stores generic JSON without interpreting value tags. Checkout now wraps new

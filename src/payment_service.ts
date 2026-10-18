@@ -167,9 +167,11 @@ export function createPaymentService(options: PaymentServiceOptions) {
   const idGenerator = options.idGenerator ?? { next: () => crypto.randomUUID() };
   const discountStart = options.discountStart ?? randomDiscountStart;
   async function notifyAfter<T>(operation: Promise<T>): Promise<T> {
-    const result = await operation;
-    options.onWork?.();
-    return result;
+    try {
+      return await operation;
+    } finally {
+      options.onWork?.();
+    }
   }
   return {
     publishCatalogVersion: (
