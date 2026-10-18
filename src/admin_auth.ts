@@ -1,3 +1,5 @@
+import type { FetchLike } from "./rpc.ts";
+import type { Kv } from "./kv.ts";
 export type AdminRole = "owner" | "admin" | "viewer";
 
 export type AuthHubClaims = {
@@ -61,14 +63,14 @@ type JsonWebKeySet = { keys: AuthJwk[] };
 type StoredJwks = JsonWebKeySet & { fetchedAt: string };
 
 type AdminAuthOptions = {
-  fetch?: typeof fetch;
+  fetch?: FetchLike;
   now?: () => number;
   randomUuid?: () => string;
 };
 
 export type AdminAuthService = ReturnType<typeof createAdminAuthService>;
 
-export function createAdminAuthService(kv: Deno.Kv, options: AdminAuthOptions = {}) {
+export function createAdminAuthService(kv: Kv, options: AdminAuthOptions = {}) {
   const fetcher = options.fetch ?? fetch;
   const now = options.now ?? Date.now;
   const randomUuid = options.randomUuid ?? (() => crypto.randomUUID());
@@ -83,12 +85,13 @@ export function createAdminAuthService(kv: Deno.Kv, options: AdminAuthOptions = 
 
     const response = await fetcher(`${AUTH_HUB_ORIGIN}/api/auth/jwks`);
     if (!response.ok) throw new AdminAuthError(503, "auth_hub_unavailable");
-    const value = await responseJson(response) as Partial<JsonWebKeySet>;
+    const value = (await responseJson(response)) as Partial<JsonWebKeySet>;
     if (!Array.isArray(value.keys) || value.keys.some((key) => !key || typeof key !== "object")) {
       throw new AdminAuthError(503, "auth_hub_invalid_jwks");
     }
     const stored: StoredJwks = { keys: value.keys as AuthJwk[], fetchedAt: nowIso(now()) };
-    await kv.atomic()
+    await kv
+      .atomic()
       .set(JWKS_KEY, stored)
       .set(JWKS_REFRESH_COOLDOWN_KEY, stored.fetchedAt, {
         expireIn: JWKS_REFRESH_COOLDOWN_MS,
@@ -107,14 +110,13 @@ export function createAdminAuthService(kv: Deno.Kv, options: AdminAuthOptions = 
     if ((await kv.get(unknownKidKey(kid))).value !== null) return null;
 
     const cooldown = await kv.get<string>(JWKS_REFRESH_COOLDOWN_KEY);
-    if (
-      cooldown.value !== null &&
-      Date.parse(cooldown.value) + JWKS_REFRESH_COOLDOWN_MS > now()
-    ) {
+    if (cooldown.value !== null && Date.parse(cooldown.value) + JWKS_REFRESH_COOLDOWN_MS > now()) {
       await rememberUnknownKid(kv, kid);
       return null;
     }
-    const locked = await kv.atomic().check(cooldown)
+    const locked = await kv
+      .atomic()
+      .check(cooldown)
       .set(JWKS_REFRESH_COOLDOWN_KEY, nowIso(now()), { expireIn: JWKS_REFRESH_COOLDOWN_MS })
       .commit();
     if (!locked.ok) {
@@ -236,9 +238,7 @@ export function createAdminAuthService(kv: Deno.Kv, options: AdminAuthOptions = 
     async listInvitations(request: Request): Promise<AdminInvitation[]> {
       await this.requireRole(request, ["owner"]);
       const invitations: AdminInvitation[] = [];
-      for await (
-        const entry of kv.list<AdminInvitation>({ prefix: [...PREFIX, "invitations"] })
-      ) {
+      for await (const entry of kv.list<AdminInvitation>({ prefix: [...PREFIX, "invitations"] })) {
         invitations.push(entry.value);
       }
       return invitations.sort((a, b) => a.invitedAt.localeCompare(b.invitedAt));
@@ -278,15 +278,13 @@ export function createAdminAuthService(kv: Deno.Kv, options: AdminAuthOptions = 
 }
 
 export async function claimOrLoadMembership(
-  kv: Deno.Kv,
+  kv: Kv,
   claims: AuthHubClaims,
   now: () => number = Date.now,
 ): Promise<AdminMember> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const handle = normalizeHandle(claims.handle);
-    const [owner, member, invitation] = await kv.getMany<
-      [string, AdminMember, AdminInvitation]
-    >([
+    const [owner, member, invitation] = await kv.getMany<[string, AdminMember, AdminInvitation]>([
       OWNER_KEY,
       memberKey(claims.sub),
       invitationKey(handle),
@@ -302,7 +300,8 @@ export async function claimOrLoadMembership(
           claimedAt: timestamp,
           updatedAt: timestamp,
         };
-        const result = await kv.atomic()
+        const result = await kv
+          .atomic()
           .check(owner)
           .check(member)
           .check(invitation)
@@ -330,7 +329,8 @@ export async function claimOrLoadMembership(
       claimedAt: timestamp,
       updatedAt: timestamp,
     };
-    const result = await kv.atomic()
+    const result = await kv
+      .atomic()
       .check(owner)
       .check(member)
       .set(OWNER_KEY, claims.sub)
@@ -384,18 +384,24 @@ function validClaims(
   const nowSeconds = Math.floor(now / 1000);
   return Boolean(
     claims &&
-      claims.iss === AUTH_HUB_ORIGIN &&
-      claims.aud === AUTH_HUB_AUDIENCE &&
-      claims.clientId === AUTH_HUB_CLIENT_ID &&
-      claims.auth === "sso" &&
-      claims.agentTokenId === undefined &&
-      typeof claims.sub === "string" && claims.sub.length > 0 &&
-      typeof claims.handle === "string" && claims.handle.length > 0 &&
-      typeof claims.isAdmin === "boolean" &&
-      Array.isArray(claims.scopes) && claims.scopes.every((scope) => typeof scope === "string") &&
-      Number.isInteger(claims.iat) && claims.iat <= nowSeconds + 60 &&
-      Number.isInteger(claims.exp) && claims.exp > nowSeconds &&
-      typeof claims.jti === "string" && claims.jti.length > 0,
+    claims.iss === AUTH_HUB_ORIGIN &&
+    claims.aud === AUTH_HUB_AUDIENCE &&
+    claims.clientId === AUTH_HUB_CLIENT_ID &&
+    claims.auth === "sso" &&
+    claims.agentTokenId === undefined &&
+    typeof claims.sub === "string" &&
+    claims.sub.length > 0 &&
+    typeof claims.handle === "string" &&
+    claims.handle.length > 0 &&
+    typeof claims.isAdmin === "boolean" &&
+    Array.isArray(claims.scopes) &&
+    claims.scopes.every((scope) => typeof scope === "string") &&
+    Number.isInteger(claims.iat) &&
+    claims.iat <= nowSeconds + 60 &&
+    Number.isInteger(claims.exp) &&
+    claims.exp > nowSeconds &&
+    typeof claims.jti === "string" &&
+    claims.jti.length > 0,
   );
 }
 
@@ -429,7 +435,8 @@ function localSession(now: () => number): AdminSession {
 function isTrustedLocalRequest(request: Request): boolean {
   const peer = request.headers.get(LOCAL_PEER_HEADER);
   const url = new URL(request.url);
-  const localOrigin = url.protocol === "http:" &&
+  const localOrigin =
+    url.protocol === "http:" &&
     (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]");
   return localOrigin && (peer === "127.0.0.1" || peer === "::1");
 }
@@ -438,7 +445,6 @@ function assertAllowedOrigin(origin: string): void {
   const allowed = new Set([
     "http://localhost:8000",
     "http://127.0.0.1:8000",
-    "https://checkout-ubq-fi.ubiquity-dao.deno.net",
     "https://checkout.ubq.fi",
   ]);
   if (!allowed.has(origin)) throw new AdminAuthError(400, "invalid_checkout_origin");
@@ -484,16 +490,11 @@ function isWellFormedKid(kid: string): boolean {
   return /^[A-Za-z0-9._:-]{1,128}$/u.test(kid);
 }
 
-async function rememberUnknownKid(kv: Deno.Kv, kid: string): Promise<void> {
+async function rememberUnknownKid(kv: Kv, kid: string): Promise<void> {
   await kv.set(unknownKidKey(kid), true, { expireIn: JWKS_REFRESH_COOLDOWN_MS });
 }
 
-function serializeCookie(
-  request: Request,
-  name: string,
-  value: string,
-  expiresAt: number,
-): string {
+function serializeCookie(request: Request, name: string, value: string, expiresAt: number): string {
   const parts = [
     `${name}=${encodeURIComponent(value)}`,
     "Path=/",
@@ -549,8 +550,8 @@ function decodeJson<T>(value: string): T {
 }
 
 function decodeBase64Url(value: string): ArrayBuffer {
-  const base64 = value.replaceAll("-", "+").replaceAll("_", "/") +
-    "=".repeat((4 - value.length % 4) % 4);
+  const base64 =
+    value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - (value.length % 4)) % 4);
   const binary = atob(base64);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0)).buffer;
 }
@@ -559,7 +560,7 @@ async function responseJson(response: Response): Promise<Record<string, unknown>
   try {
     const value = await response.json();
     return value && typeof value === "object" && !Array.isArray(value)
-      ? value as Record<string, unknown>
+      ? (value as Record<string, unknown>)
       : {};
   } catch {
     return {};
@@ -575,7 +576,10 @@ function nowIso(now: number): string {
 }
 
 export class AdminAuthError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
     super(message);
     this.name = "AdminAuthError";
   }

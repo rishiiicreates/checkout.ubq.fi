@@ -85,7 +85,7 @@ export class AnvilRpcClient implements RpcClient {
 
 export class AnvilBaseFork {
   readonly rpc = new AnvilRpcClient();
-  #process: Deno.ChildProcess | null = null;
+  #process: Bun.Subprocess<"ignore", "ignore", "inherit"> | null = null;
 
   async start(): Promise<void> {
     if (this.#process) return;
@@ -93,8 +93,9 @@ export class AnvilBaseFork {
       throw new Error(`Anvil demo port is already in use: ${ANVIL_RPC_URL}`);
     }
     try {
-      this.#process = new Deno.Command("anvil", {
-        args: [
+      this.#process = Bun.spawn({
+        cmd: [
+          "anvil",
           "--fork-url",
           BASE_FORK_URL,
           "--fork-block-number",
@@ -107,12 +108,15 @@ export class AnvilBaseFork {
           new URL(ANVIL_RPC_URL).port,
           "--silent",
         ],
-        stdout: "null",
+        stdin: "ignore",
+        stdout: "ignore",
         stderr: "inherit",
-      }).spawn();
+      });
     } catch (error) {
-      if (error instanceof Deno.errors.NotFound) {
-        throw new Error("Anvil is required. Install Foundry from https://getfoundry.sh/.");
+      if (!Bun.which("anvil")) {
+        throw new Error("Anvil is required. Install Foundry from https://getfoundry.sh/.", {
+          cause: error,
+        });
       }
       throw error;
     }
@@ -124,7 +128,8 @@ export class AnvilBaseFork {
         if (
           BigInt(chainId) === BigInt(ANVIL_CHAIN_ID) &&
           BigInt(blockNumber) === BigInt(ANVIL_FORK_BLOCK)
-        ) return;
+        )
+          return;
       } catch {
         // Anvil is still starting and loading the pinned Base state.
       }
@@ -161,12 +166,14 @@ export class AnvilBaseFork {
     await rpcRequest("anvil_impersonateAccount", [FUNDED_USDC_HOLDER]);
     try {
       await rpcRequest("anvil_setBalance", [FUNDED_USDC_HOLDER, "0x56bc75e2d63100000"]);
-      const transactionHash = await rpcRequest<string>("eth_sendTransaction", [{
-        from: FUNDED_USDC_HOLDER,
-        to: BASE_USDC_ADDRESS,
-        gas: "0x493e0",
-        data: transferCalldata(recipient, amountUnits),
-      }]);
+      const transactionHash = await rpcRequest<string>("eth_sendTransaction", [
+        {
+          from: FUNDED_USDC_HOLDER,
+          to: BASE_USDC_ADDRESS,
+          gas: "0x493e0",
+          data: transferCalldata(recipient, amountUnits),
+        },
+      ]);
       const receipt = await waitForReceipt(transactionHash);
       const log = transferLog(receipt, transactionHash, recipient, amountUnits);
       return {
@@ -200,7 +207,7 @@ export class AnvilBaseFork {
     } catch {
       // It may already have exited after reporting its startup error.
     }
-    await process.status.catch(() => {});
+    await process.exited.catch(() => {});
   }
 }
 
@@ -211,7 +218,7 @@ async function rpcRequest<T = unknown>(method: string, params: unknown[]): Promi
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
   if (!response.ok) throw new Error(`anvil_http_${response.status}`);
-  const body = await response.json() as {
+  const body = (await response.json()) as {
     result?: T;
     error?: { code?: unknown; message?: unknown };
   };
@@ -233,10 +240,9 @@ async function rpcAvailable(): Promise<boolean> {
 
 async function waitForReceipt(transactionHash: string): Promise<Record<string, unknown>> {
   for (let attempt = 0; attempt < RECEIPT_ATTEMPTS; attempt++) {
-    const receipt = await rpcRequest<Record<string, unknown> | null>(
-      "eth_getTransactionReceipt",
-      [transactionHash],
-    );
+    const receipt = await rpcRequest<Record<string, unknown> | null>("eth_getTransactionReceipt", [
+      transactionHash,
+    ]);
     if (receipt) {
       if (parseQuantity(receipt.status, "invalid_demo_receipt_status") !== 1n) {
         throw new Error("demo_usdc_transfer_failed");
@@ -260,10 +266,14 @@ function transferLog(
   const log = receipt.logs.find((candidate) => {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
     const value = candidate as Record<string, unknown>;
-    return String(value.address).toLowerCase() === BASE_USDC_ADDRESS.toLowerCase() &&
-      value.transactionHash === transactionHash && Array.isArray(value.topics) &&
-      value.topics[0] === TRANSFER_TOPIC && value.topics[2] === recipientTopic &&
-      value.data === amountWord;
+    return (
+      String(value.address).toLowerCase() === BASE_USDC_ADDRESS.toLowerCase() &&
+      value.transactionHash === transactionHash &&
+      Array.isArray(value.topics) &&
+      value.topics[0] === TRANSFER_TOPIC &&
+      value.topics[2] === recipientTopic &&
+      value.data === amountWord
+    );
   });
   if (!log || typeof log !== "object" || Array.isArray(log)) {
     throw new Error("demo_usdc_transfer_log_missing");
@@ -272,8 +282,9 @@ function transferLog(
 }
 
 function transferCalldata(recipient: string, amountUnits: bigint): string {
-  return "0xa9059cbb" + recipient.slice(2).padStart(64, "0") +
-    amountUnits.toString(16).padStart(64, "0");
+  return (
+    "0xa9059cbb" + recipient.slice(2).padStart(64, "0") + amountUnits.toString(16).padStart(64, "0")
+  );
 }
 
 function parseQuantity(value: unknown, code: string): bigint {

@@ -8,25 +8,25 @@ export type WebhookDeliveryResponse = {
   ok: boolean;
 };
 
-type WebhookConnection = {
+export type WebhookConnection = {
   read(buffer: Uint8Array): Promise<number | null>;
   write(buffer: Uint8Array): Promise<number>;
   close(): void;
 };
 
-type WebhookDialResult = {
+export type WebhookDialResult = {
   connection: WebhookConnection;
   remoteAddress: string;
 };
 
-type WebhookDialer = (
+export type WebhookDialer = (
   hostname: string,
   port: number,
   signal: AbortSignal,
 ) => Promise<WebhookDialResult>;
 
 type PinnedWebhookOptions = {
-  dial?: WebhookDialer;
+  dial: WebhookDialer;
 };
 
 const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
@@ -35,9 +35,9 @@ export async function postPinnedWebhook(
   target: ResolvedWebhookTarget,
   body: string,
   signal: AbortSignal,
-  options: PinnedWebhookOptions = {},
+  options: PinnedWebhookOptions,
 ): Promise<WebhookDeliveryResponse> {
-  const dial = options.dial ?? dialTls;
+  const dial = options.dial;
   return await postToResolvedTarget(target, body, signal, dial);
 }
 
@@ -80,51 +80,6 @@ async function postToResolvedTarget(
   } finally {
     signal.removeEventListener("abort", abort);
     connection.close();
-  }
-}
-
-async function dialTls(
-  hostname: string,
-  port: number,
-  signal: AbortSignal,
-): Promise<WebhookDialResult> {
-  if (signal.aborted) throw signal.reason;
-  const pendingConnection = Deno.connectTls({
-    hostname,
-    port,
-    alpnProtocols: ["http/1.1"],
-  });
-  let cancelConnect = () => {};
-  const cancelled = new Promise<never>((_, reject) => {
-    cancelConnect = () => reject(signal.reason);
-    signal.addEventListener("abort", cancelConnect, { once: true });
-  });
-  let connection: Deno.TlsConn;
-  try {
-    connection = await Promise.race([pendingConnection, cancelled]);
-  } catch (error) {
-    void pendingConnection.then((lateConnection) => lateConnection.close()).catch(() => {});
-    throw error;
-  } finally {
-    signal.removeEventListener("abort", cancelConnect);
-  }
-  const abortHandshake = () => connection.close();
-  signal.addEventListener("abort", abortHandshake, { once: true });
-  try {
-    if (signal.aborted) throw signal.reason;
-    const handshake = await connection.handshake();
-    if (handshake.alpnProtocol !== null && handshake.alpnProtocol !== "http/1.1") {
-      throw new Error("webhook_http_1_required");
-    }
-    return {
-      connection,
-      remoteAddress: connection.remoteAddr.hostname,
-    };
-  } catch (error) {
-    connection.close();
-    throw error;
-  } finally {
-    signal.removeEventListener("abort", abortHandshake);
   }
 }
 
@@ -176,9 +131,12 @@ function concat(chunks: Uint8Array[], total: number): Uint8Array {
 function indexOfHeaderEnd(bytes: Uint8Array): number {
   for (let index = 0; index <= bytes.byteLength - 4; index += 1) {
     if (
-      bytes[index] === 13 && bytes[index + 1] === 10 &&
-      bytes[index + 2] === 13 && bytes[index + 3] === 10
-    ) return index;
+      bytes[index] === 13 &&
+      bytes[index + 1] === 10 &&
+      bytes[index + 2] === 13 &&
+      bytes[index + 3] === 10
+    )
+      return index;
   }
   return -1;
 }

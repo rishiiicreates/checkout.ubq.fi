@@ -1,38 +1,32 @@
-interface DenoJson {
-  deploy?: {
-    app?: string;
-    org?: string;
-  };
+export {};
+const origin = "https://checkout.ubq.fi";
+const paths = ["/api/health", "/.well-known/jwks.json", "/", "/styles.css", "/app.js"];
+let version: string | null = null;
+for (const path of paths) {
+  const response = await fetch(new URL(path, origin), {
+    signal: AbortSignal.timeout(15_000),
+    redirect: "manual",
+  });
+  if (response.headers.get("x-uos-runtime") !== "cloudflare-workers")
+    throw new Error("deployment_runtime_mismatch");
+  const servedVersion = response.headers.get("x-uos-version");
+  if (!servedVersion || (version && servedVersion !== version))
+    throw new Error("deployment_version_mismatch");
+  version = servedVersion;
+  if (response.status !== 200)
+    throw new Error(`deployment_verification_failed:${path}:${response.status}`);
+  if (path === "/api/health" && (await response.json()).status !== "ready")
+    throw new Error("deployment_not_ready");
+  if (path === "/.well-known/jwks.json" && !Array.isArray((await response.json()).keys))
+    throw new Error("deployment_jwks_missing");
+  if (!response.bodyUsed) await response.body?.cancel();
+  console.log(`Verified ${path}`);
 }
+const session = await fetch(`${origin}/api/v1/admin/session`, {
+  signal: AbortSignal.timeout(15_000),
+});
+if ((await session.json()).authenticated !== false)
+  throw new Error("unexpected_public_admin_session");
+console.log("Verified public requests cannot become local administrators");
 
-const denoJson = JSON.parse(await Deno.readTextFile("deno.json")) as DenoJson;
-const app = readRequiredConfig(denoJson.deploy?.app, "deploy.app");
-const org = readRequiredConfig(denoJson.deploy?.org, "deploy.org");
-const baseUrl = `https://${app}.${org}.deno.net`;
-
-for (let attempt = 1; attempt <= 60; attempt += 1) {
-  const response = await fetch(`${baseUrl}/api/health`).catch(() => null);
-  if (response?.ok) {
-    const body = await response.json().catch(() => null) as { status?: unknown } | null;
-    if (body?.status === "ready") {
-      console.log(`${baseUrl}/api/health returned ready`);
-      Deno.exit(0);
-    }
-  }
-  await delay(5000);
-}
-
-console.error(`${baseUrl}/api/health did not return ready before timeout`);
-Deno.exit(1);
-
-function readRequiredConfig(value: string | undefined, name: string): string {
-  const trimmed = value?.trim();
-  if (!trimmed || trimmed.includes("{{") || trimmed.includes("}}")) {
-    throw new Error(`${name} is required in deno.json`);
-  }
-  return trimmed;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+console.log(`Verified Worker version ${version}`);

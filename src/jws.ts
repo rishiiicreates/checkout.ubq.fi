@@ -1,4 +1,5 @@
-const ACTIVE_SIGNING_KEY: Deno.KvKey = ["uos_checkout", "v1", "jws", "active"];
+import type { KvKey, Kv } from "./kv.ts";
+const ACTIVE_SIGNING_KEY: KvKey = ["uos_checkout", "v1", "jws", "active"];
 
 export type SigningKeyRecord = {
   schemaVersion: 1;
@@ -27,7 +28,7 @@ export interface CompactJwsSigner {
 }
 
 export function createPersistentJwsSigner(
-  kv: Deno.Kv,
+  kv: Kv,
   clock: { now(): Date } = { now: () => new Date() },
 ): CompactJwsSigner {
   let cachedRecord: SigningKeyRecord | undefined;
@@ -77,7 +78,7 @@ export function createPersistentJwsSigner(
 }
 
 export async function loadOrCreateSigningKey(
-  kv: Deno.Kv,
+  kv: Kv,
   clock: { now(): Date } = { now: () => new Date() },
 ): Promise<SigningKeyRecord> {
   while (true) {
@@ -97,10 +98,15 @@ export async function loadOrCreateSigningKey(
       true,
       ["sign", "verify"],
     );
+    if (!("privateKey" in generated) || !("publicKey" in generated))
+      throw new JwsError("rsa_key_pair_required");
     const privateJwk = await crypto.subtle.exportKey("jwk", generated.privateKey);
     const exportedPublicJwk = await crypto.subtle.exportKey("jwk", generated.publicKey);
+    if (!("kty" in privateJwk) || !("kty" in exportedPublicJwk))
+      throw new JwsError("rsa_jwk_required");
     if (
-      exportedPublicJwk.kty !== "RSA" || typeof exportedPublicJwk.n !== "string" ||
+      exportedPublicJwk.kty !== "RSA" ||
+      typeof exportedPublicJwk.n !== "string" ||
       typeof exportedPublicJwk.e !== "string"
     ) {
       throw new JwsError("generated_rsa_jwk_invalid");
@@ -145,7 +151,9 @@ export async function verifyCompactJws(
   }
   const header = parseJsonPart(parts[0], "invalid_jws_header");
   if (
-    !header || typeof header !== "object" || Array.isArray(header) ||
+    !header ||
+    typeof header !== "object" ||
+    Array.isArray(header) ||
     (header as Record<string, unknown>).alg !== "RS256" ||
     (header as Record<string, unknown>).typ !== "JWT" ||
     typeof (header as Record<string, unknown>).kid !== "string"
@@ -189,9 +197,13 @@ export class JwsError extends Error {
 
 function validateSigningKeyRecord(record: SigningKeyRecord): void {
   if (
-    record.schemaVersion !== 1 || record.algorithm !== "RS256" || !record.kid ||
-    record.privateJwk.kty !== "RSA" || record.publicJwk.kty !== "RSA" ||
-    typeof record.publicJwk.n !== "string" || typeof record.publicJwk.e !== "string"
+    record.schemaVersion !== 1 ||
+    record.algorithm !== "RS256" ||
+    !record.kid ||
+    record.privateJwk.kty !== "RSA" ||
+    record.publicJwk.kty !== "RSA" ||
+    typeof record.publicJwk.n !== "string" ||
+    typeof record.publicJwk.e !== "string"
   ) {
     throw new JwsError("stored_signing_key_invalid");
   }
@@ -226,8 +238,8 @@ function base64UrlEncode(value: Uint8Array): string {
 
 function base64UrlDecode(value: string): Uint8Array {
   if (!/^[A-Za-z0-9_-]+$/u.test(value)) throw new JwsError("invalid_base64url");
-  const padded = value.replaceAll("-", "+").replaceAll("_", "/") +
-    "=".repeat((4 - value.length % 4) % 4);
+  const padded =
+    value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - (value.length % 4)) % 4);
   let binary: string;
   try {
     binary = atob(padded);

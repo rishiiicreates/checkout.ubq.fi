@@ -1,3 +1,7 @@
+import type { FetchLike } from "./rpc.ts";
+import { SqliteKv } from "./sqlite_kv.ts";
+import { test } from "bun:test";
+import type { Kv } from "./kv.ts";
 import {
   ADMIN_SESSION_COOKIE,
   AdminAuthError,
@@ -13,21 +17,21 @@ import {
 
 const NOW = Date.parse("2026-07-21T12:00:00.000Z");
 
-Deno.test("Auth Hub verifier accepts SSO and rejects agent tokens", async () => {
+test("Auth Hub verifier accepts SSO and rejects agent tokens", async () => {
   const keys = await generateSigningKeys();
   const sso = await signToken(keys.privateKey, keys.kid, claims({ auth: "sso" }));
   const accepted = await verifyAuthHubToken(sso, { keys: [keys.publicJwk] }, NOW);
   assertEquals(accepted?.sub, "hub-owner");
 
-  const agent = await signToken(
-    keys.privateKey,
-    keys.kid,
-    { ...claims(), auth: "agent-token", agentTokenId: "agent-1" },
-  );
+  const agent = await signToken(keys.privateKey, keys.kid, {
+    ...claims(),
+    auth: "agent-token",
+    agentTokenId: "agent-1",
+  });
   assertEquals(await verifyAuthHubToken(agent, { keys: [keys.publicJwk] }, NOW), null);
 });
 
-Deno.test("first Auth Hub admin atomically claims the Checkout owner", async () => {
+test("first Auth Hub admin atomically claims the Checkout owner", async () => {
   await withKv(async (kv) => {
     const owner = await claimOrLoadMembership(
       kv,
@@ -49,7 +53,7 @@ Deno.test("first Auth Hub admin atomically claims the Checkout owner", async () 
   });
 });
 
-Deno.test("the owner can invite an Auth Hub handle that atomically becomes a member", async () => {
+test("the owner can invite an Auth Hub handle that atomically becomes a member", async () => {
   await withKv(async (kv) => {
     await claimOrLoadMembership(
       kv,
@@ -76,7 +80,7 @@ Deno.test("the owner can invite an Auth Hub handle that atomically becomes a mem
   });
 });
 
-Deno.test("login redirects to the registered Checkout Auth Hub client", async () => {
+test("login redirects to the registered Checkout Auth Hub client", async () => {
   await withKv((kv) => {
     const service = createAdminAuthService(kv, {
       now: () => NOW,
@@ -95,7 +99,7 @@ Deno.test("login redirects to the registered Checkout Auth Hub client", async ()
   });
 });
 
-Deno.test("only an internally marked loopback peer receives local owner access", async () => {
+test("only an internally marked loopback peer receives local owner access", async () => {
   await withKv(async (kv) => {
     const service = createAdminAuthService(kv);
     const untrusted = await service.sessionFromRequest(new Request("http://localhost:8000/"));
@@ -112,7 +116,7 @@ Deno.test("only an internally marked loopback peer receives local owner access",
   });
 });
 
-Deno.test("JWKS refreshes only once for an unknown kid and never for known-key failures", async () => {
+test("JWKS refreshes only once for an unknown kid and never for known-key failures", async () => {
   const trusted = await generateSigningKeys();
   const attacker = await generateSigningKeys();
   let currentNow = NOW;
@@ -123,7 +127,7 @@ Deno.test("JWKS refreshes only once for an unknown kid and never for known-key f
       fetch: (() => {
         fetchCount++;
         return Promise.resolve(Response.json({ keys: [trusted.publicJwk] }));
-      }) as typeof fetch,
+      }) as FetchLike,
     });
     const valid = await signToken(trusted.privateKey, trusted.kid, claims());
     await service.sessionFromRequest(sessionRequest(valid));
@@ -186,7 +190,7 @@ async function generateSigningKeys() {
   return {
     privateKey: pair.privateKey,
     kid,
-    publicJwk: { ...await crypto.subtle.exportKey("jwk", pair.publicKey), kid },
+    publicJwk: { ...(await crypto.subtle.exportKey("jwk", pair.publicKey)), kid },
   };
 }
 
@@ -213,14 +217,12 @@ function base64Url(value: string | Uint8Array): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
 }
 
-async function withKv(run: (kv: Deno.Kv) => void | Promise<void>): Promise<void> {
-  const path = await Deno.makeTempFile({ prefix: "checkout-admin-auth-", suffix: ".sqlite" });
-  const kv = await Deno.openKv(path);
+async function withKv(run: (kv: Kv) => void | Promise<void>): Promise<void> {
+  const kv = new SqliteKv(":memory:");
   try {
     await run(kv);
   } finally {
     kv.close();
-    await Deno.remove(path).catch(() => undefined);
   }
 }
 

@@ -1,178 +1,191 @@
-/**
- * Client for the UBQ KV service (kv-service/): a Deno-KV-shaped store on
- * Cloudflare D1. The auth hub selects it with AUTH_KV_SERVICE_URL +
- * AUTH_KV_SERVICE_TOKEN; unset keeps the local sqlite/remote Deno KV default.
- *
- * Only the Deno.Kv surface the hub uses is implemented: get, getMany, set,
- * delete, list, and atomic (check/set/delete/commit). Keys are strings,
- * numbers, or booleans, matching the hub's stored keys.
- */
+import { decodeKvValue, encodeKvValue } from "./kv_codec.ts";
+import {
+  type Kv,
+  type KvAtomic,
+  type KvCheck,
+  type KvCommitResult,
+  type KvEntries,
+  type KvEntry,
+  type KvEntryMaybe,
+  type KvKey,
+  type KvListOptions,
+  type KvListSelector,
+  listPrefix,
+  selectEntries,
+  validateKey,
+} from "./kv.ts";
 
-export type UbqKvKey = readonly (string | number | boolean)[];
-
-export type UbqKvEntryMaybe<T> = {
-  key: UbqKvKey;
-  value: T | null;
-  versionstamp: string | null;
-};
-
-export type UbqKvListSelector = { prefix?: UbqKvKey };
-
-type WireEntry = { key: UbqKvKey; value: unknown; versionstamp: string };
-
-type CheckInput = { key: UbqKvKey; versionstamp: string | null };
-
+type WireEntry = { key: KvKey; value: unknown; versionstamp: string };
+type Fetcher = (input: string, init: RequestInit) => Promise<Response>;
 const REQUEST_TIMEOUT_MS = 15_000;
 
-export class UbqKvAtomic {
-  private readonly checks: CheckInput[] = [];
-  private readonly mutations: Array<
-    { type: "set" | "delete"; key: UbqKvKey; value?: unknown; expireInMs?: number }
-  > = [];
-
-  constructor(private readonly client: UbqKv) {}
-
-  check(...entries: CheckInput[]): this {
-    this.checks.push(...entries);
-    return this;
-  }
-
-  set(key: UbqKvKey, value: unknown, options?: { expireIn?: number }): this {
-    this.mutations.push({ type: "set", key, value, expireInMs: options?.expireIn });
-    return this;
-  }
-
-  delete(key: UbqKvKey): this {
-    this.mutations.push({ type: "delete", key });
-    return this;
-  }
-
-  async commit(): Promise<{ ok: boolean; versionstamp: string | null }> {
-    const result = await this.client.request<{ ok: boolean; versionstamp?: string }>(
-      "/kv/atomic",
-      {
-        checks: this.checks.map((check) => ({
-          key: check.key,
-          versionstamp: check.versionstamp,
-        })),
-        mutations: this.mutations,
-      },
-    );
-    if (!result.ok) return { ok: false, versionstamp: null };
-    return { ok: true, versionstamp: result.versionstamp ?? null };
-  }
-}
-
-export class UbqKv {
-  constructor(
-    private readonly options: {
-      url: string;
-      token: string;
-      fetchImpl?: typeof fetch;
-    },
-  ) {}
-
-  private get fetchImpl(): typeof fetch {
-    return this.options.fetchImpl ?? globalThis.fetch;
-  }
+/** HTTP protocol for the existing shared D1 service; no new database or keyspace. */
+export class UbqKv implements Kv {
+  constructor(private readonly options: { url: string; token: string; fetchImpl?: Fetcher }) {}
 
   async request<T>(path: string, body: unknown): Promise<T> {
-    const url = `${this.options.url.replace(/\/$/, "")}${path}`;
-    const response = await this.fetchImpl(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.options.token}`,
+    const response = await (this.options.fetchImpl ?? fetch)(
+      `${this.options.url.replace(/\/$/, "")}${path}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${this.options.token}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    const payload = (await response.json()) as {
-      ok?: boolean;
-      error?: string;
-      message?: string;
-    } & Record<string, unknown>;
-    if (!response.ok || payload.ok !== true) {
+    );
+    const payload = (await response.json()) as { ok?: boolean; error?: string };
+    const conflict = path === "/kv/atomic" && response.ok && payload.ok === false && !payload.error;
+    if (!response.ok || (payload.ok !== true && !conflict)) {
       throw new Error(
-        `ubq_kv_request_failed:${path}:${response.status}:${payload.error ?? "unknown"}`,
+        `uos_kv_request_failed:${path}:${response.status}:${payload.error ?? "unknown"}`,
       );
     }
     return payload as T;
   }
 
-  async get<T>(key: UbqKvKey): Promise<UbqKvEntryMaybe<T>> {
+  async get<T>(key: KvKey): Promise<KvEntryMaybe<T>> {
+    validateKey(key);
     const result = await this.request<{ entry: WireEntry | null }>("/kv/get", { key });
-    return toEntryMaybe<T>(key, result.entry);
+    return result.entry ? fromWire<T>(result.entry) : { key, value: null, versionstamp: null };
   }
 
-  async getMany<T>(keys: UbqKvKey[]): Promise<UbqKvEntryMaybe<T>[]> {
-    if (keys.length === 0) return [];
-    const result = await this.request<{ entries: (WireEntry | null)[] }>("/kv/getMany", {
-      keys,
-    });
-    return result.entries.map((entry, index) => toEntryMaybe<T>(keys[index], entry));
+  async getMany<T extends readonly unknown[]>(keys: readonly KvKey[]): Promise<KvEntries<T>> {
+    keys.forEach(validateKey);
+    const entries: KvEntryMaybe<unknown>[] = [];
+    for (let offset = 0; offset < keys.length; offset += 100) {
+      const batch = keys.slice(offset, offset + 100);
+      const result = await this.request<{ entries: (WireEntry | null)[] }>("/kv/getMany", {
+        keys: batch,
+      });
+      if (result.entries.length !== batch.length) throw new Error("uos_kv_invalid_get_many");
+      entries.push(
+        ...result.entries.map((entry, index) =>
+          entry ? fromWire(entry) : { key: batch[index], value: null, versionstamp: null },
+        ),
+      );
+    }
+    return entries as KvEntries<T>;
   }
 
   async set(
-    key: UbqKvKey,
+    key: KvKey,
     value: unknown,
     options?: { expireIn?: number },
   ): Promise<{ ok: true; versionstamp: string }> {
+    validateKey(key);
     const result = await this.request<{ versionstamp: string }>("/kv/set", {
       key,
-      value,
+      value: encodeKvValue(value),
       expireInMs: options?.expireIn,
     });
     return { ok: true, versionstamp: result.versionstamp };
   }
 
-  async delete(key: UbqKvKey): Promise<void> {
+  async delete(key: KvKey): Promise<void> {
+    validateKey(key);
     await this.request("/kv/delete", { key });
   }
 
-  list<T>(
-    selector: UbqKvListSelector = {},
-    options?: { limit?: number },
-  ): AsyncIterableIterator<UbqKvEntryMaybe<T>> {
-    const iterator = this.listEntries<T>(selector, options);
-    return iterator[Symbol.asyncIterator]();
-  }
-
-  private async *listEntries<T>(
-    selector: UbqKvListSelector,
-    options?: { limit?: number },
-  ): AsyncIterableIterator<UbqKvEntryMaybe<T>> {
-    let cursor: string | null = null;
-    let remaining = options?.limit ?? Number.POSITIVE_INFINITY;
-    while (remaining > 0) {
-      const pageSize = Math.min(remaining, 100);
-      const page: { entries: WireEntry[]; cursor: string | null } = await this.request<
-        { entries: WireEntry[]; cursor: string | null }
-      >("/kv/list", {
-        prefix: selector.prefix,
-        limit: pageSize,
-        cursor: cursor ?? undefined,
+  async *list<T>(
+    selector: KvListSelector = {},
+    options?: KvListOptions,
+  ): AsyncIterableIterator<KvEntry<T>> {
+    const prefix = serverListPrefix(listPrefix(selector));
+    validateKey(prefix);
+    const entries: KvEntry<T>[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await this.request<{ entries: WireEntry[]; cursor: string | null }>("/kv/list", {
+        prefix,
+        limit: 500,
+        cursor,
       });
-      for (const entry of page.entries) {
-        yield {
-          key: entry.key,
-          value: entry.value as T,
-          versionstamp: entry.versionstamp,
-        };
-        remaining -= 1;
-        if (remaining <= 0) return;
-      }
-      cursor = page.cursor;
-      if (!cursor || page.entries.length === 0) return;
-    }
+      entries.push(...page.entries.map(fromWire<T>));
+      cursor = page.cursor ?? undefined;
+      if (cursor && cursors.has(cursor)) throw new Error("uos_kv_repeated_cursor");
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    // The service orders encoded keys lexically and supports prefix/cursor only.
+    // Fetch the derived prefix completely before applying tuple ranges and limit.
+    yield* selectEntries(entries, selector, options);
   }
 
-  atomic(): UbqKvAtomic {
+  atomic(): KvAtomic {
     return new UbqKvAtomic(this);
+  }
+  close(): void {}
+}
+
+class UbqKvAtomic implements KvAtomic {
+  private readonly checks: KvCheck[] = [];
+  private readonly mutations: {
+    type: "set" | "delete";
+    key: KvKey;
+    value?: unknown;
+    expireInMs?: number;
+  }[] = [];
+  private committed = false;
+  constructor(private readonly client: UbqKv) {}
+  check(...entries: KvCheck[]): this {
+    entries.forEach((entry) => validateKey(entry.key));
+    this.checks.push(
+      ...entries.map((entry) => ({
+        key: structuredClone(entry.key),
+        versionstamp: entry.versionstamp,
+      })),
+    );
+    return this;
+  }
+  set(key: KvKey, value: unknown, options?: { expireIn?: number }): this {
+    validateKey(key);
+    this.mutations.push({
+      type: "set",
+      key: [...key],
+      value: encodeKvValue(value),
+      expireInMs: options?.expireIn,
+    });
+    return this;
+  }
+  delete(key: KvKey): this {
+    validateKey(key);
+    this.mutations.push({ type: "delete", key: [...key] });
+    return this;
+  }
+  async commit(): Promise<KvCommitResult> {
+    if (this.committed) throw new Error("atomic_already_committed");
+    this.committed = true;
+    const result = await this.client.request<{ ok: boolean; versionstamp?: string }>("/kv/atomic", {
+      checks: this.checks,
+      mutations: this.mutations,
+    });
+    if (!result.ok) return { ok: false, versionstamp: null };
+    if (!result.versionstamp) throw new Error("uos_kv_missing_versionstamp");
+    return { ok: true, versionstamp: result.versionstamp };
   }
 }
 
-function toEntryMaybe<T>(key: UbqKvKey, entry: WireEntry | null): UbqKvEntryMaybe<T> {
-  if (!entry) return { key, value: null, versionstamp: null };
-  return { key: entry.key, value: entry.value as T, versionstamp: entry.versionstamp };
+function fromWire<T>(entry: WireEntry): KvEntry<T> {
+  return {
+    key: entry.key,
+    value: decodeKvValue(entry.value) as T,
+    versionstamp: entry.versionstamp,
+  };
+}
+
+function serverListPrefix(prefix: KvKey): KvKey {
+  const root = ["uos_checkout", "v1"];
+  if (!prefix.length) return root;
+  const encoded = `u1|${prefix.map((part) => (typeof part === "string" ? `s${part.length}:${part}` : typeof part === "number" ? `n:${part}` : `b:${part ? 1 : 0}`)).join("|")}|`;
+  const slash = String.fromCharCode(92);
+  const pattern =
+    Array.from(encoded, (part) => ([slash, "%", "_"].includes(part) ? slash + part : part)).join(
+      "",
+    ) + "%";
+  if (new TextEncoder().encode(pattern).byteLength <= 50) return prefix;
+  if (prefix[0] !== root[0] || prefix[1] !== root[1]) throw new Error("uos_kv_prefix_too_long");
+  return root;
 }

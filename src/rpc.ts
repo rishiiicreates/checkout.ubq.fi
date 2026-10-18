@@ -24,10 +24,7 @@ export interface RpcClient {
   batch(chainId: SupportedChainId, calls: readonly JsonRpcCall[]): Promise<JsonRpcBatchItem[]>;
 }
 
-export type FetchLike = (
-  input: string | URL | Request,
-  init?: RequestInit,
-) => Promise<Response>;
+export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export class HttpRpcClient implements RpcClient {
   constructor(private readonly fetcher: FetchLike = fetch) {}
@@ -115,11 +112,13 @@ export async function latestBlockNumber(
   client: RpcClient,
   chainId: SupportedChainId,
 ): Promise<bigint> {
-  const calls: JsonRpcCall[] = [{
-    id: "latest",
-    method: "eth_getBlockByNumber",
-    params: ["latest", false],
-  }];
+  const calls: JsonRpcCall[] = [
+    {
+      id: "latest",
+      method: "eth_getBlockByNumber",
+      params: ["latest", false],
+    },
+  ];
   const results = responseMap(await client.batch(chainId, calls), calls);
   return parseBlock(results.get("latest"), "latest").number;
 }
@@ -155,51 +154,60 @@ export async function discoverTransferLogs(
   if (fromBlock < 0n || toBlock < fromBlock) throw new RpcError("invalid_log_range");
   const tokenAddress = normalizeAddress(tokenAddressInput);
   const recipientAddress = normalizeAddress(recipientAddressInput);
-  const calls: JsonRpcCall[] = [{
-    id: "transfer_logs",
-    method: "eth_getLogs",
-    params: [{
-      address: tokenAddress,
-      fromBlock: toQuantity(fromBlock),
-      toBlock: toQuantity(toBlock),
-      topics: [TRANSFER_TOPIC, null, addressTopic(recipientAddress)],
-    }],
-  }];
+  const calls: JsonRpcCall[] = [
+    {
+      id: "transfer_logs",
+      method: "eth_getLogs",
+      params: [
+        {
+          address: tokenAddress,
+          fromBlock: toQuantity(fromBlock),
+          toBlock: toQuantity(toBlock),
+          topics: [TRANSFER_TOPIC, null, addressTopic(recipientAddress)],
+        },
+      ],
+    },
+  ];
   const results = responseMap(await client.batch(chainId, calls), calls);
   const rawLogs = results.get("transfer_logs");
   if (!Array.isArray(rawLogs)) throw new RpcError("rpc_transfer_logs_array_required");
-  return rawLogs.filter((value) =>
-    !!value && typeof value === "object" && !Array.isArray(value) &&
-    (value as Record<string, unknown>).removed !== true
-  ).map((value): DiscoveredTransferLog => {
-    const log = value as Record<string, unknown>;
-    if (normalizeAddressForVerification(log.address) !== tokenAddress) {
-      throw new RpcError("rpc_transfer_log_token_mismatch");
-    }
-    if (!Array.isArray(log.topics) || log.topics.length !== 3) {
-      throw new RpcError("rpc_transfer_log_topics_invalid");
-    }
-    const topics = log.topics.map((topic) => hexWord(topic, "invalid_transfer_topic"));
-    if (topics[0] !== TRANSFER_TOPIC) throw new RpcError("rpc_transfer_log_signature_invalid");
-    const logIndex = parseQuantity(log.logIndex, "invalid_log_index");
-    if (logIndex > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new RpcError("rpc_transfer_log_index_too_large");
-    }
-    const discoveredRecipient = topicAddress(topics[2], "invalid_transfer_recipient");
-    if (discoveredRecipient !== recipientAddress) {
-      throw new RpcError("rpc_transfer_log_recipient_mismatch");
-    }
-    return {
-      transactionHash: hexHash(log.transactionHash, "invalid_log_transaction_hash"),
-      logIndex: Number(logIndex),
-      blockNumber: parseQuantity(log.blockNumber, "invalid_log_block_number"),
-      blockHash: hexHash(log.blockHash, "invalid_log_block_hash"),
-      tokenAddress,
-      payerAddress: topicAddress(topics[1], "invalid_transfer_payer"),
-      recipientAddress: discoveredRecipient,
-      amountUnits: parseWord(log.data, "invalid_transfer_amount"),
-    };
-  });
+  return rawLogs
+    .filter(
+      (value) =>
+        !!value &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        (value as Record<string, unknown>).removed !== true,
+    )
+    .map((value): DiscoveredTransferLog => {
+      const log = value as Record<string, unknown>;
+      if (normalizeAddressForVerification(log.address) !== tokenAddress) {
+        throw new RpcError("rpc_transfer_log_token_mismatch");
+      }
+      if (!Array.isArray(log.topics) || log.topics.length !== 3) {
+        throw new RpcError("rpc_transfer_log_topics_invalid");
+      }
+      const topics = log.topics.map((topic) => hexWord(topic, "invalid_transfer_topic"));
+      if (topics[0] !== TRANSFER_TOPIC) throw new RpcError("rpc_transfer_log_signature_invalid");
+      const logIndex = parseQuantity(log.logIndex, "invalid_log_index");
+      if (logIndex > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new RpcError("rpc_transfer_log_index_too_large");
+      }
+      const discoveredRecipient = topicAddress(topics[2], "invalid_transfer_recipient");
+      if (discoveredRecipient !== recipientAddress) {
+        throw new RpcError("rpc_transfer_log_recipient_mismatch");
+      }
+      return {
+        transactionHash: hexHash(log.transactionHash, "invalid_log_transaction_hash"),
+        logIndex: Number(logIndex),
+        blockNumber: parseQuantity(log.blockNumber, "invalid_log_block_number"),
+        blockHash: hexHash(log.blockHash, "invalid_log_block_hash"),
+        tokenAddress,
+        payerAddress: topicAddress(topics[1], "invalid_transfer_payer"),
+        recipientAddress: discoveredRecipient,
+        amountUnits: parseWord(log.data, "invalid_transfer_amount"),
+      };
+    });
 }
 
 export async function verifyTransferBatch(
@@ -224,9 +232,13 @@ export async function verifyTransferBatch(
   ) {
     throw new RpcVerificationError("invalid_observed_block_hash");
   }
-  const previouslyVerifiedBlockHash = expectedInput.previouslyVerifiedBlockHash === undefined
-    ? undefined
-    : hexHash(expectedInput.previouslyVerifiedBlockHash, "invalid_previously_verified_block_hash");
+  const previouslyVerifiedBlockHash =
+    expectedInput.previouslyVerifiedBlockHash === undefined
+      ? undefined
+      : hexHash(
+          expectedInput.previouslyVerifiedBlockHash,
+          "invalid_previously_verified_block_hash",
+        );
 
   const calls: JsonRpcCall[] = [
     {
@@ -292,10 +304,10 @@ export async function verifyTransferBatch(
   const rawLog = receipt.logs.find((value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     try {
-      return parseQuantity(
-        (value as Record<string, unknown>).logIndex,
-        "invalid_log_index",
-      ) === BigInt(logIndex);
+      return (
+        parseQuantity((value as Record<string, unknown>).logIndex, "invalid_log_index") ===
+        BigInt(logIndex)
+      );
     } catch {
       return false;
     }
@@ -404,9 +416,10 @@ function responseMap(
     }
     if (results.has(response.id)) throw new RpcError("rpc_duplicate_response_id");
     if (response.error !== undefined) {
-      const message = typeof response.error?.message === "string"
-        ? response.error.message
-        : "unknown upstream error";
+      const message =
+        typeof response.error?.message === "string"
+          ? response.error.message
+          : "unknown upstream error";
       throw new RpcError(`rpc_upstream_error:${response.id}:${message}`);
     }
     results.set(response.id, response.result);
@@ -425,7 +438,10 @@ function objectResult(value: unknown, missingCode: string): Record<string, unkno
   return value as Record<string, unknown>;
 }
 
-function parseBlock(value: unknown, label: string): {
+function parseBlock(
+  value: unknown,
+  label: string,
+): {
   number: bigint;
   hash: string;
   timestamp: bigint;

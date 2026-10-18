@@ -1,11 +1,8 @@
+import type { Kv } from "./kv.ts";
 import { LOCAL_PEER_HEADER } from "./admin_auth.ts";
 import type { ResolvedWebhookTarget } from "./webhook.ts";
 
-export type MerchantScope =
-  | "catalog:write"
-  | "invoice:create"
-  | "invoice:read"
-  | "claim:create";
+export type MerchantScope = "catalog:write" | "invoice:create" | "invoice:read" | "claim:create";
 
 export type MerchantRecord = {
   id: string;
@@ -51,45 +48,18 @@ type MerchantAuthOptions = {
   resolveDns?: (hostname: string, recordType: "A" | "AAAA") => Promise<string[]>;
 };
 
-export function createMerchantAuthService(kv: Deno.Kv, options: MerchantAuthOptions = {}) {
+export function createMerchantAuthService(kv: Kv, options: MerchantAuthOptions = {}) {
   const now = options.now ?? Date.now;
   const randomUuid = options.randomUuid ?? (() => crypto.randomUUID());
-  const randomBytes = options.randomBytes ??
-    ((length: number) => crypto.getRandomValues(new Uint8Array(length)));
-  const resolveDns = options.resolveDns ??
-    ((hostname, recordType) => Deno.resolveDns(hostname, recordType) as Promise<string[]>);
+  const randomBytes =
+    options.randomBytes ?? ((length: number) => crypto.getRandomValues(new Uint8Array(length)));
+  const resolveDns =
+    options.resolveDns ??
+    (async () => {
+      throw new Error("webhook_dns_resolver_required");
+    });
 
-  const resolveWebhookTarget = async (
-    settlementWebhookUrl: string,
-  ): Promise<ResolvedWebhookTarget> => {
-    const url = new URL(webhookUrl(settlementWebhookUrl));
-    const hostname = normalizedHostname(url.hostname);
-    if (isIpAddress(hostname)) {
-      if (!isPublicIpAddress(hostname)) {
-        throw new MerchantAuthError(400, "unsafe_webhook_url");
-      }
-      return { url, addresses: [hostname] };
-    }
-    const answers = await Promise.allSettled([
-      resolveDns(hostname, "A"),
-      resolveDns(hostname, "AAAA"),
-    ]);
-    const addresses = answers.flatMap((answer) =>
-      answer.status === "fulfilled" ? answer.value : []
-    );
-    if (addresses.length === 0) {
-      const failure = answers.find((answer) => answer.status === "rejected");
-      throw new MerchantAuthError(
-        400,
-        "webhook_dns_failed",
-        failure?.status === "rejected" ? failure.reason : undefined,
-      );
-    }
-    if (addresses.some((address) => !isPublicIpAddress(address))) {
-      throw new MerchantAuthError(400, "unsafe_webhook_url");
-    }
-    return { url, addresses: [...new Set(addresses.map(normalizedHostname))] };
-  };
+  const resolveWebhookTarget = (url: string) => resolveWebhookTargetWithDns(url, resolveDns);
 
   const validateWebhookTarget = async (settlementWebhookUrl: string): Promise<void> => {
     await resolveWebhookTarget(settlementWebhookUrl);
@@ -146,7 +116,8 @@ export function createMerchantAuthService(kv: Deno.Kv, options: MerchantAuthOpti
         createdAt: nowIso(now()),
       };
       const existingHash = await kv.get<string>(tokenHashKey(tokenHash));
-      const result = await kv.atomic()
+      const result = await kv
+        .atomic()
         .check(existingHash)
         .set(apiKeyKey(id), record)
         .set(tokenHashKey(tokenHash), id)
@@ -167,7 +138,8 @@ export function createMerchantAuthService(kv: Deno.Kv, options: MerchantAuthOpti
         throw new MerchantAuthError(404, "merchant_key_not_found");
       }
       const revoked = { ...entry.value, revokedAt: nowIso(now()) };
-      const result = await kv.atomic()
+      const result = await kv
+        .atomic()
         .check(entry)
         .set(apiKeyKey(keyId), revoked)
         .delete(tokenHashKey(entry.value.tokenHash))
@@ -216,6 +188,39 @@ export function createMerchantAuthService(kv: Deno.Kv, options: MerchantAuthOpti
   };
 }
 
+export async function resolveWebhookTargetWithDns(
+  settlementWebhookUrl: string,
+  resolveDns: (hostname: string, recordType: "A" | "AAAA") => Promise<string[]>,
+): Promise<ResolvedWebhookTarget> {
+  const url = new URL(webhookUrl(settlementWebhookUrl));
+  const hostname = normalizedHostname(url.hostname);
+  if (isIpAddress(hostname)) {
+    if (!isPublicIpAddress(hostname)) {
+      throw new MerchantAuthError(400, "unsafe_webhook_url");
+    }
+    return { url, addresses: [hostname] };
+  }
+  const answers = await Promise.allSettled([
+    resolveDns(hostname, "A"),
+    resolveDns(hostname, "AAAA"),
+  ]);
+  const addresses = answers.flatMap((answer) =>
+    answer.status === "fulfilled" ? answer.value : [],
+  );
+  if (addresses.length === 0) {
+    const failure = answers.find((answer) => answer.status === "rejected");
+    throw new MerchantAuthError(
+      400,
+      "webhook_dns_failed",
+      failure?.status === "rejected" ? failure.reason : undefined,
+    );
+  }
+  if (addresses.some((address) => !isPublicIpAddress(address))) {
+    throw new MerchantAuthError(400, "unsafe_webhook_url");
+  }
+  return { url, addresses: [...new Set(addresses.map(normalizedHostname))] };
+}
+
 function normalizeScopes(scopes: MerchantScope[]): MerchantScope[] {
   if (!Array.isArray(scopes) || scopes.length === 0) {
     throw new MerchantAuthError(400, "scopes_required");
@@ -245,10 +250,14 @@ function webhookUrl(value: string): string {
   }
   const hostname = normalizedHostname(url.hostname);
   if (
-    hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") ||
-    hostname.endsWith(".internal") || hostname.endsWith(".home.arpa") ||
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal") ||
+    hostname.endsWith(".home.arpa") ||
     (isIpAddress(hostname) && !isPublicIpAddress(hostname))
-  ) throw new MerchantAuthError(400, "unsafe_webhook_url");
+  )
+    throw new MerchantAuthError(400, "unsafe_webhook_url");
   return url.toString();
 }
 
@@ -268,14 +277,19 @@ function isPublicIpAddress(value: string): boolean {
 
 function isIpv4(value: string): boolean {
   const octets = value.split(".");
-  return octets.length === 4 &&
-    octets.every((octet) => /^(?:0|[1-9][0-9]{0,2})$/u.test(octet) && Number(octet) <= 255);
+  return (
+    octets.length === 4 &&
+    octets.every((octet) => /^(?:0|[1-9][0-9]{0,2})$/u.test(octet) && Number(octet) <= 255)
+  );
 }
 
 function isPublicIpv4(value: string): boolean {
   const [a, b, c] = value.split(".").map(Number);
   return !(
-    a === 0 || a === 10 || a === 127 || a >= 224 ||
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    a >= 224 ||
     (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
@@ -294,8 +308,12 @@ function isPublicIpv6(value: string): boolean {
   }
   const first = Number.parseInt(normalized.split(":", 1)[0] || "0", 16);
   if (!Number.isFinite(first)) return false;
-  return first >= 0x2000 && first <= 0x3fff &&
-    normalized !== "2001:db8" && !normalized.startsWith("2001:db8:");
+  return (
+    first >= 0x2000 &&
+    first <= 0x3fff &&
+    normalized !== "2001:db8" &&
+    !normalized.startsWith("2001:db8:")
+  );
 }
 
 function identifier(value: string, field: string): string {
@@ -320,7 +338,8 @@ function bearerToken(request: Request): string {
 function isTrustedLocalRequest(request: Request): boolean {
   const peer = request.headers.get(LOCAL_PEER_HEADER);
   const url = new URL(request.url);
-  const localOrigin = url.protocol === "http:" &&
+  const localOrigin =
+    url.protocol === "http:" &&
     (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]");
   return localOrigin && (peer === "127.0.0.1" || peer === "::1");
 }
@@ -341,7 +360,11 @@ function nowIso(now: number): string {
 }
 
 export class MerchantAuthError extends Error {
-  constructor(readonly status: number, message: string, override readonly cause?: unknown) {
+  constructor(
+    readonly status: number,
+    message: string,
+    override readonly cause?: unknown,
+  ) {
     super(message);
     this.name = "MerchantAuthError";
   }

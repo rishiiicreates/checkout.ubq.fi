@@ -5,20 +5,10 @@ const DEMO_PORT = 8010;
 
 export async function startDemoServer(
   environment: DemoEnvironment,
-  serve: typeof Deno.serve = Deno.serve,
+  serve: typeof Bun.serve = Bun.serve,
 ) {
   try {
-    return serve(
-      {
-        hostname: DEMO_HOST,
-        port: DEMO_PORT,
-        onListen: () => {
-          console.log(`Ubiquity Checkout Anvil demo: http://${DEMO_HOST}:${DEMO_PORT}`);
-          console.log("Press Ctrl+C to stop the demo and its local Base fork.");
-        },
-      },
-      environment.handler,
-    );
+    return serve({ hostname: DEMO_HOST, port: DEMO_PORT, fetch: environment.handler });
   } catch (error) {
     await environment.close();
     throw error;
@@ -28,25 +18,20 @@ export async function startDemoServer(
 async function main(): Promise<void> {
   const environment = await createDemoEnvironment();
   const server = await startDemoServer(environment);
-
+  console.log(`Ubiquity Checkout Anvil demo: ${server.url}`);
   let closing = false;
-  async function close(): Promise<void> {
+  const close = async () => {
     if (closing) return;
     closing = true;
-    await server.shutdown();
+    await server.stop(true);
     await environment.close();
-  }
-
-  Deno.addSignalListener("SIGINT", () => {
+  };
+  process.once("SIGINT", () => {
     void close();
   });
-  Deno.addSignalListener("SIGTERM", () => {
+  process.once("SIGTERM", () => {
     void close();
   });
-
-  await server.finished.finally(() => environment.close());
 }
 
-if (import.meta.main) {
-  await main();
-}
+if (import.meta.main) await main();

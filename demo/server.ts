@@ -1,3 +1,5 @@
+import { SqliteKv } from "../src/sqlite_kv.ts";
+import type { Kv } from "../src/kv.ts";
 import {
   type CheckoutServices,
   createCheckoutServices,
@@ -29,17 +31,17 @@ export type DemoEnvironment = {
 
 type DemoEnvironmentOptions = {
   anvil?: AnvilBaseFork;
-  openKv?: () => Promise<Deno.Kv>;
+  openKv?: () => Promise<Kv>;
 };
 
 export async function createDemoEnvironment(
   options: DemoEnvironmentOptions = {},
 ): Promise<DemoEnvironment> {
   const anvil = options.anvil ?? new AnvilBaseFork();
-  let kv: Deno.Kv | undefined;
+  let kv: Kv | undefined;
   try {
     await anvil.start();
-    kv = await (options.openKv ?? (() => Deno.openKv(":memory:")))();
+    kv = await (options.openKv ?? (() => Promise.resolve(new SqliteKv(":memory:"))))();
     const openedKv = kv;
     const services = createCheckoutServices(openedKv, { rpc: anvil.rpc });
     const checkoutHandler = createHandler(services);
@@ -54,13 +56,15 @@ export async function createDemoEnvironment(
       DEMO_PRICING_VERSION,
       {
         currency: "USD",
-        products: [{
-          productId: DEMO_PRODUCT_ID,
-          label: "Solo test plan",
-          kind: "prepaid_plan",
-          priceCents: DEMO_PRICE_CENTS,
-          enabled: true,
-        }],
+        products: [
+          {
+            productId: DEMO_PRODUCT_ID,
+            label: "Solo test plan",
+            kind: "prepaid_plan",
+            priceCents: DEMO_PRICE_CENTS,
+            enabled: true,
+          },
+        ],
       },
     );
 
@@ -190,10 +194,13 @@ async function advanceInvoice(
       },
     },
   );
-  const result = await response.json() as Record<string, unknown>;
-  return json({ ...result, transactionHash: transfer.transactionHash }, {
-    status: response.status,
-  });
+  const result = (await response.json()) as Record<string, unknown>;
+  return json(
+    { ...result, transactionHash: transfer.transactionHash },
+    {
+      status: response.status,
+    },
+  );
 }
 
 async function demoInvoice(services: CheckoutServices, invoiceId: string): Promise<InvoiceRecord> {
@@ -231,13 +238,14 @@ async function cloneJsonResponse(response: Response): Promise<Response> {
 }
 
 async function demoStatic(method: string, pathname: string): Promise<Response | null> {
-  const file = pathname === "/" || pathname === "/index.html"
-    ? ["index.html", "text/html; charset=utf-8"]
-    : pathname === "/styles.css"
-    ? ["styles.css", "text/css; charset=utf-8"]
-    : pathname === "/app.js"
-    ? ["app.js", "text/javascript; charset=utf-8"]
-    : null;
+  const file =
+    pathname === "/" || pathname === "/index.html"
+      ? ["index.html", "text/html; charset=utf-8"]
+      : pathname === "/styles.css"
+        ? ["styles.css", "text/css; charset=utf-8"]
+        : pathname === "/app.js"
+          ? ["app.js", "text/javascript; charset=utf-8"]
+          : null;
   if (!file) return null;
   const headers = new Headers({
     "cache-control": "no-store",
@@ -249,7 +257,7 @@ async function demoStatic(method: string, pathname: string): Promise<Response | 
     "x-content-type-options": "nosniff",
   });
   if (method === "HEAD") return new Response(null, { headers });
-  return new Response(await Deno.readFile(new URL(file[0], STATIC_ROOT)), { headers });
+  return new Response(Bun.file(new URL(file[0], STATIC_ROOT)), { headers });
 }
 
 function json(body: unknown, init: ResponseInit = {}): Response {

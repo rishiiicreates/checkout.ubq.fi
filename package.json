@@ -1,0 +1,35 @@
+{
+  "name": "uos-checkout",
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/bun": "1.4.3",
+    "eslint": "10.13.0",
+    "miniflare": "5.20261012.1-beta",
+    "prettier": "3.9.10",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.71.2",
+    "wrangler": "4.151.1"
+  },
+  "engines": {
+    "bun": "1.4.0"
+  },
+  "packageManager": "bun@1.4.0",
+  "private": true,
+  "scripts": {
+    "dev": "bun --watch bun.ts",
+    "start": "bun bun.ts",
+    "demo": "bun demo/main.ts",
+    "fmt": "bun x --bun prettier --check .",
+    "lint": "bun x --bun eslint .",
+    "typecheck": "bun x --bun tsc --noEmit -p tsconfig.json && bun x --bun tsc --noEmit -p tsconfig.worker.json",
+    "test": "bun --no-env-file test main_test.ts src/",
+    "test:anvil": "bun --no-env-file test demo/e2e_test.ts --timeout 120000",
+    "test:workers": "bun --no-env-file test tests/worker_test.ts --timeout 60000",
+    "check": "bun run fmt && bun run lint && bun run typecheck && bun run test && bun run test:workers",
+    "deploy:types": "WRANGLER_LOG_PATH=.wrangler/logs/wrangler.log WRANGLER_SEND_METRICS=false bun x wrangler types worker-configuration.d.ts && bun scripts/normalize_worker_types.ts",
+    "deploy:dry-run": "WRANGLER_LOG_PATH=.wrangler/logs/wrangler.log WRANGLER_SEND_METRICS=false bun x wrangler deploy --dry-run --outdir .worker-build",
+    "deploy": "WRANGLER_LOG_PATH=.wrangler/logs/wrangler.log WRANGLER_SEND_METRICS=false bun x wrangler deploy",
+    "deploy:verify": "bun scripts/verify_deployment.ts"
+  },
+  "type": "module"
+}

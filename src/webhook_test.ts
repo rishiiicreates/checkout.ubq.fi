@@ -1,7 +1,12 @@
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import { test } from "bun:test";
+import {
+  ok as assert,
+  deepStrictEqual as assertEquals,
+  rejects as assertRejects,
+} from "node:assert/strict";
 import { postPinnedWebhook } from "./webhook.ts";
 
-Deno.test("webhook delivery dials a validated address while preserving the TLS hostname", async () => {
+test("webhook delivery dials a validated address while preserving the TLS hostname", async () => {
   const writes: Uint8Array[] = [];
   const response = new TextEncoder().encode(
     "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -47,7 +52,7 @@ Deno.test("webhook delivery dials a validated address while preserving the TLS h
   assert(request.endsWith('\r\n\r\n{"eventJws":"signed"}'));
 });
 
-Deno.test("webhook delivery rejects DNS rebinding before writing the payload", async () => {
+test("webhook delivery rejects DNS rebinding before writing the payload", async () => {
   let writes = 0;
   let closed = 0;
   await assertRejects(
@@ -76,14 +81,13 @@ Deno.test("webhook delivery rejects DNS rebinding before writing the payload", a
             }),
         },
       ),
-    Error,
-    "webhook_address_changed",
+    /webhook_address_changed/,
   );
   assertEquals(writes, 0);
   assertEquals(closed, 1);
 });
 
-Deno.test("webhook delivery accepts the address selected from the validated set", async () => {
+test("webhook delivery accepts the address selected from the validated set", async () => {
   const response = new TextEncoder().encode(
     "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
   );

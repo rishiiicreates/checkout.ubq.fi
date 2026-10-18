@@ -1,3 +1,6 @@
+import { WorkerBudgetError } from "./src/worker_budget.ts";
+import type { FetchLike } from "./src/rpc.ts";
+import type { Kv } from "./src/kv.ts";
 import {
   AdminAuthError,
   type AdminAuthService,
@@ -10,17 +13,11 @@ import {
   type MerchantScope,
 } from "./src/merchant_auth.ts";
 import { type CompactJwsSigner, createPersistentJwsSigner, JwsError } from "./src/jws.ts";
-import { UbqKv } from "./src/ubq_kv.ts";
 import { createPaymentService, type PaymentService } from "./src/payment_service.ts";
 import { type InvoiceJson, PaymentDomainError } from "./src/payment_types.ts";
 import { HttpRpcClient, type RpcClient, RpcError, RpcVerificationError } from "./src/rpc.ts";
-import {
-  postPinnedWebhook,
-  type ResolvedWebhookTarget,
-  type WebhookDeliveryResponse,
-} from "./src/webhook.ts";
+import { type ResolvedWebhookTarget, type WebhookDeliveryResponse } from "./src/webhook.ts";
 
-const STATIC_ROOT = new URL("./public/", import.meta.url);
 const LINKEDIN_MERCHANT_ID = "linkedin-scraper-2025";
 const ADMIN_MUTATION_HEADER = "x-uos-requested-with";
 const ADMIN_MUTATION_VALUE = "checkout-admin";
@@ -32,11 +29,13 @@ const OUTBOX_MAX_EVENTS_PER_RUN = 1_000;
 type MerchantAuthService = ReturnType<typeof createMerchantAuthService>;
 
 export type CheckoutServices = {
-  kv: Deno.Kv;
+  kv: Kv;
+  rpc: RpcClient;
   adminAuth: AdminAuthService;
   merchantAuth: MerchantAuthService;
   payment: PaymentService;
-  fetcher: typeof fetch;
+  fetcher: FetchLike;
+  assetFetcher: (request: Request) => Promise<Response>;
   webhookSender: (
     target: ResolvedWebhookTarget,
     body: string,
@@ -45,7 +44,8 @@ export type CheckoutServices = {
 };
 
 type CheckoutServiceOptions = {
-  fetch?: typeof fetch;
+  fetch?: FetchLike;
+  assetFetcher?: CheckoutServices["assetFetcher"];
   rpc?: RpcClient;
   signer?: CompactJwsSigner;
   resolveDns?: (hostname: string, recordType: "A" | "AAAA") => Promise<string[]>;
@@ -53,22 +53,29 @@ type CheckoutServiceOptions = {
 };
 
 export function createCheckoutServices(
-  kv: Deno.Kv,
+  kv: Kv,
   options: CheckoutServiceOptions = {},
 ): CheckoutServices {
   const fetcher = options.fetch ?? fetch;
   const signer = options.signer ?? createPersistentJwsSigner(kv);
+  const rpc = options.rpc ?? new HttpRpcClient(fetcher);
   return {
     kv,
+    rpc,
     adminAuth: createAdminAuthService(kv, { fetch: fetcher }),
     merchantAuth: createMerchantAuthService(kv, { resolveDns: options.resolveDns }),
     payment: createPaymentService({
       kv,
-      rpc: options.rpc ?? new HttpRpcClient(fetcher),
+      rpc,
       signer,
     }),
     fetcher,
-    webhookSender: options.webhookSender ?? postPinnedWebhook,
+    assetFetcher: options.assetFetcher ?? (async () => new Response(null, { status: 404 })),
+    webhookSender:
+      options.webhookSender ??
+      (async () => {
+        throw new Error("webhook_transport_required");
+      }),
   };
 }
 
@@ -212,15 +219,18 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
     const idempotencyKey = request.headers.get("idempotency-key")?.trim();
     if (!idempotencyKey) throw new HttpError(400, "idempotency_key_required");
     const body = await requestJson(request);
-    const invoice = await services.payment.createInvoice({
-      merchantId: principal.merchant.id,
-      idempotencyKey,
-    }, {
-      customerReference: body.customerReference,
-      pricingVersionId: body.pricingVersionId,
-      productId: body.productId,
-      chainId: body.chainId,
-    });
+    const invoice = await services.payment.createInvoice(
+      {
+        merchantId: principal.merchant.id,
+        idempotencyKey,
+      },
+      {
+        customerReference: body.customerReference,
+        pricingVersionId: body.pricingVersionId,
+        productId: body.productId,
+        chainId: body.chainId,
+      },
+    );
     return json(invoice, { status: 201 });
   }
 
@@ -249,7 +259,7 @@ async function route(request: Request, services: CheckoutServices): Promise<Resp
   }
 
   if (request.method === "GET" || request.method === "HEAD") {
-    const staticResponse = maybeStatic(request, url);
+    const staticResponse = maybeStatic(request, url, services.assetFetcher);
     if (staticResponse) return staticResponse;
   }
 
@@ -279,12 +289,11 @@ async function adminOverview(services: CheckoutServices) {
       awaiting: count(["awaiting_payment", "confirming"]),
       provisional: count(["provisionally_paid"]),
       settled: count(["settled", "finalized"]),
-      review:
-        invoices.filter((invoice: InvoiceJson) =>
-          invoice.requiresManualReview || ["late_payment", "manual_review", "reverted"].includes(
-            invoice.status,
-          )
-        ).length,
+      review: invoices.filter(
+        (invoice: InvoiceJson) =>
+          invoice.requiresManualReview ||
+          ["late_payment", "manual_review", "reverted"].includes(invoice.status),
+      ).length,
     },
     chains: storedChains,
     merchant,
@@ -293,25 +302,40 @@ async function adminOverview(services: CheckoutServices) {
   };
 }
 
-export async function runHourlyMaintenance(services: CheckoutServices): Promise<void> {
+export async function runHourlyMaintenance(
+  services: CheckoutServices,
+  deadline = Number.POSITIVE_INFINITY,
+  options: { chainId?: number; maxOutboxEvents?: number } = {},
+): Promise<void> {
   const chains = await services.payment.listChainConfigurations();
   for (const chain of chains) {
-    if (chain.revision === 0) continue;
+    if (Date.now() >= deadline) return;
+    if (
+      chain.revision === 0 ||
+      (options.chainId !== undefined && chain.chainId !== options.chainId)
+    )
+      continue;
     try {
       await services.payment.reconcileHourly(chain.chainId);
     } catch (error) {
       console.error("checkout_reconciliation_chain_failed", chain.chainId, error);
     }
   }
-  await deliverOutbox(services);
+  if (options.maxOutboxEvents !== 0)
+    await deliverOutbox(services, deadline, options.maxOutboxEvents);
 }
 
-export async function deliverOutbox(services: CheckoutServices): Promise<void> {
-  let remaining = OUTBOX_MAX_EVENTS_PER_RUN;
-  while (remaining > 0) {
+export async function deliverOutbox(
+  services: CheckoutServices,
+  deadline = Number.POSITIVE_INFINITY,
+  maxEvents = OUTBOX_MAX_EVENTS_PER_RUN,
+): Promise<void> {
+  let remaining = maxEvents;
+  while (remaining > 0 && Date.now() < deadline) {
     const pageSize = Math.min(OUTBOX_PAGE_SIZE, remaining);
     const events = await services.payment.listOutbox(pageSize);
     for (const event of events) {
+      if (Date.now() >= deadline) return;
       const merchant = await services.merchantAuth.getMerchant(event.payload.merchantId);
       if (!merchant) {
         await services.payment.markOutboxFailed(event.id, "merchant_not_found");
@@ -324,7 +348,7 @@ export async function deliverOutbox(services: CheckoutServices): Promise<void> {
         const response = await services.webhookSender(
           target,
           JSON.stringify({ eventJws: event.compactJws }),
-          AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+          AbortSignal.timeout(Math.max(1, Math.min(WEBHOOK_TIMEOUT_MS, deadline - Date.now()))),
         );
         if (response.ok) {
           await services.payment.markOutboxDelivered(event.id);
@@ -342,13 +366,27 @@ export async function deliverOutbox(services: CheckoutServices): Promise<void> {
   }
 }
 
-export function withPeerAddress(request: Request, peerAddress: string): Request {
+export function withPeerAddress(
+  request: Request,
+  peerAddress: string,
+  requestUrl = request.url,
+): Request {
   const headers = new Headers(request.headers);
   headers.delete(LOCAL_PEER_HEADER);
   if (peerAddress === "127.0.0.1" || peerAddress === "::1") {
     headers.set(LOCAL_PEER_HEADER, peerAddress);
   }
-  return new Request(request, { headers });
+  const init: RequestInit & { duplex: "half" } = {
+    method: request.method,
+    headers,
+    signal: request.signal,
+    redirect: request.redirect,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+    duplex: "half",
+  };
+  // Bun 1.4 merges original Request headers even when init.headers is empty.
+  // Construct from the URL so removing the trust marker cannot retain it.
+  return new Request(requestUrl, init);
 }
 
 function requireAdminMutation(request: Request): void {
@@ -366,9 +404,26 @@ async function requestJson(request: Request): Promise<Record<string, unknown>> {
   if (Number.isFinite(contentLength) && contentLength > JSON_BODY_LIMIT_BYTES) {
     throw new HttpError(413, "request_body_too_large");
   }
-  const text = await request.text();
-  if (new TextEncoder().encode(text).byteLength > JSON_BODY_LIMIT_BYTES) {
-    throw new HttpError(413, "request_body_too_large");
+  const reader = request.body?.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  if (reader) {
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > JSON_BODY_LIMIT_BYTES) {
+          await reader.cancel();
+          throw new HttpError(413, "request_body_too_large");
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      text += decoder.decode();
+    } finally {
+      reader.releaseLock();
+    }
   }
   if (!text.trim()) return {};
   try {
@@ -401,20 +456,29 @@ function memberRole(value: unknown): "admin" | "viewer" {
   throw new HttpError(400, "invalid_member_role");
 }
 
-function maybeStatic(request: Request, url: URL): Response | Promise<Response> | null {
+function maybeStatic(
+  request: Request,
+  url: URL,
+  assetFetcher: CheckoutServices["assetFetcher"],
+): Response | Promise<Response> | null {
   if (url.pathname === "/" || url.pathname === "/index.html") {
-    return staticFile("index.html", "text/html; charset=utf-8", request.method);
+    return staticFile("index.html", "text/html; charset=utf-8", request, assetFetcher);
   }
   if (url.pathname === "/styles.css") {
-    return staticFile("styles.css", "text/css; charset=utf-8", request.method);
+    return staticFile("styles.css", "text/css; charset=utf-8", request, assetFetcher);
   }
   if (url.pathname === "/app.js") {
-    return staticFile("app.js", "text/javascript; charset=utf-8", request.method);
+    return staticFile("app.js", "text/javascript; charset=utf-8", request, assetFetcher);
   }
   return null;
 }
 
-async function staticFile(name: string, contentType: string, method: string): Promise<Response> {
+async function staticFile(
+  name: string,
+  contentType: string,
+  request: Request,
+  assetFetcher: CheckoutServices["assetFetcher"],
+): Promise<Response> {
   const headers = new Headers({
     "cache-control": name === "index.html" ? "no-cache" : "public, max-age=300",
     "content-type": contentType,
@@ -423,8 +487,12 @@ async function staticFile(name: string, contentType: string, method: string): Pr
     "referrer-policy": "no-referrer",
     "x-content-type-options": "nosniff",
   });
-  if (method === "HEAD") return new Response(null, { headers });
-  return new Response(await Deno.readFile(new URL(name, STATIC_ROOT)), { headers });
+  if (request.method === "HEAD") return new Response(null, { headers });
+  const asset = await assetFetcher(
+    new Request(new URL(name === "index.html" ? "/" : `/${name}`, request.url)),
+  );
+  if (!asset.ok) throw new Error("static_asset_unavailable");
+  return new Response(asset.body, { headers });
 }
 
 function json(body: unknown, init: ResponseInit = {}): Response {
@@ -436,18 +504,23 @@ function json(body: unknown, init: ResponseInit = {}): Response {
 
 function httpError(error: unknown): { status: number; code: string } {
   if (
-    error instanceof HttpError || error instanceof AdminAuthError ||
-    error instanceof MerchantAuthError
+    error instanceof HttpError ||
+    error instanceof AdminAuthError ||
+    error instanceof MerchantAuthError ||
+    error instanceof WorkerBudgetError
   ) {
     return { status: error.status, code: error.message };
   }
   if (error instanceof PaymentDomainError) {
     if (error.code.endsWith("_not_found")) return { status: 404, code: error.code };
     if (
-      error.code.includes("conflict") || error.code.includes("already_claimed") ||
-      error.code === "amount_space_exhausted" || error.code === "chain_disabled" ||
+      error.code.includes("conflict") ||
+      error.code.includes("already_claimed") ||
+      error.code === "amount_space_exhausted" ||
+      error.code === "chain_disabled" ||
       error.code === "chain_not_configured"
-    ) return { status: 409, code: error.code };
+    )
+      return { status: 409, code: error.code };
     return { status: 400, code: error.code };
   }
   if (error instanceof RpcVerificationError) return { status: 422, code: error.code };
@@ -457,60 +530,11 @@ function httpError(error: unknown): { status: number; code: string } {
 }
 
 class HttpError extends Error {
-  constructor(public readonly status: number, message: string) {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
     super(message);
     this.name = "HttpError";
   }
-}
-
-if (import.meta.main) {
-  const kv = await openCheckoutKv();
-  const services = createCheckoutServices(kv);
-  const handler = createHandler(services);
-  const maintenanceIntervalMs = Number(readEnv("CHECKOUT_MAINTENANCE_INTERVAL_MS") ?? "");
-  if (Deno.env.get("DENO_DEPLOYMENT_ID")) {
-    Deno.cron("hourly checkout reconciliation", "0 * * * *", () => runHourlyMaintenance(services));
-  } else if (Number.isSafeInteger(maintenanceIntervalMs) && maintenanceIntervalMs > 0) {
-    // Hosted runs without Deno.cron (the VPS) keep the same hourly maintenance
-    // by setting CHECKOUT_MAINTENANCE_INTERVAL_MS.
-    setInterval(() => {
-      runHourlyMaintenance(services).catch((error) => {
-        console.error("checkout maintenance failed:", error);
-      });
-    }, maintenanceIntervalMs);
-  }
-  Deno.serve({ port: parsePort(readEnv("PORT")) }, (request, info) => {
-    const remoteAddress = info.remoteAddr;
-    const peerAddress = "hostname" in remoteAddress ? remoteAddress.hostname : "";
-    return handler(withPeerAddress(request, peerAddress));
-  });
-}
-
-/**
- * KV selection, in priority order:
- * 1. CHECKOUT_KV_SERVICE_URL + CHECKOUT_KV_SERVICE_TOKEN -> the UBQ KV service
- *    on Cloudflare D1 (the hosted canonical store).
- * 2. CHECKOUT_KV_URL -> a local sqlite path or a remote Deno KV connect URL.
- * 3. Unset -> the local Deno default (development and tests).
- */
-export async function openCheckoutKv(): Promise<Deno.Kv> {
-  const serviceUrl = readEnv("CHECKOUT_KV_SERVICE_URL");
-  const serviceToken = readEnv("CHECKOUT_KV_SERVICE_TOKEN");
-  if (serviceUrl && serviceToken) {
-    return new UbqKv({ url: serviceUrl, token: serviceToken }) as unknown as Deno.Kv;
-  }
-  return await Deno.openKv(readEnv("CHECKOUT_KV_URL"));
-}
-
-function readEnv(name: string): string | undefined {
-  try {
-    return Deno.env.get(name)?.trim() || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function parsePort(raw: string | undefined): number {
-  const parsed = Number.parseInt(raw ?? "", 10);
-  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : 8000;
 }

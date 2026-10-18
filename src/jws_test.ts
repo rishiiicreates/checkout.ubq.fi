@@ -1,7 +1,10 @@
+import { SqliteKv } from "./sqlite_kv.ts";
+import { inspect } from "node:util";
+import { test } from "bun:test";
 import { createPersistentJwsSigner, JwsError, verifyCompactJws } from "./jws.ts";
 
-Deno.test("RS256 keypair and kid persist in KV and publish a verifiable JWKS", async () => {
-  const kv = await Deno.openKv(":memory:");
+test("RS256 keypair and kid persist in KV and publish a verifiable JWKS", async () => {
+  const kv = new SqliteKv(":memory:");
   try {
     const first = createPersistentJwsSigner(kv, {
       now: () => new Date("2026-07-21T12:00:00.000Z"),
@@ -31,8 +34,8 @@ Deno.test("RS256 keypair and kid persist in KV and publish a verifiable JWKS", a
   }
 });
 
-Deno.test("concurrent signer initialization converges on one active key", async () => {
-  const kv = await Deno.openKv(":memory:");
+test("concurrent signer initialization converges on one active key", async () => {
+  const kv = new SqliteKv(":memory:");
   try {
     const signers = Array.from({ length: 4 }, () => createPersistentJwsSigner(kv));
     const kids = await Promise.all(signers.map((signer) => signer.kid()));
@@ -42,8 +45,8 @@ Deno.test("concurrent signer initialization converges on one active key", async 
   }
 });
 
-Deno.test("tampered compact JWS fails verification", async () => {
-  const kv = await Deno.openKv(":memory:");
+test("tampered compact JWS fails verification", async () => {
+  const kv = new SqliteKv(":memory:");
   try {
     const signer = createPersistentJwsSigner(kv);
     const compact = await signer.sign({ amount: "1" });
@@ -51,10 +54,7 @@ Deno.test("tampered compact JWS fails verification", async () => {
     const replacement = parts[1].endsWith("A") ? "B" : "A";
     parts[1] = `${parts[1].slice(0, -1)}${replacement}`;
     const jwks = await signer.jwks();
-    await assertRejectsCode(
-      () => verifyCompactJws(parts.join("."), jwks),
-      "invalid_jws_signature",
-    );
+    await assertRejectsCode(() => verifyCompactJws(parts.join("."), jwks), "invalid_jws_signature");
   } finally {
     kv.close();
   }
@@ -65,13 +65,13 @@ async function assertRejectsCode(fn: () => Promise<unknown>, code: string): Prom
     await fn();
   } catch (error) {
     if (error instanceof JwsError && error.code === code) return;
-    throw new Error(`Expected ${code}, got ${String(error)}`);
+    throw new Error(`Expected ${code}, got ${String(error)}`, { cause: error });
   }
   throw new Error(`Expected rejection ${code}`);
 }
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`Expected ${Deno.inspect(expected)}, got ${Deno.inspect(actual)}`);
+    throw new Error(`Expected ${inspect(expected)}, got ${inspect(actual)}`);
   }
 }

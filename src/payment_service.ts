@@ -1,3 +1,4 @@
+import type { KvKey, Kv, KvEntryMaybe, KvAtomic } from "./kv.ts";
 import { type CompactJwsSigner } from "./jws.ts";
 import {
   catalogVersionKey,
@@ -43,20 +44,20 @@ import {
   verifyTransferBatch,
 } from "./rpc.ts";
 
-const PREFIX: Deno.KvKey = ["uos_checkout", "v1", "payments"];
-const INVOICES_PREFIX: Deno.KvKey = [...PREFIX, "invoices"];
-const PAYMENTS_PREFIX: Deno.KvKey = [...PREFIX, "payment_records"];
-const LOCATORS_PREFIX: Deno.KvKey = [...PREFIX, "payment_locators"];
-const RESERVATIONS_PREFIX: Deno.KvKey = [...PREFIX, "amount_reservations"];
-const OPEN_INVOICES_PREFIX: Deno.KvKey = [...PREFIX, "open_invoices"];
-const IDEMPOTENCY_PREFIX: Deno.KvKey = [...PREFIX, "idempotency"];
-const INVOICES_BY_CHAIN_PREFIX: Deno.KvKey = [...PREFIX, "invoices_by_chain"];
-const HEADS_PREFIX: Deno.KvKey = [...PREFIX, "chain_heads"];
-const EVENTS_PREFIX: Deno.KvKey = [...PREFIX, "events"];
-const EVENTS_BY_INVOICE_PREFIX: Deno.KvKey = [...PREFIX, "events_by_invoice"];
-const OUTBOX_PREFIX: Deno.KvKey = [...PREFIX, "outbox"];
-const CURSORS_PREFIX: Deno.KvKey = [...PREFIX, "reconciliation_cursors"];
-const CHAIN_SETTINGS_PREFIX: Deno.KvKey = [...PREFIX, "chain_settings"];
+const PREFIX: KvKey = ["uos_checkout", "v1", "payments"];
+const INVOICES_PREFIX: KvKey = [...PREFIX, "invoices"];
+const PAYMENTS_PREFIX: KvKey = [...PREFIX, "payment_records"];
+const LOCATORS_PREFIX: KvKey = [...PREFIX, "payment_locators"];
+const RESERVATIONS_PREFIX: KvKey = [...PREFIX, "amount_reservations"];
+const OPEN_INVOICES_PREFIX: KvKey = [...PREFIX, "open_invoices"];
+const IDEMPOTENCY_PREFIX: KvKey = [...PREFIX, "idempotency"];
+const INVOICES_BY_CHAIN_PREFIX: KvKey = [...PREFIX, "invoices_by_chain"];
+const HEADS_PREFIX: KvKey = [...PREFIX, "chain_heads"];
+const EVENTS_PREFIX: KvKey = [...PREFIX, "events"];
+const EVENTS_BY_INVOICE_PREFIX: KvKey = [...PREFIX, "events_by_invoice"];
+const OUTBOX_PREFIX: KvKey = [...PREFIX, "outbox"];
+const CURSORS_PREFIX: KvKey = [...PREFIX, "reconciliation_cursors"];
+const CHAIN_SETTINGS_PREFIX: KvKey = [...PREFIX, "chain_settings"];
 
 const EVENT_ISSUER = "https://checkout.ubq.fi";
 const EVENT_TTL_SECONDS = 24 * 60 * 60;
@@ -70,7 +71,7 @@ const MAX_AMOUNT_RESERVATION_PROBES = 64;
 export type IdGenerator = { next(): string };
 
 export type PaymentServiceOptions = {
-  kv: Deno.Kv;
+  kv: Kv;
   rpc: RpcClient;
   signer: CompactJwsSigner;
   clock?: Clock;
@@ -158,14 +159,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       context: MerchantContext,
       pricingVersionId: unknown,
       projection: unknown,
-    ) =>
-      publishCatalogVersion(
-        kv,
-        merchantId(context),
-        pricingVersionId,
-        projection,
-        clock,
-      ),
+    ) => publishCatalogVersion(kv, merchantId(context), pricingVersionId, projection, clock),
     getCatalogVersion: (context: MerchantContext, pricingVersionId: unknown) =>
       getCatalogVersion(kv, merchantId(context), pricingVersionId),
     configureChain: (chainId: unknown, input: { enabled: unknown; treasuryAddress: unknown }) =>
@@ -211,7 +205,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
     if (
       treasuryAddress === "0x0000000000000000000000000000000000000000" ||
       treasuryAddress === normalizeAddress(chain.tokenAddress)
-    ) throw new PaymentDomainError("invalid_treasury_address");
+    )
+      throw new PaymentDomainError("invalid_treasury_address");
     while (true) {
       const existing = await kv.get<PaymentChainSettings>(chainSettingsKey(chainId));
       const record: PaymentChainSettings = {
@@ -237,9 +232,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const customerReference = boundedText(input.customerReference, "customer_reference", 256);
     const pricingVersionId = boundedText(input.pricingVersionId, "pricing_version_id", 128);
     const productId = boundedText(input.productId, "product_id", 128);
-    const chainId = input.chainId === undefined
-      ? DEFAULT_CHAIN_ID
-      : supportedChainId(input.chainId);
+    const chainId =
+      input.chainId === undefined ? DEFAULT_CHAIN_ID : supportedChainId(input.chainId);
     const requestFingerprint = JSON.stringify({
       merchant,
       customerReference,
@@ -276,7 +270,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
         if (open.value.requestFingerprint !== requestFingerprint) {
           throw new PaymentDomainError("open_invoice_conflict");
         }
-        const committed = await kv.atomic()
+        const committed = await kv
+          .atomic()
           .check(idempotency)
           .check(open)
           .set(idempotencyKeyEntry, open.value)
@@ -290,8 +285,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
       );
       const version = versionEntry.value;
       if (!version) throw new PaymentDomainError("catalog_version_not_found");
-      const product = version.projection.products.find((candidate) =>
-        candidate.productId === productId
+      const product = version.projection.products.find(
+        (candidate) => candidate.productId === productId,
       );
       if (!product) throw new PaymentDomainError("catalog_product_not_found");
       if (!product.enabled) throw new PaymentDomainError("catalog_product_disabled");
@@ -322,15 +317,13 @@ export function createPaymentService(options: PaymentServiceOptions) {
           kv.get<IdempotencyIndex>(idempotencyKeyEntry),
         ]);
         if (currentIdempotency.value || currentOpen.value) break;
-        let reservedInvoice: Deno.KvEntryMaybe<InvoiceRecord> | null = null;
+        let reservedInvoice: KvEntryMaybe<InvoiceRecord> | null = null;
         if (reservation.value !== null) {
           if (typeof reservation.value.invoiceId !== "string") {
             candidate = nextDiscount(candidate);
             continue;
           }
-          reservedInvoice = await kv.get<InvoiceRecord>(
-            invoiceKey(reservation.value.invoiceId),
-          );
+          reservedInvoice = await kv.get<InvoiceRecord>(invoiceKey(reservation.value.invoiceId));
           if (!reservationCanBeReused(reservedInvoice.value, now)) {
             candidate = nextDiscount(candidate);
             continue;
@@ -364,7 +357,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
           updatedAt: timestamp,
         };
         const index: OpenInvoiceIndex = { invoiceId, requestFingerprint };
-        let atomic = kv.atomic()
+        let atomic = kv
+          .atomic()
           .check(versionEntry)
           .check(chainSettingsEntry)
           .check(reservation)
@@ -407,9 +401,10 @@ export function createPaymentService(options: PaymentServiceOptions) {
       input.observedBlockNumber,
       "invalid_observed_block_number",
     );
-    const observedBlockHash = input.observedBlockHash === undefined
-      ? undefined
-      : boundedText(input.observedBlockHash, "observed_block_hash", 66);
+    const observedBlockHash =
+      input.observedBlockHash === undefined
+        ? undefined
+        : boundedText(input.observedBlockHash, "observed_block_hash", 66);
     const locatorKey = paymentLocatorKey(invoice.chainId, transactionHash, logIndex);
     const existingLocator = await kv.get<LocatorIndex>(locatorKey);
     if (existingLocator.value) {
@@ -451,8 +446,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
   }
 
   async function reincludeRevertedPayment(
-    invoiceEntry: Deno.KvEntryMaybe<InvoiceRecord>,
-    locatorEntry: Deno.KvEntryMaybe<LocatorIndex>,
+    invoiceEntry: KvEntryMaybe<InvoiceRecord>,
+    locatorEntry: KvEntryMaybe<LocatorIndex>,
     transactionHash: string,
     logIndex: number,
     observedBlockNumber: bigint,
@@ -520,7 +515,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const event = sealed
       ? await makeEvent("payment.accepted.v1", nextInvoice, nextPayment, timestamp)
       : undefined;
-    let atomic = kv.atomic()
+    let atomic = kv
+      .atomic()
       .check(invoiceEntry)
       .check(paymentEntry)
       .check(locatorEntry)
@@ -531,13 +527,10 @@ export function createPaymentService(options: PaymentServiceOptions) {
       .set(headKey(invoice.chainId), heads)
       .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id);
     if (openEntry.value === null) {
-      atomic = atomic.set(
-        openKey,
-        {
-          invoiceId: invoice.id,
-          requestFingerprint: invoiceRequestFingerprint(invoice),
-        } satisfies OpenInvoiceIndex,
-      );
+      atomic = atomic.set(openKey, {
+        invoiceId: invoice.id,
+        requestFingerprint: invoiceRequestFingerprint(invoice),
+      } satisfies OpenInvoiceIndex);
     }
     if (event) atomic = addEventMutations(atomic, event);
     if (!(await atomic.commit()).ok) {
@@ -552,9 +545,9 @@ export function createPaymentService(options: PaymentServiceOptions) {
   }
 
   async function recordPrimaryPayment(
-    invoiceEntry: Deno.KvEntryMaybe<InvoiceRecord>,
-    locatorKey: Deno.KvKey,
-    locatorEntry: Deno.KvEntryMaybe<LocatorIndex>,
+    invoiceEntry: KvEntryMaybe<InvoiceRecord>,
+    locatorKey: KvKey,
+    locatorEntry: KvEntryMaybe<LocatorIndex>,
     evidence: VerifiedTransfer,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
@@ -589,8 +582,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
       invoice.chainId,
     );
     const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
-    const conflictingOpen = !includedLate && openEntry.value !== null &&
-      openEntry.value.invoiceId !== invoice.id;
+    const conflictingOpen =
+      !includedLate && openEntry.value !== null && openEntry.value.invoiceId !== invoice.id;
     let nextInvoice: InvoiceRecord = {
       ...invoice,
       paymentId,
@@ -601,7 +594,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
 
     let event: OutboxEventRecord | undefined;
     if (
-      !includedLate && !conflictingOpen &&
+      !includedLate &&
+      !conflictingOpen &&
       heads.latestBlock >= evidence.blockNumber + SEALED_BLOCKS_REQUIRED
     ) {
       nextInvoice = { ...nextInvoice, status: "provisionally_paid", acceptedAt: timestamp };
@@ -610,28 +604,27 @@ export function createPaymentService(options: PaymentServiceOptions) {
       event = await makeEvent("payment.accepted.v1", nextInvoice, payment, timestamp);
     }
 
-    let atomic = kv.atomic()
+    let atomic = kv
+      .atomic()
       .check(invoiceEntry)
       .check(locatorEntry)
       .check(headsEntry)
       .check(openEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(paymentId), payment)
-      .set(
-        locatorKey,
-        { invoiceId: invoice.id, paymentId, duplicate: false } satisfies LocatorIndex,
-      )
+      .set(locatorKey, {
+        invoiceId: invoice.id,
+        paymentId,
+        duplicate: false,
+      } satisfies LocatorIndex)
       .set(headKey(invoice.chainId), heads);
     if (includedLate && openEntry.value?.invoiceId === invoice.id) {
       atomic = atomic.delete(openKey);
     } else if (!includedLate && !conflictingOpen && openEntry.value === null) {
-      atomic = atomic.set(
-        openKey,
-        {
-          invoiceId: invoice.id,
-          requestFingerprint: invoiceRequestFingerprint(invoice),
-        } satisfies OpenInvoiceIndex,
-      );
+      atomic = atomic.set(openKey, {
+        invoiceId: invoice.id,
+        requestFingerprint: invoiceRequestFingerprint(invoice),
+      } satisfies OpenInvoiceIndex);
     }
     if (includedLate || conflictingOpen) {
       atomic = atomic.delete(invoiceByChainKey(invoice.chainId, invoice.id));
@@ -650,9 +643,9 @@ export function createPaymentService(options: PaymentServiceOptions) {
   }
 
   async function recordDuplicatePayment(
-    invoiceEntry: Deno.KvEntryMaybe<InvoiceRecord>,
-    locatorKey: Deno.KvKey,
-    locatorEntry: Deno.KvEntryMaybe<LocatorIndex>,
+    invoiceEntry: KvEntryMaybe<InvoiceRecord>,
+    locatorKey: KvKey,
+    locatorEntry: KvEntryMaybe<LocatorIndex>,
     evidence: VerifiedTransfer,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
@@ -688,13 +681,17 @@ export function createPaymentService(options: PaymentServiceOptions) {
       invoice.chainId,
     );
     const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
-    let atomic = kv.atomic().check(invoiceEntry).check(locatorEntry)
+    let atomic = kv
+      .atomic()
+      .check(invoiceEntry)
+      .check(locatorEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(paymentId), payment)
-      .set(
-        locatorKey,
-        { invoiceId: invoice.id, paymentId, duplicate: true } satisfies LocatorIndex,
-      );
+      .set(locatorKey, {
+        invoiceId: invoice.id,
+        paymentId,
+        duplicate: true,
+      } satisfies LocatorIndex);
     if (openEntry.value?.invoiceId === invoice.id) atomic = atomic.check(openEntry).delete(openKey);
     const committed = await atomic.commit();
     if (!committed.ok) throw new PaymentDomainError("payment_claim_conflict");
@@ -751,14 +748,16 @@ export function createPaymentService(options: PaymentServiceOptions) {
       nextPayment = { ...payment, phase: "accepted", acceptedAt: timestamp, updatedAt: timestamp };
       event = await makeEvent("payment.accepted.v1", nextInvoice, nextPayment, timestamp);
     } else if (
-      invoice.status === "provisionally_paid" && heads.safeBlock !== null &&
+      invoice.status === "provisionally_paid" &&
+      heads.safeBlock !== null &&
       heads.safeBlock >= payment.blockNumber
     ) {
       nextInvoice = { ...invoice, status: "settled", settledAt: timestamp, updatedAt: timestamp };
       nextPayment = { ...payment, phase: "settled", settledAt: timestamp, updatedAt: timestamp };
       event = await makeEvent("payment.settled.v1", nextInvoice, nextPayment, timestamp);
     } else if (
-      invoice.status === "settled" && heads.finalizedBlock !== null &&
+      invoice.status === "settled" &&
+      heads.finalizedBlock !== null &&
       heads.finalizedBlock >= payment.blockNumber
     ) {
       nextInvoice = {
@@ -784,7 +783,11 @@ export function createPaymentService(options: PaymentServiceOptions) {
       invoice.chainId,
     );
     const openEntry = await kv.get<OpenInvoiceIndex>(openKey);
-    let atomic = kv.atomic().check(invoiceEntry).check(paymentEntry).check(headsEntry)
+    let atomic = kv
+      .atomic()
+      .check(invoiceEntry)
+      .check(paymentEntry)
+      .check(headsEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(payment.id), nextPayment)
       .set(headKey(invoice.chainId), heads);
@@ -801,8 +804,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
   }
 
   async function handleReorg(
-    invoiceEntry: Deno.KvEntryMaybe<InvoiceRecord>,
-    paymentEntry: Deno.KvEntryMaybe<PaymentRecord>,
+    invoiceEntry: KvEntryMaybe<InvoiceRecord>,
+    paymentEntry: KvEntryMaybe<PaymentRecord>,
     reason: string,
   ): Promise<ClaimPaymentResult> {
     const invoice = invoiceEntry.value!;
@@ -831,7 +834,11 @@ export function createPaymentService(options: PaymentServiceOptions) {
         expiredAt: expired ? timestamp : undefined,
         updatedAt: timestamp,
       };
-      let atomic = kv.atomic().check(invoiceEntry).check(paymentEntry).check(locatorEntry)
+      let atomic = kv
+        .atomic()
+        .check(invoiceEntry)
+        .check(paymentEntry)
+        .check(locatorEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
         .delete(paymentKey(payment.id))
         .delete(locatorKey);
@@ -864,7 +871,10 @@ export function createPaymentService(options: PaymentServiceOptions) {
       reason,
     );
     let atomic = addEventMutations(
-      kv.atomic().check(invoiceEntry).check(paymentEntry)
+      kv
+        .atomic()
+        .check(invoiceEntry)
+        .check(paymentEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
         .set(paymentKey(payment.id), nextPayment)
         .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id),
@@ -885,7 +895,8 @@ export function createPaymentService(options: PaymentServiceOptions) {
       if (
         invoice.status !== "awaiting_payment" ||
         clock.now().getTime() < Date.parse(invoice.expiresAt)
-      ) return invoiceJson(invoice);
+      )
+        return invoiceJson(invoice);
       const openKey = openInvoiceKey(
         invoice.merchant,
         invoice.customerReference,
@@ -977,11 +988,12 @@ export function createPaymentService(options: PaymentServiceOptions) {
 
   async function signedExistingEvent(invoiceId: string): Promise<string | undefined> {
     const invoice = await invoiceRecord(kv, invoiceId);
-    const types: PaymentEventType[] = invoice.status === "reverted"
-      ? ["payment.reverted.v1"]
-      : invoice.status === "settled" || invoice.status === "finalized"
-      ? ["payment.settled.v1", "payment.accepted.v1"]
-      : ["payment.accepted.v1"];
+    const types: PaymentEventType[] =
+      invoice.status === "reverted"
+        ? ["payment.reverted.v1"]
+        : invoice.status === "settled" || invoice.status === "finalized"
+          ? ["payment.settled.v1", "payment.accepted.v1"]
+          : ["payment.accepted.v1"];
     for (const type of types) {
       const eventId = (await kv.get<string>(eventByInvoiceKey(invoiceId, type))).value;
       if (!eventId) continue;
@@ -1000,14 +1012,14 @@ export function createPaymentService(options: PaymentServiceOptions) {
     const cursorEntry = await kv.get<ReconciliationCursor>(cursorKey(chainId));
     const invoices = await listReconciliationInvoices(kv, chainId, clock);
     const minimumOutstandingBlock = invoices.reduce(
-      (minimum, invoice) => invoice.minimumBlock < minimum ? invoice.minimumBlock : minimum,
+      (minimum, invoice) => (invoice.minimumBlock < minimum ? invoice.minimumBlock : minimum),
       toBlock,
     );
     const fromBlock = cursorEntry.value
       ? maximum(
-        minimumOutstandingBlock,
-        maximum(0n, cursorEntry.value.blockNumber + 1n - RECONCILIATION_OVERLAP_BLOCKS),
-      )
+          minimumOutstandingBlock,
+          maximum(0n, cursorEntry.value.blockNumber + 1n - RECONCILIATION_OVERLAP_BLOCKS),
+        )
       : minimumOutstandingBlock;
     if (toBlock < fromBlock) throw new PaymentDomainError("reconciliation_range_regressed");
     const watch = { fromBlock, toBlock, invoices };
@@ -1028,29 +1040,37 @@ export function createPaymentService(options: PaymentServiceOptions) {
     requestedToBlock?: bigint,
   ): Promise<ReconciliationWatch> {
     const observedHeads = requestedToBlock === undefined ? await chainHeads(rpc, chainId) : null;
-    const toBlock = requestedToBlock ?? observedHeads!.safeBlock ?? observedHeads!.finalizedBlock ??
+    const toBlock =
+      requestedToBlock ??
+      observedHeads!.safeBlock ??
+      observedHeads!.finalizedBlock ??
       observedHeads!.latestBlock;
     const tokenAddress = CHAIN_CONFIGURATIONS[chainId].tokenAddress;
     return reconcileChainRange(chainId, toBlock, async (watch) => {
       if (watch.invoices.length === 0) return;
       const treasuries = [...new Set(watch.invoices.map((invoice) => invoice.treasuryAddress))];
-      const logs = (await Promise.all(treasuries.map((treasuryAddress) =>
-        discoverTransferLogs(
-          rpc,
-          chainId,
-          tokenAddress,
-          treasuryAddress,
-          watch.fromBlock,
-          watch.toBlock,
+      const logs = (
+        await Promise.all(
+          treasuries.map((treasuryAddress) =>
+            discoverTransferLogs(
+              rpc,
+              chainId,
+              tokenAddress,
+              treasuryAddress,
+              watch.fromBlock,
+              watch.toBlock,
+            ),
+          ),
         )
-      ))).flat();
+      ).flat();
       for (const log of logs) {
-        const invoice = watch.invoices.find((candidate) =>
-          (!candidate.paymentId || candidate.status === "reverted") &&
-          candidate.minimumBlock <= log.blockNumber &&
-          candidate.tokenAddress.toLowerCase() === log.tokenAddress.toLowerCase() &&
-          candidate.treasuryAddress.toLowerCase() === log.recipientAddress.toLowerCase() &&
-          candidate.paidAmountUnits === log.amountUnits
+        const invoice = watch.invoices.find(
+          (candidate) =>
+            (!candidate.paymentId || candidate.status === "reverted") &&
+            candidate.minimumBlock <= log.blockNumber &&
+            candidate.tokenAddress.toLowerCase() === log.tokenAddress.toLowerCase() &&
+            candidate.treasuryAddress.toLowerCase() === log.recipientAddress.toLowerCase() &&
+            candidate.paidAmountUnits === log.amountUnits,
         );
         if (!invoice) continue;
         try {
@@ -1066,14 +1086,16 @@ export function createPaymentService(options: PaymentServiceOptions) {
             error instanceof PaymentDomainError &&
             (error.code === "payment_locator_already_claimed" ||
               error.code === "payment_before_minimum_block")
-          ) continue;
+          )
+            continue;
           throw error;
         }
       }
       for (const watched of watch.invoices) {
         const current = await invoiceRecord(kv, watched.id);
         if (
-          current.paymentId && current.status !== "late_payment" &&
+          current.paymentId &&
+          current.status !== "late_payment" &&
           current.status !== "manual_review"
         ) {
           await refreshInvoice(current.id);
@@ -1086,22 +1108,21 @@ export function createPaymentService(options: PaymentServiceOptions) {
 }
 
 export async function listReconciliationInvoices(
-  kv: Deno.Kv,
+  kv: Kv,
   chainId: SupportedChainId,
   clock: Clock = systemClock,
 ): Promise<InvoiceRecord[]> {
   const invoices: InvoiceRecord[] = [];
   const cutoff = clock.now().getTime() - RECENTLY_EXPIRED_WINDOW_MS;
-  for await (
-    const entry of kv.list<string>({ prefix: [...INVOICES_BY_CHAIN_PREFIX, chainId] })
-  ) {
+  for await (const entry of kv.list<string>({ prefix: [...INVOICES_BY_CHAIN_PREFIX, chainId] })) {
     const invoice = (await kv.get<InvoiceRecord>(invoiceKey(entry.value))).value;
     if (!invoice) {
       await kv.delete(entry.key);
       continue;
     }
     if (
-      isOpenInvoiceStatus(invoice.status) || invoice.status === "confirming" ||
+      isOpenInvoiceStatus(invoice.status) ||
+      invoice.status === "confirming" ||
       invoice.status === "reverted" ||
       (invoice.status === "expired" && Date.parse(invoice.expiredAt ?? invoice.updatedAt) >= cutoff)
     ) {
@@ -1110,11 +1131,11 @@ export async function listReconciliationInvoices(
       await kv.delete(invoiceByChainKey(chainId, invoice.id));
     }
   }
-  return invoices.sort((a, b) => a.minimumBlock < b.minimumBlock ? -1 : a.id.localeCompare(b.id));
+  return invoices.sort((a, b) => (a.minimumBlock < b.minimumBlock ? -1 : a.id.localeCompare(b.id)));
 }
 
 export async function listOutbox(
-  kv: Deno.Kv,
+  kv: Kv,
   signer: CompactJwsSigner,
   clock: Clock = systemClock,
   limit = 100,
@@ -1125,8 +1146,8 @@ export async function listOutbox(
   const events: SignedOutboxEvent[] = [];
   const now = clock.now();
   const selector = {
-    start: [...OUTBOX_PREFIX, 0] as Deno.KvKey,
-    end: [...OUTBOX_PREFIX, now.getTime(), "\uffff"] as Deno.KvKey,
+    start: [...OUTBOX_PREFIX, 0] as KvKey,
+    end: [...OUTBOX_PREFIX, now.getTime(), "\uffff"] as KvKey,
   };
   for await (const entry of kv.list<string>(selector)) {
     const event = (await kv.get<DeliveryEventRecord>(eventKey(entry.value))).value;
@@ -1138,7 +1159,7 @@ export async function listOutbox(
 }
 
 export async function markOutboxDelivered(
-  kv: Deno.Kv,
+  kv: Kv,
   eventIdInput: unknown,
   clock: Clock = systemClock,
 ): Promise<OutboxEventRecord> {
@@ -1149,15 +1170,21 @@ export async function markOutboxDelivered(
     if (entry.value.deliveredAt) return entry.value;
     const next = { ...entry.value, deliveredAt: clock.now().toISOString() };
     if (
-      (await kv.atomic().check(entry).set(eventKey(eventId), next).delete(outboxKey(entry.value))
-        .commit())
-        .ok
-    ) return next;
+      (
+        await kv
+          .atomic()
+          .check(entry)
+          .set(eventKey(eventId), next)
+          .delete(outboxKey(entry.value))
+          .commit()
+      ).ok
+    )
+      return next;
   }
 }
 
 export async function markOutboxFailed(
-  kv: Deno.Kv,
+  kv: Kv,
   eventIdInput: unknown,
   reason: unknown,
   clock: Clock = systemClock,
@@ -1180,7 +1207,9 @@ export async function markOutboxFailed(
       lastError: boundedDeliveryError(reason),
       nextAttemptAt: new Date(attemptedAt.getTime() + delay).toISOString(),
     };
-    const committed = await kv.atomic().check(entry)
+    const committed = await kv
+      .atomic()
+      .check(entry)
       .set(eventKey(eventId), next)
       .delete(outboxKey(entry.value))
       .set(outboxKey(next), eventId)
@@ -1189,14 +1218,14 @@ export async function markOutboxFailed(
   }
 }
 
-export async function invoiceRecord(kv: Deno.Kv, invoiceIdInput: unknown): Promise<InvoiceRecord> {
+export async function invoiceRecord(kv: Kv, invoiceIdInput: unknown): Promise<InvoiceRecord> {
   const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
   const invoice = (await kv.get<InvoiceRecord>(invoiceKey(invoiceId))).value;
   if (!invoice) throw new PaymentDomainError("invoice_not_found");
   return invoice;
 }
 
-export async function listInvoices(kv: Deno.Kv, limit = 50): Promise<InvoiceJson[]> {
+export async function listInvoices(kv: Kv, limit = 50): Promise<InvoiceJson[]> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
     throw new PaymentDomainError("invalid_invoice_limit");
   }
@@ -1211,7 +1240,7 @@ export async function listInvoices(kv: Deno.Kv, limit = 50): Promise<InvoiceJson
 }
 
 export async function getChainConfiguration(
-  kv: Deno.Kv,
+  kv: Kv,
   chainId: SupportedChainId,
 ): Promise<PaymentChainSettings> {
   const settings = (await kv.get<PaymentChainSettings>(chainSettingsKey(chainId))).value;
@@ -1219,12 +1248,10 @@ export async function getChainConfiguration(
   return settings;
 }
 
-export async function listChainConfigurations(
-  kv: Deno.Kv,
-): Promise<PaymentChainConfigurationJson[]> {
+export async function listChainConfigurations(kv: Kv): Promise<PaymentChainConfigurationJson[]> {
   const entries = await Promise.all(
     ([1, 10, 8453] as const).map((chainId) =>
-      kv.get<PaymentChainSettings>(chainSettingsKey(chainId))
+      kv.get<PaymentChainSettings>(chainSettingsKey(chainId)),
     ),
   );
   return ([1, 10, 8453] as const).map((chainId, index) => {
@@ -1240,11 +1267,11 @@ export async function listChainConfigurations(
   });
 }
 
-function invoiceKey(invoiceId: string): Deno.KvKey {
+function invoiceKey(invoiceId: string): KvKey {
   return [...INVOICES_PREFIX, invoiceId];
 }
 
-function paymentKey(paymentId: string): Deno.KvKey {
+function paymentKey(paymentId: string): KvKey {
   return [...PAYMENTS_PREFIX, paymentId];
 }
 
@@ -1252,7 +1279,7 @@ function paymentLocatorKey(
   chainId: SupportedChainId,
   transactionHash: string,
   logIndex: number,
-): Deno.KvKey {
+): KvKey {
   return [...LOCATORS_PREFIX, chainId, transactionHash, logIndex];
 }
 
@@ -1261,7 +1288,7 @@ function amountReservationKey(
   tokenAddress: string,
   treasuryAddress: string,
   paidAmountUnits: bigint,
-): Deno.KvKey {
+): KvKey {
   return [
     ...RESERVATIONS_PREFIX,
     chainId,
@@ -1276,11 +1303,11 @@ function openInvoiceKey(
   customerReference: string,
   productId: string,
   chainId: SupportedChainId,
-): Deno.KvKey {
+): KvKey {
   return [...OPEN_INVOICES_PREFIX, merchant, customerReference, productId, chainId];
 }
 
-function idempotencyIndexKey(merchant: string, idempotencyKey: string): Deno.KvKey {
+function idempotencyIndexKey(merchant: string, idempotencyKey: string): KvKey {
   return [...IDEMPOTENCY_PREFIX, merchant, idempotencyKey];
 }
 
@@ -1294,31 +1321,31 @@ function invoiceRequestFingerprint(invoice: InvoiceRecord): string {
   });
 }
 
-function invoiceByChainKey(chainId: SupportedChainId, invoiceId: string): Deno.KvKey {
+function invoiceByChainKey(chainId: SupportedChainId, invoiceId: string): KvKey {
   return [...INVOICES_BY_CHAIN_PREFIX, chainId, invoiceId];
 }
 
-function headKey(chainId: SupportedChainId): Deno.KvKey {
+function headKey(chainId: SupportedChainId): KvKey {
   return [...HEADS_PREFIX, chainId];
 }
 
-function eventKey(eventId: string): Deno.KvKey {
+function eventKey(eventId: string): KvKey {
   return [...EVENTS_PREFIX, eventId];
 }
 
-function eventByInvoiceKey(invoiceId: string, type: PaymentEventType): Deno.KvKey {
+function eventByInvoiceKey(invoiceId: string, type: PaymentEventType): KvKey {
   return [...EVENTS_BY_INVOICE_PREFIX, invoiceId, type];
 }
 
-function outboxKey(event: DeliveryEventRecord): Deno.KvKey {
+function outboxKey(event: DeliveryEventRecord): KvKey {
   return [...OUTBOX_PREFIX, Date.parse(event.nextAttemptAt), event.id];
 }
 
-function cursorKey(chainId: SupportedChainId): Deno.KvKey {
+function cursorKey(chainId: SupportedChainId): KvKey {
   return [...CURSORS_PREFIX, chainId];
 }
 
-function chainSettingsKey(chainId: SupportedChainId): Deno.KvKey {
+function chainSettingsKey(chainId: SupportedChainId): KvKey {
   return [...CHAIN_SETTINGS_PREFIX, chainId];
 }
 
@@ -1376,19 +1403,19 @@ function mergeHeads(
 }
 
 function headAdvanced(previous: ChainHeadRecord | null, next: ChainHeadRecord): boolean {
-  return !previous || previous.latestBlock !== next.latestBlock ||
+  return (
+    !previous ||
+    previous.latestBlock !== next.latestBlock ||
     previous.safeBlock !== next.safeBlock ||
-    previous.finalizedBlock !== next.finalizedBlock;
+    previous.finalizedBlock !== next.finalizedBlock
+  );
 }
 
 function maximum(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
 }
 
-function addEventMutations(
-  atomic: Deno.AtomicOperation,
-  event: OutboxEventRecord,
-): Deno.AtomicOperation {
+function addEventMutations(atomic: KvAtomic, event: OutboxEventRecord): KvAtomic {
   const delivery = event as DeliveryEventRecord;
   return atomic
     .set(eventKey(event.id), event)
@@ -1417,11 +1444,11 @@ function boundedDeliveryError(reason: unknown): string {
 }
 
 async function expireAwaiting(
-  kv: Deno.Kv,
+  kv: Kv,
   clock: Clock,
-  invoiceEntry: Deno.KvEntryMaybe<InvoiceRecord>,
-  openEntry: Deno.KvEntryMaybe<OpenInvoiceIndex>,
-  openKey: Deno.KvKey,
+  invoiceEntry: KvEntryMaybe<InvoiceRecord>,
+  openEntry: KvEntryMaybe<OpenInvoiceIndex>,
+  openKey: KvKey,
 ): Promise<InvoiceRecord | null> {
   const invoice = invoiceEntry.value!;
   const timestamp = clock.now().toISOString();

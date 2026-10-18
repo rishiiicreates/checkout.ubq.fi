@@ -1,3 +1,8 @@
+import { WorkerBudgetError } from "./worker_budget.ts";
+import { SqliteKv } from "./sqlite_kv.ts";
+import { inspect } from "node:util";
+import { test } from "bun:test";
+import type { Kv } from "./kv.ts";
 import { createPersistentJwsSigner, verifyCompactJws } from "./jws.ts";
 import {
   createPaymentService,
@@ -11,12 +16,9 @@ const MERCHANT = "linkedin-scraper-2025";
 const TREASURY = `0x${"44".repeat(20)}`;
 const PAYER = `0x${"33".repeat(20)}`;
 
-Deno.test("catalog versions are canonical, merchant-scoped, immutable, and idempotent", async () => {
+test("catalog versions are canonical, merchant-scoped, immutable, and idempotent", async () => {
   await withService(async ({ service }) => {
-    const unsorted = catalog([
-      product("second", 200),
-      product("first", 100),
-    ]);
+    const unsorted = catalog([product("second", 200), product("first", 100)]);
     const first = await service.publishCatalogVersion(
       { merchantId: MERCHANT },
       "prices-1",
@@ -28,7 +30,10 @@ Deno.test("catalog versions are canonical, merchant-scoped, immutable, and idemp
       catalog([product("first", 100), product("second", 200)]),
     );
     assertEquals(first.digest, reordered.digest);
-    assertEquals(first.projection.products.map((entry) => entry.productId), ["first", "second"]);
+    assertEquals(
+      first.projection.products.map((entry) => entry.productId),
+      ["first", "second"],
+    );
     assertEquals(first.canonicalJson, JSON.stringify(first.projection));
 
     await assertDomainError(
@@ -49,49 +54,52 @@ Deno.test("catalog versions are canonical, merchant-scoped, immutable, and idemp
   });
 });
 
-Deno.test("invoice allocation resolves overlapping amount bands and preserves expired slots", async () => {
+test("invoice allocation resolves overlapping amount bands and preserves expired slots", async () => {
   const starts = [1n, 10_001n, 1n];
-  await withService(async ({ service, clock }) => {
-    await service.publishCatalogVersion(
-      { merchantId: MERCHANT },
-      "prices-100",
-      catalog([product("pack-100", 100)]),
-    );
-    await service.publishCatalogVersion(
-      { merchantId: MERCHANT },
-      "prices-101",
-      catalog([product("pack-101", 101)]),
-    );
-    const first = await service.createInvoice(context("first"), {
-      customerReference: "customer-a",
-      pricingVersionId: "prices-100",
-      productId: "pack-100",
-      chainId: 8453,
-    });
-    const overlapping = await service.createInvoice(context("second"), {
-      customerReference: "customer-b",
-      pricingVersionId: "prices-101",
-      productId: "pack-101",
-      chainId: 8453,
-    });
-    assertEquals(first.paidAmountUnits, "999999");
-    assertEquals(overlapping.paidAmountUnits, "999998");
-    assertEquals(overlapping.discountUnits, "10002");
+  await withService(
+    async ({ service, clock }) => {
+      await service.publishCatalogVersion(
+        { merchantId: MERCHANT },
+        "prices-100",
+        catalog([product("pack-100", 100)]),
+      );
+      await service.publishCatalogVersion(
+        { merchantId: MERCHANT },
+        "prices-101",
+        catalog([product("pack-101", 101)]),
+      );
+      const first = await service.createInvoice(context("first"), {
+        customerReference: "customer-a",
+        pricingVersionId: "prices-100",
+        productId: "pack-100",
+        chainId: 8453,
+      });
+      const overlapping = await service.createInvoice(context("second"), {
+        customerReference: "customer-b",
+        pricingVersionId: "prices-101",
+        productId: "pack-101",
+        chainId: 8453,
+      });
+      assertEquals(first.paidAmountUnits, "999999");
+      assertEquals(overlapping.paidAmountUnits, "999998");
+      assertEquals(overlapping.discountUnits, "10002");
 
-    clock.advance(61 * 60 * 1000);
-    assertEquals((await service.expireInvoice(first.id)).status, "expired");
-    const afterExpiry = await service.createInvoice(context("third"), {
-      customerReference: "customer-c",
-      pricingVersionId: "prices-100",
-      productId: "pack-100",
-      chainId: 8453,
-    });
-    assertEquals(afterExpiry.paidAmountUnits, "999997");
-    assertEquals(afterExpiry.discountUnits, "3");
-  }, { discountStart: () => starts.shift() ?? 1n });
+      clock.advance(61 * 60 * 1000);
+      assertEquals((await service.expireInvoice(first.id)).status, "expired");
+      const afterExpiry = await service.createInvoice(context("third"), {
+        customerReference: "customer-c",
+        pricingVersionId: "prices-100",
+        productId: "pack-100",
+        chainId: 8453,
+      });
+      assertEquals(afterExpiry.paidAmountUnits, "999997");
+      assertEquals(afterExpiry.discountUnits, "3");
+    },
+    { discountStart: () => starts.shift() ?? 1n },
+  );
 });
 
-Deno.test("finalized amount reservations become reusable only after the quarantine window", async () => {
+test("finalized amount reservations become reusable only after the quarantine window", async () => {
   await withService(async ({ service, rpc, clock }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -141,7 +149,7 @@ Deno.test("finalized amount reservations become reusable only after the quaranti
   });
 });
 
-Deno.test("concurrent creation is idempotent and enforces one open tuple", async () => {
+test("concurrent creation is idempotent and enforces one open tuple", async () => {
   await withService(async ({ service }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -170,14 +178,17 @@ Deno.test("concurrent creation is idempotent and enforces one open tuple", async
   });
 });
 
-Deno.test("admin overviews merge disabled chains and never expose invoice binding secrets", async () => {
+test("admin overviews merge disabled chains and never expose invoice binding secrets", async () => {
   await withService(async ({ service }) => {
     const chains = await service.listChainConfigurations();
-    assertEquals(chains.map((chain) => [chain.chainId, chain.enabled]), [
-      [1, false],
-      [10, false],
-      [8453, true],
-    ]);
+    assertEquals(
+      chains.map((chain) => [chain.chainId, chain.enabled]),
+      [
+        [1, false],
+        [10, false],
+        [8453, true],
+      ],
+    );
     const updated = await service.configureChain(8453, {
       enabled: true,
       treasuryAddress: TREASURY,
@@ -202,7 +213,7 @@ Deno.test("admin overviews merge disabled chains and never expose invoice bindin
   });
 });
 
-Deno.test("late inclusion is quarantined but pre-expiry inclusion can be accepted after expiry", async () => {
+test("late inclusion is quarantined but pre-expiry inclusion can be accepted after expiry", async () => {
   await withService(async ({ service, rpc, clock }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -256,7 +267,7 @@ Deno.test("late inclusion is quarantined but pre-expiry inclusion can be accepte
   });
 });
 
-Deno.test("three sealed blocks accept, safe settles, finalized records, and stale heads do not latch", async () => {
+test("three sealed blocks accept, safe settles, finalized records, and stale heads do not latch", async () => {
   await withService(async ({ service, rpc, kv }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -325,13 +336,9 @@ Deno.test("three sealed blocks accept, safe settles, finalized records, and stal
 
     rpc.setHeads(101n, null, null);
     assertEquals((await service.refreshInvoice(invoice.id)).invoice.status, "provisionally_paid");
-    const recoveredHeads = (await kv.get<{ latestBlock: bigint }>([
-      "uos_checkout",
-      "v1",
-      "payments",
-      "chain_heads",
-      8453,
-    ])).value;
+    const recoveredHeads = (
+      await kv.get<{ latestBlock: bigint }>(["uos_checkout", "v1", "payments", "chain_heads", 8453])
+    ).value;
     assertEquals(recoveredHeads?.latestBlock, 101n);
     rpc.setHeads(101n, 100n, null);
     const settled = await service.refreshInvoice(invoice.id);
@@ -343,7 +350,7 @@ Deno.test("three sealed blocks accept, safe settles, finalized records, and stal
   });
 });
 
-Deno.test("reorg before provisional returns to awaiting; reorg after provisional emits quarantine event", async () => {
+test("reorg before provisional returns to awaiting; reorg after provisional emits quarantine event", async () => {
   await withService(async ({ service, rpc }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -398,7 +405,7 @@ Deno.test("reorg before provisional returns to awaiting; reorg after provisional
   });
 });
 
-Deno.test("claim replay and a second exact transfer never emit a second acceptance", async () => {
+test("claim replay and a second exact transfer never emit a second acceptance", async () => {
   await withService(async ({ service, rpc }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -442,7 +449,7 @@ Deno.test("claim replay and a second exact transfer never emit a second acceptan
   });
 });
 
-Deno.test("a reverted locator can reappear canonically and emit a new acceptance lifecycle", async () => {
+test("a reverted locator can reappear canonically and emit a new acceptance lifecycle", async () => {
   await withService(async ({ service, rpc }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -473,7 +480,10 @@ Deno.test("a reverted locator can reappear canonically and emit a new acceptance
     rpc.reincludeTransfer(transactionHash, 101n);
     rpc.setHeads(104n, null, null);
     const watch = await service.reconcileHourly(8453, 104n);
-    assertEquals(watch.invoices.map((candidate) => candidate.id), [invoice.id]);
+    assertEquals(
+      watch.invoices.map((candidate) => candidate.id),
+      [invoice.id],
+    );
     assertEquals((await service.getInvoice(invoice.id)).status, "provisionally_paid");
     const reaccepted = await service.claimPayment(invoice.id, claim(transactionHash, 101n));
     const reacceptedClaims = (await verifyCompactJws(reaccepted.eventJws!, await service.jwks()))
@@ -489,15 +499,18 @@ Deno.test("a reverted locator can reappear canonically and emit a new acceptance
   });
 });
 
-Deno.test("reconciliation cursor advances only after a complete worker range", async () => {
-  await withService(async ({ service }) => {
+test("reconciliation cursor advances only after a complete worker range", async () => {
+  await withService(async ({ service, kv }) => {
     let attempts = 0;
-    await assertRejects(
-      () =>
-        service.reconcileChainRange(8453, 200n, () => {
-          attempts++;
-          return Promise.reject(new Error("upstream unavailable"));
-        }),
+    await assertRejects(() =>
+      service.reconcileChainRange(8453, 200n, () => {
+        attempts++;
+        return Promise.reject(new WorkerBudgetError());
+      }),
+    );
+    assertEquals(
+      (await kv.get(["uos_checkout", "v1", "payments", "reconciliation_cursors", 8453])).value,
+      null,
     );
     const watch = await service.reconcileChainRange(8453, 200n, () => {
       attempts++;
@@ -513,7 +526,7 @@ Deno.test("reconciliation cursor advances only after a complete worker range", a
   });
 });
 
-Deno.test("hourly reconciliation discovers matching treasury transfers and claims them", async () => {
+test("hourly reconciliation discovers matching treasury transfers and claims them", async () => {
   await withService(async ({ service, rpc }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -539,7 +552,7 @@ Deno.test("hourly reconciliation discovers matching treasury transfers and claim
   });
 });
 
-Deno.test("hourly reconciliation scans only through the coherent safe head", async () => {
+test("hourly reconciliation scans only through the coherent safe head", async () => {
   await withService(async ({ service, rpc }) => {
     rpc.setHeads(200n, 190n, 180n);
     const watch = await service.reconcileHourly(8453);
@@ -548,7 +561,7 @@ Deno.test("hourly reconciliation scans only through the coherent safe head", asy
   });
 });
 
-Deno.test("outbox retries after JWS expiry keep stable event identity and isolate poison entries", async () => {
+test("outbox retries after JWS expiry keep stable event identity and isolate poison entries", async () => {
   await withService(async ({ service, rpc, clock }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -577,7 +590,10 @@ Deno.test("outbox retries after JWS expiry keep stable event identity and isolat
     const originalClaims = (await verifyCompactJws(initial[0].compactJws, await service.jwks()))
       .payload as Record<string, unknown>;
     await service.markOutboxFailed(initial[0].id, "merchant outage");
-    assertEquals((await service.listOutbox()).map((event) => event.id), [initial[1].id]);
+    assertEquals(
+      (await service.listOutbox()).map((event) => event.id),
+      [initial[1].id],
+    );
 
     clock.advance(25 * 60 * 60 * 1000);
     const retried = (await service.listOutbox()).find((event) => event.id === initial[0].id);
@@ -591,7 +607,7 @@ Deno.test("outbox retries after JWS expiry keep stable event identity and isolat
   });
 });
 
-Deno.test("reconciliation overlaps the cursor and finds a transfer introduced behind it", async () => {
+test("reconciliation overlaps the cursor and finds a transfer introduced behind it", async () => {
   await withService(async ({ service, rpc }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -617,7 +633,7 @@ Deno.test("reconciliation overlaps the cursor and finds a transfer introduced be
   });
 });
 
-Deno.test("disabled chains drain outstanding invoices and terminal invoices leave the active index", async () => {
+test("disabled chains drain outstanding invoices and terminal invoices leave the active index", async () => {
   await withService(async ({ service, rpc, kv }) => {
     await service.publishCatalogVersion(
       { merchantId: MERCHANT },
@@ -652,16 +668,15 @@ Deno.test("disabled chains drain outstanding invoices and terminal invoices leav
     await service.refreshInvoice(invoice.id);
     assertEquals((await service.getInvoice(invoice.id)).status, "finalized");
     const active = [];
-    for await (
-      const entry of kv.list({
-        prefix: ["uos_checkout", "v1", "payments", "invoices_by_chain", 8453],
-      })
-    ) active.push(entry);
+    for await (const entry of kv.list({
+      prefix: ["uos_checkout", "v1", "payments", "invoices_by_chain", 8453],
+    }))
+      active.push(entry);
     assertEquals(active.length, 0);
   });
 });
 
-Deno.test("treasury rejects zero and token addresses and events target the invoice merchant", async () => {
+test("treasury rejects zero and token addresses and events target the invoice merchant", async () => {
   await withService(async ({ service, rpc }) => {
     await assertDomainError(
       () =>
@@ -685,12 +700,15 @@ Deno.test("treasury rejects zero and token addresses and events target the invoi
       "prices",
       catalog([product("pack", 100)]),
     );
-    const invoice = await service.createInvoice({ merchantId: merchant, idempotencyKey: "aud" }, {
-      customerReference: "audience",
-      pricingVersionId: "prices",
-      productId: "pack",
-      chainId: 8453,
-    });
+    const invoice = await service.createInvoice(
+      { merchantId: merchant, idempotencyKey: "aud" },
+      {
+        customerReference: "audience",
+        pricingVersionId: "prices",
+        productId: "pack",
+        chainId: 8453,
+      },
+    );
     rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
       transactionHash: hash(64),
       blockNumber: 100n,
@@ -710,11 +728,11 @@ async function withService(
     service: PaymentService;
     rpc: MockRpc;
     clock: MutableClock;
-    kv: Deno.Kv;
+    kv: Kv;
   }) => Promise<void>,
   options: { discountStart?: () => bigint } = {},
 ): Promise<void> {
-  const kv = await Deno.openKv(":memory:");
+  const kv = new SqliteKv(":memory:");
   const clock = new MutableClock("2026-07-21T12:00:00.000Z");
   const rpc = new MockRpc();
   let id = 0;
@@ -821,10 +839,14 @@ class MockRpc implements RpcClient {
       };
       const fromBlock = BigInt(filter.fromBlock);
       const toBlock = BigInt(filter.toBlock);
-      const logs = [...this.#transfers.values()].filter((transfer) =>
-        transfer.blockNumber >= fromBlock && transfer.blockNumber <= toBlock &&
-        addressTopic(transfer.treasuryAddress) === filter.topics[2]
-      ).map(rpcLog);
+      const logs = [...this.#transfers.values()]
+        .filter(
+          (transfer) =>
+            transfer.blockNumber >= fromBlock &&
+            transfer.blockNumber <= toBlock &&
+            addressTopic(transfer.treasuryAddress) === filter.topics[2],
+        )
+        .map(rpcLog);
       return Promise.resolve([{ jsonrpc: "2.0", id: "transfer_logs", result: logs }]);
     }
     const receiptCall = calls.find((call) => call.id === "receipt");
@@ -834,16 +856,17 @@ class MockRpc implements RpcClient {
       receipt: transfer && !this.#missingReceipts.has(transactionHash) ? receipt(transfer) : null,
       event_block: transfer
         ? block(
-          transfer.blockNumber,
-          this.#canonicalOverrides.get(transactionHash) ?? transfer.blockHash,
-          transfer.includedAt,
-        )
+            transfer.blockNumber,
+            this.#canonicalOverrides.get(transactionHash) ?? transfer.blockHash,
+            transfer.includedAt,
+          )
         : null,
       latest: block(this.#latest, hash(Number(this.#latest) + 2000)),
       safe: this.#safe === null ? null : block(this.#safe, hash(Number(this.#safe) + 3000)),
-      finalized: this.#finalized === null
-        ? null
-        : block(this.#finalized, hash(Number(this.#finalized) + 4000)),
+      finalized:
+        this.#finalized === null
+          ? null
+          : block(this.#finalized, hash(Number(this.#finalized) + 4000)),
     };
     return Promise.resolve(
       calls.map((call) => ({ jsonrpc: "2.0", id: call.id, result: results[call.id] })),
@@ -930,7 +953,7 @@ async function assertDomainError(fn: () => Promise<unknown>, code: string): Prom
     await fn();
   } catch (error) {
     if (error instanceof PaymentDomainError && error.code === code) return;
-    throw new Error(`Expected ${code}, got ${String(error)}`);
+    throw new Error(`Expected ${code}, got ${String(error)}`, { cause: error });
   }
   throw new Error(`Expected rejection ${code}`);
 }
@@ -950,7 +973,7 @@ function assert(value: unknown): asserts value {
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (!deepEqual(actual, expected)) {
-    throw new Error(`Expected ${Deno.inspect(expected)}, got ${Deno.inspect(actual)}`);
+    throw new Error(`Expected ${inspect(expected)}, got ${inspect(actual)}`);
   }
 }
 
