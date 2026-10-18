@@ -5,7 +5,11 @@ import { startCheckoutServer } from "../bun.ts";
 import { BUN_DUE_PREFIX } from "./bun_queue.ts";
 import type { KvAtomic, KvEntries, KvKey, KvPage, KvPageOptions } from "./kv.ts";
 import { CHAIN_CONFIGURATIONS, type InvoiceRecord } from "./payment_types.ts";
+import { RuntimeRpc } from "./account_runtime_test_fixture.ts";
+import { treasuryHistoryKey } from "./account_store.ts";
+import { TRANSFER_TOPIC } from "./rpc.ts";
 import { SqliteKv } from "./sqlite_kv.ts";
+import { WorkerRequestBudget } from "./worker_budget.ts";
 
 const SIGNING_KEY = "local-auth-recovery-fixture";
 const SUBSCRIPTION = "auth-recovery";
@@ -302,6 +306,183 @@ test("a valid signed notice with no related transfer does not sweep unrelated Bu
     ok(fixture.kv.operations.length > 0, "valid delivery must persist its receipt");
     equal(fixture.kv.queueOperations, []);
     equal(fixture.refreshes, 0);
+    equal(fixture.handles.size, 0);
+  } finally {
+    await fixture.close();
+  }
+});
+
+async function recordedTransferFixture() {
+  const fixture = await serverFixture();
+  try {
+    const rpc = new RuntimeRpc();
+    fixture.app.services.rpc.batch = rpc.batch.bind(rpc);
+    await fixture.app.services.payment.configureChain(8453, {
+      enabled: true,
+      treasuryAddress: `0x${"44".repeat(20)}`,
+    });
+    await fixture.app.services.payment.publishCatalogVersion(
+      { merchantId: MERCHANT },
+      "related-prices",
+      {
+        currency: "USD",
+        products: [
+          {
+            productId: "related-credits",
+            label: "Credits",
+            kind: "credit_pack",
+            priceCents: 200,
+            enabled: true,
+          },
+        ],
+      },
+    );
+    const created = await fixture.app.services.payment.createInvoice(
+      { merchantId: MERCHANT, idempotencyKey: "related-attempt" },
+      {
+        customerReference: "related-account",
+        pricingVersionId: "related-prices",
+        productId: "related-credits",
+        chainId: 8453,
+      },
+    );
+    const invoice = await fixture.app.services.payment.getInvoiceRecord(created.id);
+    const transfer = rpc.add(invoice, 100n);
+    rpc.latest = 100n;
+    transfer.timestamp = Math.floor(Date.now() / 1000);
+    const claimed = await fixture.app.services.payment.claimPayment(created.id, {
+      transactionHash: transfer.transactionHash,
+      logIndex: "0",
+      observedBlockNumber: "100",
+      observedBlockHash: transfer.blockHash,
+    });
+    equal(claimed.invoice.status, "confirming");
+    ok(claimed.invoice.paymentId);
+    equal(
+      (
+        await fixture.kv.get(
+          treasuryHistoryKey(8453, invoice.tokenAddress, invoice.treasuryAddress),
+        )
+      ).value,
+      true,
+    );
+    await fixture.app.queue.refresh();
+    fixture.loseCallbacks();
+    fixture.reset();
+    const topic = (address: string) => `0x${address.slice(2).padStart(64, "0")}`;
+    const body = JSON.stringify({
+      webhookId: SUBSCRIPTION,
+      id: "related-notice",
+      type: "ADDRESS_ACTIVITY",
+      createdAt: new Date().toISOString(),
+      event: {
+        network: "BASE_MAINNET",
+        activity: [
+          {
+            category: "token",
+            log: {
+              address: transfer.tokenAddress,
+              transactionHash: transfer.transactionHash,
+              logIndex: "0x0",
+              blockNumber: "0x64",
+              blockHash: transfer.blockHash,
+              topics: [
+                TRANSFER_TOPIC,
+                topic(transfer.payerAddress),
+                topic(transfer.recipientAddress),
+              ],
+              data: `0x${transfer.amountUnits.toString(16).padStart(64, "0")}`,
+              removed: false,
+            },
+          },
+        ],
+      },
+    });
+    return { ...fixture, body, transfer, invoiceId: created.id };
+  } catch (error) {
+    await fixture.close();
+    throw error;
+  }
+}
+
+test("an authenticated related signed notice restores an unchanged inclusion's lost callback", async () => {
+  const fixture = await recordedTransferFixture();
+  try {
+    const before = (await fixture.kv.listPage(BUN_DUE_PREFIX, { limit: 1 })).entries[0];
+    fixture.reset();
+    const response = await fixture.request("/api/v1/chain-events/alchemy", {
+      method: "POST",
+      body: fixture.body,
+      headers: {
+        "content-type": "application/json",
+        "x-alchemy-signature": signature(fixture.body),
+      },
+    });
+    equal(response.status, 200);
+    await response.text();
+    ok(
+      fixture.handles.size > 0,
+      "exact related inclusion must restore its retained confirmation callback",
+    );
+    const after = (await fixture.kv.listPage(BUN_DUE_PREFIX, { limit: 1 })).entries[0];
+    equal(after, before, "related recovery preserves the committed job generation");
+    equal(
+      (await fixture.app.services.payment.getInvoiceRecord(fixture.invoiceId)).status,
+      "confirming",
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a related notice retains retryable receipt work when queue recovery is unavailable", async () => {
+  const fixture = await recordedTransferFixture();
+  const ensure = fixture.app.queue.ensure.bind(fixture.app.queue);
+  try {
+    fixture.app.queue.ensure = async () => {
+      throw new Error("queue_temporarily_unavailable");
+    };
+    const request = () =>
+      fixture.request("/api/v1/chain-events/alchemy", {
+        method: "POST",
+        body: fixture.body,
+        headers: {
+          "content-type": "application/json",
+          "x-alchemy-signature": signature(fixture.body),
+        },
+      });
+    const pending = await request();
+    equal(pending.status, 503, "failed recovery must not consume a related notice as complete");
+    await pending.text();
+    equal(fixture.handles.size, 0);
+    fixture.app.queue.ensure = ensure;
+    const retried = await request();
+    equal(retried.status, 200);
+    await retried.text();
+    ok(fixture.handles.size > 0);
+  } finally {
+    fixture.app.queue.ensure = ensure;
+    await fixture.close();
+  }
+});
+
+test("a related inclusion defers instead of acknowledging when recovery has insufficient capacity", async () => {
+  const fixture = await recordedTransferFixture();
+  try {
+    const result = await fixture.app.services.payment.processChainTransfer(
+      { ...fixture.transfer, chainId: 8453, removed: false },
+      {
+        budget: new WorkerRequestBudget(10),
+        deadline: Date.now() + 20_000,
+        isCurrent: async () => true,
+      },
+    );
+    equal(
+      result.invoiceId,
+      fixture.invoiceId,
+      "fixture notice must attribute to the recorded invoice",
+    );
+    equal(result.terminal, false);
     equal(fixture.handles.size, 0);
   } finally {
     await fixture.close();
