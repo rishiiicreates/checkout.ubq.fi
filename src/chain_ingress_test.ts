@@ -440,6 +440,10 @@ function measuredKv(store: Kv, budget?: WorkerRequestBudget, failAtomic?: number
     calls++;
   };
   const kv: Kv = {
+    listPage: (prefix, options) => {
+      count();
+      return store.listPage(prefix, options);
+    },
     get: (key) => {
       count();
       return store.get(key);

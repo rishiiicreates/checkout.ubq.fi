@@ -20,7 +20,7 @@ const PREFIX = ["uos_checkout", "v1", "payments"];
 const SCAN_BLOCKS = 1000n;
 const OVERLAP_BLOCKS = 128n;
 const LEASE_MS = 30_000;
-const COMPLETION_CALLS = 6;
+const COMPLETION_CALLS = 3;
 
 export type DiscoveryOptions = { budget?: WorkerRequestBudget; deadline?: number };
 export type DiscoveryState = { searchedThrough?: bigint; leaseId?: string; leaseUntil?: number };

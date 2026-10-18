@@ -1,5 +1,6 @@
 import { WorkerBudgetError } from "./src/worker_budget.ts";
 import type { DiscoveryOptions } from "./src/payment_discovery.ts";
+import type { WakeupPort } from "./src/wakeup.ts";
 import type { FetchLike } from "./src/rpc.ts";
 import type { Kv } from "./src/kv.ts";
 import {
@@ -14,7 +15,11 @@ import {
   type MerchantScope,
 } from "./src/merchant_auth.ts";
 import { type CompactJwsSigner, createPersistentJwsSigner, JwsError } from "./src/jws.ts";
-import { createPaymentService, type PaymentService } from "./src/payment_service.ts";
+import {
+  createPaymentService,
+  type PaymentService,
+  type SignedOutboxEvent,
+} from "./src/payment_service.ts";
 import { type InvoiceJson, PaymentDomainError } from "./src/payment_types.ts";
 import { HttpRpcClient, type RpcClient, RpcError, RpcVerificationError } from "./src/rpc.ts";
 import { type ResolvedWebhookTarget, type WebhookDeliveryResponse } from "./src/webhook.ts";
@@ -52,6 +57,7 @@ type CheckoutServiceOptions = {
   resolveDns?: (hostname: string, recordType: "A" | "AAAA") => Promise<string[]>;
   webhookSender?: CheckoutServices["webhookSender"];
   discovery?: DiscoveryOptions;
+  wakeups?: WakeupPort;
 };
 
 export function createCheckoutServices(
@@ -71,6 +77,7 @@ export function createCheckoutServices(
       rpc,
       signer,
       discovery: options.discovery,
+      wakeups: options.wakeups,
     }),
     fetcher,
     assetFetcher: options.assetFetcher ?? (async () => new Response(null, { status: 404 })),
@@ -351,34 +358,54 @@ export async function deliverOutbox(
     const events = await services.payment.listOutbox(pageSize);
     for (const event of events) {
       if (Date.now() >= deadline) return;
-      const merchant = await services.merchantAuth.getMerchant(event.payload.merchantId);
-      if (!merchant) {
-        await services.payment.markOutboxFailed(event.id, "merchant_not_found");
-        continue;
-      }
-      try {
-        const target = await services.merchantAuth.resolveWebhookTarget(
-          merchant.settlementWebhookUrl,
-        );
-        const response = await services.webhookSender(
-          target,
-          JSON.stringify({ eventJws: event.compactJws }),
-          AbortSignal.timeout(Math.max(1, Math.min(WEBHOOK_TIMEOUT_MS, deadline - Date.now()))),
-        );
-        if (response.ok) {
-          await services.payment.markOutboxDelivered(event.id);
-        } else {
-          await services.payment.markOutboxFailed(event.id, `webhook_http_${response.status}`);
-        }
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        await services.payment.markOutboxFailed(event.id, reason);
-        console.error("checkout_settlement_webhook_failed", event.id, error);
-      }
+      await deliverSignedOutboxEvent(services, event, deadline);
     }
     remaining -= events.length;
     if (events.length < pageSize) return;
   }
+}
+
+export async function deliverOutboxEvent(
+  services: CheckoutServices,
+  eventId: string,
+  options: { deadline?: number; isCurrent?: () => Promise<boolean> } = {},
+): Promise<void> {
+  const event = await services.payment.getOutboxEvent(eventId);
+  if (!event || (options.isCurrent && !(await options.isCurrent()))) return;
+  await deliverSignedOutboxEvent(services, event, options.deadline ?? Infinity, options.isCurrent);
+}
+
+async function deliverSignedOutboxEvent(
+  services: CheckoutServices,
+  event: SignedOutboxEvent,
+  deadline: number,
+  isCurrent: () => Promise<boolean> = async () => true,
+): Promise<void> {
+  const current = async () => Date.now() < deadline && (await isCurrent());
+  if (!(await current())) return;
+  const merchant = await services.merchantAuth.getMerchant(event.payload.merchantId);
+  if (!(await current())) return;
+  if (!merchant) {
+    await services.payment.markOutboxFailed(event.id, "merchant_not_found");
+    return;
+  }
+  let failure: string | undefined;
+  try {
+    const target = await services.merchantAuth.resolveWebhookTarget(merchant.settlementWebhookUrl);
+    if (!(await current())) return;
+    const response = await services.webhookSender(
+      target,
+      JSON.stringify({ eventJws: event.compactJws }),
+      AbortSignal.timeout(Math.max(1, Math.min(WEBHOOK_TIMEOUT_MS, deadline - Date.now()))),
+    );
+    if (!response.ok) failure = `webhook_http_${response.status}`;
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+    console.error("checkout_settlement_webhook_failed", event.id, error);
+  }
+  if (!(await current())) return;
+  if (failure) await services.payment.markOutboxFailed(event.id, failure);
+  else await services.payment.markOutboxDelivered(event.id);
 }
 
 export function withPeerAddress(

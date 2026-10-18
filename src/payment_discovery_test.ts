@@ -9,7 +9,10 @@ import {
 } from "./payment_discovery.ts";
 import { SqliteKv } from "./sqlite_kv.ts";
 import { WorkerRequestBudget } from "./worker_budget.ts";
-import type { Kv } from "./kv.ts";
+import { createIntentWakeupPort, type WakeupPort } from "./wakeup.ts";
+import { UbqKv } from "./ubq_kv.ts";
+import { decodeKvValue, encodeKvValue } from "./kv_codec.ts";
+import type { Kv, KvCheck, KvKey } from "./kv.ts";
 import type { InvoiceRecord } from "./payment_types.ts";
 import {
   TRANSFER_TOPIC,
@@ -310,13 +313,109 @@ test("the Worker budget retains completion headroom for partial results and late
   }
 });
 
+test("real service-adapter calls keep intent prearming and a zero-search-budget response within24", async () => {
+  const app = await setup();
+  try {
+    app.rpc.latest = 5000n;
+    app.rpc.add(app.invoice, 1150n);
+    await app.kv.set(discoveryStateKey(app.invoice.id), { searchedThrough: 1099n });
+    const budget = new WorkerRequestBudget(24);
+    for (let index = 0; index < 5; index++) budget.reserve(); // auth/ownership plus migration RPC
+    let storageCalls = 0,
+      prepareCalls = 0,
+      rpcCalls = 0;
+    let sawCompletionBoundary = false;
+    const wire = new UbqKv({
+      url: "https://kv.invalid",
+      token: "offline",
+      fetchImpl: async (url, init) => {
+        budget.reserve();
+        storageCalls++;
+        if (budget.remaining === 0) sawCompletionBoundary = true;
+        const body = JSON.parse(String(init.body)) as {
+          key: KvKey;
+          keys: KvKey[];
+          checks: KvCheck[];
+          mutations: { type: "set" | "delete"; key: KvKey; value?: unknown }[];
+        };
+        const path = new URL(url).pathname;
+        if (path === "/kv/get") {
+          const entry = await app.kv.get(body.key);
+          return Response.json({
+            ok: true,
+            entry:
+              entry.versionstamp === null
+                ? null
+                : { ...entry, value: encodeKvValue(decodeKvValue(entry.value)) },
+          });
+        }
+        if (path === "/kv/getMany") {
+          const entries = await app.kv.getMany(body.keys);
+          return Response.json({
+            ok: true,
+            entries: entries.map((entry) =>
+              entry.versionstamp === null
+                ? null
+                : { ...entry, value: encodeKvValue(decodeKvValue(entry.value)) },
+            ),
+          });
+        }
+        if (path === "/kv/atomic") {
+          const atomic = app.kv.atomic().check(...body.checks);
+          for (const mutation of body.mutations) {
+            if (mutation.type === "set") atomic.set(mutation.key, mutation.value);
+            else atomic.delete(mutation.key);
+          }
+          return Response.json(await atomic.commit());
+        }
+        throw new Error(`unexpected_offline_path:${path}`);
+      },
+    });
+    const rpc: RpcClient = {
+      batch: (chain, calls) => {
+        budget.reserve();
+        rpcCalls++;
+        return app.rpc.batch(chain, calls);
+      },
+    };
+    const wakeups = createIntentWakeupPort({
+      kv: wire,
+      budget,
+      transport: {
+        prepare: async (intent) => {
+          for (const _target of intent.targets) {
+            budget.reserve();
+            prepareCalls++;
+          }
+        },
+      },
+    });
+    const result = await app.restart(wire, rpc, budget, wakeups).discoverPayment(app.invoice.id);
+    equal(result.discovery?.found, true);
+    ok(result.eventJws);
+    ok(sawCompletionBoundary);
+    ok(budget.remaining >= 0);
+    equal(prepareCalls, 2);
+    console.log(
+      `intent discovery calls: storage=${storageCalls},rpc=${rpcCalls},prearm=${prepareCalls},prior=5,total=${24 - budget.remaining},ceiling=24`,
+    );
+  } finally {
+    app.kv.close();
+  }
+});
+
 async function setup() {
   const kv = new SqliteKv();
   const rpc = new DiscoveryRpc();
   let instant = Date.parse("2026-10-18T00:00:00Z");
   let sequence = 0;
   const clock = { now: () => new Date(instant) };
-  const restart = (storage: Kv = kv, client: RpcClient = rpc, budget?: WorkerRequestBudget) =>
+  const restart = (
+    storage: Kv = kv,
+    client: RpcClient = rpc,
+    budget?: WorkerRequestBudget,
+    wakeups?: WakeupPort,
+  ) =>
     createPaymentService({
       kv: storage,
       rpc: client,
@@ -325,6 +424,7 @@ async function setup() {
       idGenerator: { next: () => `discovery-${++sequence}` },
       discountStart: () => 1n,
       discovery: { budget },
+      wakeups,
     });
   const service = restart();
   await service.configureChain(8453, { enabled: true, treasuryAddress: treasury });
@@ -462,6 +562,10 @@ function deferred() {
 
 function countedKv(kv: Kv, budget: WorkerRequestBudget): Kv {
   return {
+    listPage: (prefix, options) => {
+      budget.reserve();
+      return kv.listPage(prefix, options);
+    },
     get: (key) => {
       budget.reserve();
       return kv.get(key);
