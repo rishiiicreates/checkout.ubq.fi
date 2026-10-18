@@ -159,6 +159,56 @@ Deno.test("discovery chunks long ranges and bisects provider range limits withou
   }
 });
 
+Deno.test("discovery never bisects rate, quota, or throttling errors", async () => {
+  for (
+    const message of [
+      "rate limit exceeded",
+      "too many requests",
+      "quota exceeded",
+      "request limit exceeded",
+      "throttled: block range temporarily unavailable",
+    ]
+  ) {
+    let calls = 0;
+    const client: RpcClient = {
+      batch() {
+        calls++;
+        return Promise.resolve([{
+          jsonrpc: "2.0",
+          id: "transfer_logs",
+          error: { code: -32005, message },
+        }]);
+      },
+    };
+    await assertRejectsRpcCode(
+      () => discoverTransferLogs(client, 8453, TOKEN, RECIPIENT, 100n, 1_099n),
+      `rpc_upstream_error:transfer_logs:${message}`,
+    );
+    assertEquals(calls, 1);
+  }
+});
+
+Deno.test("discovery still bisects explicit result-count limits", async () => {
+  let calls = 0;
+  const client: RpcClient = {
+    batch(_chainId, requests) {
+      calls++;
+      const filter = requests[0].params[0] as { fromBlock: string; toBlock: string };
+      return Promise.resolve([
+        BigInt(filter.toBlock) - BigInt(filter.fromBlock) > 249n
+          ? {
+            jsonrpc: "2.0",
+            id: "transfer_logs",
+            error: { message: "query returned more than 10000 results" },
+          }
+          : { jsonrpc: "2.0", id: "transfer_logs", result: [] },
+      ]);
+    },
+  };
+  assertEquals(await discoverTransferLogs(client, 8453, TOKEN, RECIPIENT, 100n, 1_099n), []);
+  assertEquals(calls, 7);
+});
+
 function expected() {
   return {
     transactionHash: TRANSACTION_HASH,

@@ -594,6 +594,247 @@ Deno.test("discovery rejects nonmatching transfers and uses the coherent safe/la
   });
 });
 
+Deno.test("discovery bounds old invoices and resumes persisted full-history coverage", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "bounded-discovery");
+    const cursorKey = ["uos_checkout", "v1", "payments", "reconciliation_cursors", 8453];
+    await kv.set(cursorKey, { blockNumber: 42n });
+    clock.advance(60 * 60_000);
+    await service.expireInvoice(invoice.id);
+    clock.advance(30 * 24 * 60 * 60_000);
+    const head = 99n + 30n * 43_200n;
+    rpc.setHeads(head, null, null);
+    const first = await service.discoverPayment(invoice.id);
+    const firstLogs = rpc.logRanges.length;
+    assertEquals(firstLogs, 50);
+    assertEquals(first.discovery, { found: false, searchedToBlock: "50099" });
+    const restarted = createPaymentService({
+      kv,
+      rpc,
+      clock,
+      signer: createPersistentJwsSigner(kv, clock),
+    });
+    let through = BigInt(first.discovery!.searchedToBlock!);
+    let requests = 1;
+    let secondLogs = 0;
+    while (through < head) {
+      const callsBefore = rpc.logRanges.length;
+      const result = await restarted.discoverPayment(invoice.id);
+      const next = BigInt(result.discovery!.searchedToBlock!);
+      assert(next > through);
+      if (requests === 1) secondLogs = rpc.logRanges.length - callsBefore;
+      assert(rpc.logRanges.length - callsBefore <= 50);
+      assertEquals(rpc.logRanges[callsBefore][0], through + 1n - 128n);
+      through = next;
+      assert(++requests <= 27);
+    }
+    assertEquals(requests, 26);
+    const caughtUpCalls = rpc.logRanges.length;
+    assertEquals(
+      (await service.discoverPayment(invoice.id)).discovery?.searchedToBlock,
+      head.toString(),
+    );
+    const caughtUpLogs = rpc.logRanges.length - caughtUpCalls;
+    assert(caughtUpLogs <= 2);
+    console.log("discovery_scan_counts", { requests, firstLogs, secondLogs, caughtUpLogs });
+    assertEquals((await kv.get<{ blockNumber: bigint }>(cursorKey)).value?.blockNumber, 42n);
+    assertEquals(
+      (await kv.get<{ searchedThrough: bigint }>(discoveryStateKey(invoice.id))).value
+        ?.searchedThrough,
+      head,
+    );
+  });
+});
+
+Deno.test("discovery busy calls return only committed progress without RPC", async () => {
+  await withService(async ({ service, rpc }) => {
+    const invoice = await createTestInvoice(service, "busy-discovery");
+    rpc.setHeads(200n, null, null);
+    for (const committed of [undefined, "200"]) {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let blocked = false;
+      rpc.beforeLogs = () => {
+        if (blocked) return Promise.resolve();
+        blocked = true;
+        entered.resolve();
+        return release.promise;
+      };
+      const owner = service.discoverPayment(invoice.id);
+      await entered.promise;
+      const callsBefore = rpc.requests;
+      try {
+        const busy = await Promise.all(
+          Array.from({ length: 5 }, () => service.discoverPayment(invoice.id)),
+        );
+        assertEquals(rpc.requests, callsBefore);
+        for (const result of busy) {
+          assertEquals(result.discovery?.found, false);
+          assertEquals(result.discovery?.searchedToBlock, committed);
+        }
+      } finally {
+        release.resolve();
+        await owner;
+      }
+      rpc.setHeads(100_100n, null, null);
+    }
+  });
+});
+
+Deno.test("discovery retries matching logs with delayed canonical receipts before advancing", async () => {
+  for (const failure of ["missing", "noncanonical"]) {
+    await withService(async ({ service, rpc, clock, kv }) => {
+      const invoice = await createTestInvoice(service, `delayed-discovery-${failure}`);
+      const transactionHash = hash(98);
+      rpc.setHeads(100_100n, null, null);
+      await service.discoverPayment(invoice.id);
+      rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+        transactionHash,
+        blockNumber: 50_050n,
+        includedAt: clock.now(),
+      });
+      if (failure === "missing") rpc.hideReceipt(transactionHash);
+      else rpc.reorgTransfer(transactionHash);
+      const missing = await service.discoverPayment(invoice.id);
+      assertEquals(missing.discovery, { found: false, searchedToBlock: "50099" });
+      const state = (await kv.get<{ searchedThrough: bigint }>(discoveryStateKey(invoice.id)))
+        .value!;
+      assertEquals(state.searchedThrough, 50_099n);
+      rpc.reincludeTransfer(transactionHash, 50_050n);
+      assertEquals(
+        (await service.discoverPayment(invoice.id)).invoice.status,
+        "provisionally_paid",
+      );
+      assertEquals((await kv.get(discoveryStateKey(invoice.id))).value, null);
+    });
+  }
+});
+
+Deno.test("a claim fences an in-flight discovery from restoring cleared progress", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "claim-fences-discovery");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    rpc.setHeads(1_000n, null, null);
+    rpc.beforeLogs = () => {
+      entered.resolve();
+      return release.promise;
+    };
+    const pending = service.discoverPayment(invoice.id);
+    await entered.promise;
+    try {
+      assert((await kv.get<{ leaseId: string }>(discoveryStateKey(invoice.id))).value?.leaseId);
+      rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+        transactionHash: hash(99),
+        blockNumber: 105n,
+        includedAt: clock.now(),
+      });
+      await service.claimPayment(invoice.id, claim(hash(99), 105n));
+      assertEquals((await kv.get(discoveryStateKey(invoice.id))).value, null);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+    assertEquals((await kv.get(discoveryStateKey(invoice.id))).value, null);
+  });
+});
+
+Deno.test("discovery expired leases fence stale completion and release from the successor", async () => {
+  await withService(async ({ service, rpc, clock, kv }) => {
+    const invoice = await createTestInvoice(service, "expired-discovery-owner");
+    await kv.set(discoveryStateKey(invoice.id), { searchedThrough: 500n });
+    rpc.setHeads(100_100n, null, null);
+    const entered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const release = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let started = 0;
+    rpc.beforeLogs = () => {
+      const index = started++;
+      if (index > 1) return Promise.resolve();
+      entered[index].resolve();
+      return release[index].promise;
+    };
+    const stale = service.discoverPayment(invoice.id);
+    await entered[0].promise;
+    clock.advance(61_000);
+    const successor = service.discoverPayment(invoice.id);
+    await entered[1].promise;
+    try {
+      const owned = (await kv.get<{ leaseId: string }>(discoveryStateKey(invoice.id))).value!;
+      release[0].resolve();
+      await stale;
+      const afterStale =
+        (await kv.get<{ leaseId: string; searchedThrough: bigint }>(discoveryStateKey(invoice.id)))
+          .value!;
+      assertEquals(afterStale.leaseId, owned.leaseId);
+      assertEquals(afterStale.searchedThrough, 500n);
+    } finally {
+      release[0].resolve();
+      release[1].resolve();
+      await Promise.all([stale, successor]);
+    }
+    const after =
+      (await kv.get<{ leaseId?: string; searchedThrough: bigint }>(discoveryStateKey(invoice.id)))
+        .value!;
+    assertEquals(after.leaseId, undefined);
+    assertEquals(after.searchedThrough, 50_372n);
+  });
+});
+
+Deno.test("payment reorg and re-inclusion transitions clear discovery state", async () => {
+  for (const accepted of [false, true]) {
+    await withService(async ({ service, rpc, clock, kv }) => {
+      const invoice = await createTestInvoice(service, `clear-reorg-discovery-${accepted}`);
+      const transactionHash = hash(101);
+      rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+        transactionHash,
+        blockNumber: 100n,
+        includedAt: clock.now(),
+      });
+      rpc.setHeads(accepted ? 103n : 100n, null, null);
+      await kv.set(discoveryStateKey(invoice.id), { searchedThrough: 900n });
+      await service.claimPayment(invoice.id, claim(transactionHash, 100n));
+      assert((await kv.get(discoveryStateKey(invoice.id))).value === null);
+      await kv.set(discoveryStateKey(invoice.id), { searchedThrough: 900n });
+      rpc.reorgTransfer(transactionHash);
+      await service.refreshInvoice(invoice.id);
+      assert((await kv.get(discoveryStateKey(invoice.id))).value === null);
+      if (accepted) {
+        await kv.set(discoveryStateKey(invoice.id), { searchedThrough: 900n });
+        rpc.reincludeTransfer(transactionHash, 104n, 5);
+        rpc.setHeads(110n, null, null);
+        await service.claimPayment(invoice.id, { ...claim(transactionHash, 104n), logIndex: "5" });
+        assert((await kv.get(discoveryStateKey(invoice.id))).value === null);
+      }
+    });
+  }
+});
+
+Deno.test("discovery continues past an unrelated duplicate to the original re-inclusion", async () => {
+  await withService(async ({ service, rpc, clock }) => {
+    const invoice = await createTestInvoice(service, "duplicate-before-reinclude");
+    const record = await service.getInvoiceRecord(invoice.id);
+    rpc.addTransfer(record, {
+      transactionHash: hash(103),
+      blockNumber: 101n,
+      includedAt: clock.now(),
+    });
+    rpc.addTransfer(record, {
+      transactionHash: hash(102),
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    await service.claimPayment(invoice.id, claim(hash(102), 100n));
+    rpc.reorgTransfer(hash(102));
+    await service.refreshInvoice(invoice.id);
+    rpc.reincludeTransfer(hash(102), 104n, 5);
+    rpc.setHeads(110n, null, null);
+    const result = await service.discoverPayment(invoice.id);
+    assertEquals(result.invoice.status, "provisionally_paid");
+    assertEquals(result.discovery?.found, true);
+  });
+});
+
 Deno.test("hourly reconciliation discovers matching treasury transfers and claims them", async () => {
   await withService(async ({ service, rpc }) => {
     await service.publishCatalogVersion(
@@ -1311,6 +1552,8 @@ type MockTransfer = {
 class MockRpc implements RpcClient {
   requests = 0;
   failures = 0;
+  logRanges: [bigint, bigint][] = [];
+  beforeLogs?: () => Promise<void>;
   #transfers = new Map<string, MockTransfer>();
   #missingReceipts = new Set<string>();
   #canonicalOverrides = new Map<string, string>();
@@ -1379,12 +1622,17 @@ class MockRpc implements RpcClient {
       };
       const fromBlock = BigInt(filter.fromBlock);
       const toBlock = BigInt(filter.toBlock);
+      this.logRanges.push([fromBlock, toBlock]);
       const logs = [...this.#transfers.values()].filter((transfer) =>
         transfer.blockNumber >= fromBlock && transfer.blockNumber <= toBlock &&
         transfer.tokenAddress.toLowerCase() === filter.address.toLowerCase() &&
         addressTopic(transfer.treasuryAddress) === filter.topics[2]
       ).map(rpcLog);
-      return Promise.resolve([{ jsonrpc: "2.0", id: "transfer_logs", result: logs }]);
+      return (this.beforeLogs?.() ?? Promise.resolve()).then(() => [{
+        jsonrpc: "2.0",
+        id: "transfer_logs",
+        result: logs,
+      }]);
     }
     const receiptCall = calls.find((call) => call.id === "receipt");
     const transactionHash = receiptCall ? String(receiptCall.params[0]).toLowerCase() : "";
@@ -1470,6 +1718,10 @@ function claim(transactionHash: string, blockNumber: bigint) {
 
 function hash(seed: number): string {
   return `0x${seed.toString(16).padStart(64, "0")}`;
+}
+
+function discoveryStateKey(invoiceId: string): Deno.KvKey {
+  return ["uos_checkout", "v1", "payments", "discovery_state", invoiceId];
 }
 
 function quantity(value: bigint): string {

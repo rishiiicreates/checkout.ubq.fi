@@ -176,7 +176,9 @@ export async function discoverTransferLogs(
       if (
         !(error instanceof RpcError) || start === end ||
         !error.code.startsWith("rpc_upstream_error:transfer_logs:") ||
-        !/range|limit|too many|response size|maximum|exceed/i.test(error.code)
+        /rate.?limit|too many requests|quota|throttl|request limit/i.test(error.code) ||
+        !/block.{0,16}range|range.{0,32}(?:large|wide|limit|exceed)|(?:response|result|log|payload).{0,16}size|too many (?:results|logs)|query returned more than \d+ results|(?:max(?:imum)?|limit).{0,16}(?:blocks|results|logs)/i
+          .test(error.code)
       ) {
         throw error;
       }

@@ -3,8 +3,8 @@
 ## 2026-10-17: invoice discovery claims
 
 The claim route accepts an empty object for server-side discovery or exactly the existing four
-locator fields. Discovery scans one invoice from its minimum block to the safe, finalized, or latest
-head, in that order, and does not use the legacy chain cursor. Both reconciliation paths share the
+locator fields. Discovery scans one invoice toward the safe, finalized, or latest head, in that
+order, and does not use the legacy chain cursor. Both reconciliation paths share the
 amount/token/treasury/minimum-block predicate and independently verify canonical receipts before
 claiming. An absent transfer is a successful response with `discovery.found: false`; an already
 claimed invoice returns its current state and a signed event when available.
@@ -14,8 +14,26 @@ changed log index. The payment update, removal of its old locator, and creation 
 locator share one atomic commit with checks on both locators. Discovery reports `found: false` while
 the invoice remains reverted, including when another transaction is retained as a duplicate.
 
-Transfer-log queries use at most 1,000 blocks per request and bisect provider range-limit errors.
-This bounds long-invoice scans while retaining the same matching and canonical verification rules.
+Each discovery call covers at most 50,000 blocks, starting at the invoice minimum or 128 blocks
+before its saved next block, whichever is later. The per-invoice `discovery_state` key persists
+completed no-match coverage separately from the hourly cursor. A backlog needs repeated capped calls
+before catching up; once caught up, only the overlap and new blocks are queried. There is no
+invoice-age or expiry clamp, so the complete history and late-payment/re-inclusion paths remain
+reachable.
+
+A compare-and-swap lease in the same key admits one normal discovery owner for 60 seconds. Busy
+calls do no RPC work and return only the last committed watermark, if any. Progress checks both the
+invoice version and owned lease. Primary claims, re-inclusion, and both reorg transitions atomically
+delete discovery state; stale owners can neither restore progress nor release a successor's lease.
+Expired leases allow crash recovery and can overlap an already in-flight stalled scan; this is not
+an exactly-once RPC guarantee.
+
+A matching log with unavailable or noncanonical verification evidence holds the watermark in place
+so its receipt can be retried even if further progress would move it outside the overlap. Verified
+unrelated duplicates do not prevent checking later logs for the original payment's re-inclusion.
+Transfer-log queries use 1,000-block chunks, so an ordinary 50,000-block call uses at most 50 log
+queries. Explicit block-range, result-count, and response-size errors can bisect those chunks and
+increase that count; rate, quota, and throttling errors propagate without bisection.
 
 ## 2026-10-17: durable event-driven maintenance
 

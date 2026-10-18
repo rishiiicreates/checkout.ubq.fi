@@ -58,12 +58,15 @@ const EVENTS_PREFIX: Deno.KvKey = [...PREFIX, "events"];
 const EVENTS_BY_INVOICE_PREFIX: Deno.KvKey = [...PREFIX, "events_by_invoice"];
 const OUTBOX_PREFIX: Deno.KvKey = [...PREFIX, "outbox"];
 const CURSORS_PREFIX: Deno.KvKey = [...PREFIX, "reconciliation_cursors"];
+const DISCOVERY_PREFIX: Deno.KvKey = [...PREFIX, "discovery_state"];
 const CHAIN_SETTINGS_PREFIX: Deno.KvKey = [...PREFIX, "chain_settings"];
 
 const EVENT_ISSUER = "https://checkout.ubq.fi";
 const EVENT_TTL_SECONDS = 24 * 60 * 60;
 const SEALED_BLOCKS_REQUIRED = 3n;
 const RECONCILIATION_OVERLAP_BLOCKS = 128n;
+const DISCOVERY_MAX_BLOCKS = 50_000n;
+const DISCOVERY_LEASE_MS = 60_000;
 const OUTBOX_INITIAL_BACKOFF_MS = 60_000;
 const OUTBOX_MAX_BACKOFF_MS = 24 * 60 * 60 * 1000;
 const AMOUNT_RESERVATION_REUSE_DELAY_MS = RECENTLY_EXPIRED_WINDOW_MS;
@@ -131,6 +134,12 @@ type ReconciliationCursor = {
   chainId: SupportedChainId;
   blockNumber: bigint;
   updatedAt: string;
+};
+
+type DiscoveryState = {
+  searchedThrough?: bigint;
+  leaseId?: string;
+  leaseUntil?: number;
 };
 
 type DeliveryEventRecord = OutboxEventRecord & {
@@ -411,52 +420,105 @@ export function createPaymentService(options: PaymentServiceOptions) {
   }
 
   async function discoverPayment(invoiceIdInput: unknown): Promise<ClaimPaymentResult> {
-    const invoice = await invoiceRecord(kv, invoiceIdInput);
-    if (invoice.paymentId && invoice.status !== "reverted") {
-      return {
-        invoice: invoiceJson(invoice),
-        eventJws: await signedExistingEvent(invoice.id),
-        discovery: { found: true },
+    const invoiceId = boundedText(invoiceIdInput, "invoice_id", 128);
+    const stateKey = discoveryStateKey(invoiceId);
+    while (true) {
+      const invoiceEntry = await kv.get<InvoiceRecord>(invoiceKey(invoiceId));
+      const invoice = invoiceEntry.value;
+      if (!invoice) throw new PaymentDomainError("invoice_not_found");
+      if (invoice.paymentId && invoice.status !== "reverted") return discoveryResult(invoice);
+      const state = await kv.get<DiscoveryState>(stateKey);
+      const now = clock.now().getTime();
+      if ((state.value?.leaseUntil ?? 0) > now) {
+        return discoveryResult(await invoiceRecord(kv, invoiceId), state.value?.searchedThrough);
+      }
+      const leaseId = crypto.randomUUID();
+      const leased: DiscoveryState = {
+        ...state.value,
+        leaseId,
+        leaseUntil: now + DISCOVERY_LEASE_MS,
       };
-    }
-    const heads = await chainHeads(rpc, invoice.chainId);
-    const toBlock = heads.safeBlock ?? heads.finalizedBlock ?? heads.latestBlock;
-    const logs = toBlock < invoice.minimumBlock ? [] : await discoverTransferLogs(
-      rpc,
-      invoice.chainId,
-      invoice.tokenAddress,
-      invoice.treasuryAddress,
-      invoice.minimumBlock,
-      toBlock,
-    );
-    for (const log of logs) {
-      if (!invoiceMatchesTransfer(invoice, log)) continue;
+      if (!(await kv.atomic().check(invoiceEntry).check(state).set(stateKey, leased).commit()).ok) {
+        continue;
+      }
       try {
-        const result = await claimPayment(invoice.id, {
-          transactionHash: log.transactionHash,
-          logIndex: log.logIndex.toString(),
-          observedBlockNumber: log.blockNumber.toString(),
-          observedBlockHash: log.blockHash,
-        });
-        return {
-          ...result,
-          discovery: {
-            found: result.invoice.status !== "reverted",
-            searchedToBlock: toBlock.toString(),
-          },
-        };
-      } catch (error) {
-        if (isSkippableDiscoveryError(error)) continue;
-        throw error;
+        const heads = await chainHeads(rpc, invoice.chainId);
+        const head = heads.safeBlock ?? heads.finalizedBlock ?? heads.latestBlock;
+        const fromBlock = state.value?.searchedThrough === undefined
+          ? invoice.minimumBlock
+          : maximum(
+            invoice.minimumBlock,
+            state.value.searchedThrough + 1n - RECONCILIATION_OVERLAP_BLOCKS,
+          );
+        const toBlock = head < fromBlock + DISCOVERY_MAX_BLOCKS - 1n
+          ? head
+          : fromBlock + DISCOVERY_MAX_BLOCKS - 1n;
+        const logs = toBlock < fromBlock ? [] : await discoverTransferLogs(
+          rpc,
+          invoice.chainId,
+          invoice.tokenAddress,
+          invoice.treasuryAddress,
+          fromBlock,
+          toBlock,
+        );
+        let incomplete = false;
+        for (const log of logs) {
+          if (!invoiceMatchesTransfer(invoice, log)) continue;
+          try {
+            const result = await claimPayment(invoice.id, {
+              transactionHash: log.transactionHash,
+              logIndex: log.logIndex.toString(),
+              observedBlockNumber: log.blockNumber.toString(),
+              observedBlockHash: log.blockHash,
+            });
+            if (result.invoice.status === "reverted") continue;
+            return { ...result, discovery: { found: true, searchedToBlock: toBlock.toString() } };
+          } catch (error) {
+            // Logs can precede canonical receipt visibility. Keep the retry position
+            // until matching evidence is verifiable, even outside the overlap.
+            if (error instanceof RpcVerificationError) incomplete = true;
+            if (isSkippableDiscoveryError(error)) continue;
+            throw error;
+          }
+        }
+        const owned = await kv.get<DiscoveryState>(stateKey);
+        if (!incomplete && toBlock >= fromBlock && owned.value?.leaseId === leaseId) {
+          await kv.atomic().check(invoiceEntry).check(owned).set(
+            stateKey,
+            {
+              ...owned.value,
+              searchedThrough: maximum(owned.value.searchedThrough ?? toBlock, toBlock),
+            } satisfies DiscoveryState,
+          ).commit();
+        }
+        const current = await invoiceRecord(kv, invoiceId);
+        const committed = await kv.get<DiscoveryState>(stateKey);
+        return discoveryResult(
+          current,
+          toBlock < fromBlock ? toBlock : committed.value?.searchedThrough,
+        );
+      } finally {
+        const owned = await kv.get<DiscoveryState>(stateKey);
+        if (owned.value?.leaseId === leaseId) {
+          const atomic = kv.atomic().check(owned);
+          await (owned.value.searchedThrough === undefined
+            ? atomic.delete(stateKey)
+            : atomic.set(stateKey, { searchedThrough: owned.value.searchedThrough })).commit();
+        }
       }
     }
-    const current = await invoiceRecord(kv, invoice.id);
+  }
+
+  async function discoveryResult(
+    invoice: InvoiceRecord,
+    searchedThrough?: bigint,
+  ): Promise<ClaimPaymentResult> {
     return {
-      invoice: invoiceJson(current),
-      eventJws: current.paymentId ? await signedExistingEvent(invoice.id) : undefined,
+      invoice: invoiceJson(invoice),
+      eventJws: invoice.paymentId ? await signedExistingEvent(invoice.id) : undefined,
       discovery: {
-        found: !!current.paymentId && current.status !== "reverted",
-        searchedToBlock: toBlock.toString(),
+        found: !!invoice.paymentId && invoice.status !== "reverted",
+        ...(searchedThrough === undefined ? {} : { searchedToBlock: searchedThrough.toString() }),
       },
     };
   }
@@ -617,6 +679,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       .check(openEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(nextPayment.id), nextPayment)
+      .delete(discoveryStateKey(invoice.id))
       .set(
         locatorEntry.key,
         {
@@ -716,6 +779,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       .check(openEntry)
       .set(invoiceKey(invoice.id), nextInvoice)
       .set(paymentKey(paymentId), payment)
+      .delete(discoveryStateKey(invoice.id))
       .set(
         locatorKey,
         { invoiceId: invoice.id, paymentId, duplicate: false } satisfies LocatorIndex,
@@ -935,6 +999,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       };
       let atomic = kv.atomic().check(invoiceEntry).check(paymentEntry).check(locatorEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
+        .delete(discoveryStateKey(invoice.id))
         .delete(paymentKey(payment.id))
         .delete(locatorKey);
       if (expired && openEntry.value?.invoiceId === invoice.id) {
@@ -969,6 +1034,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     let atomic = addEventMutations(
       kv.atomic().check(invoiceEntry).check(paymentEntry)
         .set(invoiceKey(invoice.id), nextInvoice)
+        .delete(discoveryStateKey(invoice.id))
         .set(paymentKey(payment.id), nextPayment)
         .set(invoiceByChainKey(invoice.chainId, invoice.id), invoice.id),
       event,
@@ -1449,6 +1515,10 @@ export async function listChainConfigurations(
 
 function invoiceKey(invoiceId: string): Deno.KvKey {
   return [...INVOICES_PREFIX, invoiceId];
+}
+
+function discoveryStateKey(invoiceId: string): Deno.KvKey {
+  return [...DISCOVERY_PREFIX, invoiceId];
 }
 
 function paymentKey(paymentId: string): Deno.KvKey {

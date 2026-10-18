@@ -54,6 +54,14 @@ even if its log index changes. They stop and remove their active index at the wi
 explicit claim remains available. This replaces the former hourly scan and leaves no periodic
 maintenance when idle.
 
+Server-side discovery saves per-invoice progress and scans at most 50,000 blocks per call with a
+128-block overlap. Old invoices need repeated calls to catch up; caught-up calls scan only the
+overlap and new blocks. A persisted lease prevents ordinary concurrent calls from repeating RPC
+work, and busy calls return only saved progress. Matching logs with temporarily unverifiable
+receipts keep their retry position. Normal scans use at most 50 log queries; explicit provider range
+or response-size limits can require additional split queries, while rate, quota, and throttling
+errors are returned without splitting.
+
 Signed events atomically create delivery work and retry failed webhooks at their persisted due
 times. Duplicate jobs use persisted leases and check delivery state before sending. Delivery is at
 least once across a crash after the recipient accepts but before its acknowledgement is saved;
