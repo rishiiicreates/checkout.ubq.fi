@@ -24,14 +24,7 @@ export function startCheckoutServer(options: { kv?: Kv; port?: number; hostname?
       fetch(request, server) {
         const response = (async () => {
           await queue.start();
-          try {
-            return await handler(withBunIngress(request, server.requestIP(request)?.address ?? ""));
-          } finally {
-            if (/^\/api\/v1\/(invoices|chain-events)(\/|$)/.test(new URL(request.url).pathname))
-              await queue
-                .refresh()
-                .catch((error) => console.error("checkout_queue_refresh_failed", error));
-          }
+          return handler(withBunIngress(request, server.requestIP(request)?.address ?? ""));
         })();
         requests.add(response);
         void response.then(
