@@ -1,0 +1,112 @@
+# Handoff: claim a crypto invoice by id alone on the Workers checkout, and replace the 1-minute cron with per-invoice events
+
+> **Owner rule (2026-10-18), overriding anything below: no cron, ever.** Everything is purely event-based. No `Deno.cron`, no Worker cron trigger, no `setInterval` sweep, no "low-frequency backstop" and no daily retention pass. Each piece of work is scheduled by the event that creates it, for exactly when it is due: a KV delayed enqueue or a Durable Object alarm. Where one delay cannot reach that far (90 days, 13 months), chain the delays. A lost or failed enqueue is recovered only by events, never by a timer. Those events are process startup, the next related write or request, or an alarm set when the work was created. Every existing cron goes. If something truly cannot be made event-driven, stop and explain it in the report; do not add a cron.
+
+**For:** Codex on the VPS (`codex@arch`). **Repo:** `ubiquity/checkout.ubq.fi`, branch `development`. **Date:** 2026-10-18. **Owner decision:** "Discovery + events".
+
+## Why this exists
+
+Checkout moved from the Deno VPS service to **Bun and Cloudflare Workers Free**: PR #3, `codex/bun-workers-migration`, merged at 03:52 UTC. Production `checkout.ubq.fi` is now the Worker `checkout-ubq-fi`.
+
+The earlier crypto-claim work in **PR #2** (`codex/2026-10-17-crypto-claim-discovery-g141810ab38`) was written for the old Deno service and no longer fits:
+- it conflicts with `development`;
+- it uses a different storage envelope on the same D1;
+- its work queue runs on in-process timers, which a Worker cannot keep.
+
+That PR is superseded by this task. Its logic and lessons still apply, and its tests are the best specification there is.
+
+Two outcomes are wanted on the Workers codebase:
+
+1. **Part A: discovery claim.** `POST /api/v1/invoices/{id}/claims` with an empty body `{}` finds the payment for that one invoice on chain and claims it. No person in a chat knows the four on-chain coordinates.
+2. **Part B: events instead of cron.** The owner asked for everything to be event-based instead of cron (*"cron wastes so much resources"*). `wrangler.jsonc` currently plans a `* * * * *` cron (`triggers.crons`), which a separate rollout lane meant to activate when PR #3 merged; that deploy failed on a Cloudflare permission, so production runs **no** scheduler right now. Replace the cron with per-invoice scheduled wake-ups. **Durable Object alarms** are the expected tool: SQLite-backed Durable Objects are on the Workers Free plan. Check the current Free-plan limits yourself and cite them.
+
+## The contract Prospector already ships
+
+`ubiquity/prospector` PR #162 is merged and live, at a77c767d or later. Its client (`src/crypto_checkout.ts`: `discoverPayment`, and the parser around lines 660-690) calls checkout with `{}` and accepts:
+- `{ invoice, eventJws?, discovery?: { found: boolean, searchedToBlock?: "<decimal string>" } }`;
+- found: the same response as a coordinate claim, `invoice` and `eventJws`;
+- not found: HTTP 200 with the invoice as it stands and `discovery: { found: false, searchedToBlock }`. Not paid yet is a normal answer;
+- already paid: the invoice's current state, idempotently.
+
+Keep exactly this shape. If the Worker has to answer "still searching" (see the limits below), express it inside this shape. For example, `found: false` with the block reached so far tells a caller "not seen yet". Do not invent a field that Prospector rejects. Read Prospector's parser before deciding.
+
+## Part A: what to carry over and what must change
+
+**Carry over from PR #2 and its fixes** (read its diff, its tests, and issues checkout.ubq.fi #4 and #5):
+- **One match predicate, shared with reconciliation.** Match on: no payment, or a reverted one; `minimumBlock <= block`; same token; same treasury; exact `paidAmountUnits`. Open invoices reserve distinct amounts, which is why an exact-amount match is safe.
+- **Search range:** from `invoice.minimumBlock` to the same safe, then finalized, then latest head that reconciliation uses.
+- **Never** read or advance a reconciliation cursor from a discovery claim.
+- **Report the result from the returned state, never the path taken** (issue #4). `found` is true only if the invoice that comes back carries a current payment. A reorg can clear it.
+- **Idempotency:** a second claim after success returns the paid state. A duplicate wake-up neither double-claims nor double-delivers.
+- **Reject anything that is neither `{}` nor the four coordinates.** Use the existing invalid-input error style. The four-field claim keeps working exactly as today; the browser wallet watcher uses it.
+
+**What changes on a Worker:**
+- **Subrequest and CPU limits.** One request has a capped number of subrequests (fetch and KV/D1 calls), and a Free Worker has a small CPU budget. `src/worker_budget.ts` and `src/reconciliation_batch.ts` already encode this codebase's answer; use them.
+- **Durable search progress.** A long range (an invoice open for hours on Base spans thousands of blocks) must be searched in chunks, with progress saved per invoice, so repeated calls or wake-ups make progress instead of starting over. A request that runs out of budget saves its progress and answers `found: false` with the block it reached.
+- **The storage envelope** is the one on `development` (`src/kv_codec.ts`). Production is already writing it.
+
+## Part B: events instead of the cron
+
+1. **Inventory first.** List everything the Worker's `scheduled()` handler and `reconciliation_batch.ts` do: reconciliation per chain, expiry, refresh, outbox and webhook delivery and retries, retention, anything else. Put the list in the report. Each item needs an event-driven home before the cron goes.
+2. **Per-invoice wake-ups.**
+   - When an invoice is created, schedule its first discovery a short time later.
+   - If nothing is found and the invoice is still open, back off: 1, 2, 5, 10 and 20 minutes, then every 30, never past expiry.
+   - Stop when the invoice is paid, expired or cancelled.
+   - A `{}` claim is the immediate event when a person says they paid.
+3. **Expiry** fires at the invoice's own expiry time.
+4. **Webhook and outbox delivery** is scheduled when the event is written, and retried with backoff on failure.
+5. **Remove the cron trigger.** Every item from step 1 gets an event-driven home, and tests prove it.
+   - Remove the `triggers.crons` entry and the `scheduled()` handler. A reverted payment after a reorg is re-checked by an alarm set when the payment was accepted, not by a sweep.
+   - With no open invoices and no pending deliveries, the system does no periodic work.
+6. **Migration of existing state.** Invoices that are open at cutover, and deliveries already pending, must get their wake-ups. Do this with a one-time, idempotent pass triggered by an event (the first request after the deploy, or an explicit admin call), never by a schedule. Say exactly how it runs.
+7. **Lifecycle discipline** (issue #5): every asynchronous continuation checks it is still current before it schedules or runs anything.
+
+## Rules for this run
+
+- **Work in a new git worktree** on a new branch from the latest `origin/development`:
+  - `git -C ~/repos/ubiquity/checkout.ubq.fi fetch origin development`, then `git -C ~/repos/ubiquity/checkout.ubq.fi worktree add ~/handoffs/worktrees/checkout-discovery-events -b codex/checkout-discovery-events origin/development`.
+  - `~/repos/ubiquity/checkout.ubq.fi` is the persistent root of another lane's Bun releases (`.deploy-root/`). Do not change its branch, index, files or `.deploy-root`.
+  - Do not touch `/tmp/checkout-free-worker-probe` or the PR #2 worktree.
+- **No production effects.** That means:
+  - no `wrangler deploy`, no Cloudflare API calls, no D1 or KV writes outside local fakes;
+  - no service restarts, no on-chain transactions, no public RPC;
+  - local Miniflare or `wrangler dev --local` and the repo's own fakes are fine.
+- **Merging to `development` deploys production** (`.github/workflows/workers-deploy.yml`). So open a **draft** PR and never merge. Do not use `[skip ci]`: CI is wanted on this PR.
+- Follow the repo's `AGENTS.md` and `DECISIONS.md`. Record the durable decisions (events instead of cron, and the discovery contract) in `DECISIONS.md`. File a copy of this handoff on your branch under the repo's docs convention.
+- Run the repo's full offline gate. Commit in small steps and push.
+- Finish with a report covering:
+  - what changed, with commits;
+  - the scheduled-work inventory and where each item now lives;
+  - the Free-plan limits you designed against, with sources;
+  - how existing open invoices and pending deliveries are migrated;
+  - the test commands and results;
+  - anything not done, and why.
+
+## Owner decision (2026-10-18): payments are detected by a chain webhook
+
+
+Design it this way:
+1. Inbound endpoint. Checkout receives push events from a chain indexer when a treasury address receives a token transfer. Build a provider-neutral, signed chain-event endpoint with an adapter for Alchemy Address Activity webhooks, the recommended free-tier provider. Read Alchemy's current docs for the payload, signature header and HMAC scheme, and cite them.
+   - Verify the signature with a Worker secret. Reject unsigned, stale or replayed deliveries.
+   - Parse transfers to the configured treasury addresses for the supported tokens and chains.
+   - Match each transfer to an open invoice with the same shared match predicate as discovery.
+   - Claim it with the transfer's own coordinates: tx hash, log index, block number and block hash.
+   - Duplicate deliveries and out-of-order deliveries must be idempotent.
+   - If the provider marks a log as removed (a reorg), handle it through the existing reverted-payment path.
+2. Check every chain checkout supports against the provider's supported networks. Report any chain it cannot cover. Do not fall back to polling for it.
+3. Alarms remain only for events whose time is known when the work is created. Each alarm is scheduled by the event that created it:
+   - invoice expiry at expiresAt;
+   - confirmation progression (the safe or finalized re-check at the time that depth is expected);
+   - webhook-delivery retries to merchants.
+   No alarm exists to look for new payments.
+4. Backups that are themselves events stay as they are:
+   - the payer's wallet report (the four-field claim);
+   - the claim by invoice id (`{}` discovery);
+   - one discovery pass over the invoice's range when its expiry alarm fires, before it expires, which catches a missed webhook.
+5. Setup is the owner's job, so do none of it.
+   - Do not create webhooks.
+   - Do not call the indexer's or Cloudflare's APIs.
+   - Do not add secrets anywhere real.
+   - Document exactly what the owner must do: which addresses and networks to register, which events to subscribe to, the endpoint URL, and the `wrangler secret put` names.
+   - Tests use signed fake deliveries.
+Everything else, including the no-cron rule and the draft-PR deliverable, is unchanged. Re-read the handoff's Owner rule if you need to. Continue from where you are.
