@@ -78,6 +78,12 @@ Work-producing service operations notify the scheduler when they settle, includi
 
 Native KV wake messages carry the exact work key and read only that record through the existing compare-and-swap lease path. Startup scans persisted work once and rearms keyed wakes for pending retries and abandoned lease deadlines; old unkeyed messages need no backlog scan because startup replaces their wake coverage. Duplicate and early wakes leave active leases and future work intact. The D1 adapter retains its single earliest-work timer and existing scan behavior.
 
+## 2026-10-18: current payment results and scheduler shutdown
+
+Discovery reports success only when its returned invoice retains a payment and is not reverted. If refreshing a concurrent claim clears that payment, discovery continues checking later matching logs. Claim and discovery replay select an existing signed event from the returned invoice's eligible phase, payment identity, and phase timestamp; a confirming re-inclusion or a subsequently unpaid invoice cannot return a prior lifecycle's acceptance event. Historical outbox events retain their existing delivery semantics.
+
+One scheduler lifecycle fences startup, scans, lease acquisition, handlers, completion writes, timers, and wake callbacks. Concurrent starts share recovery, and shutdown invalidates that lifecycle before waiting for its startup, scans, and admitted drains to settle. Already-running handlers finish before shutdown resolves, but their later scheduler cleanup is skipped and their persisted leases remain recoverable. Explicit restart creates a fresh lifecycle after the prior shutdown settles; one native listener captures the current lifecycle when admitting each wake. Manual drains remain available before the first start and become inert after shutdown until an explicit restart.
+
 ## 2026-10-17: JSON KV value encoding and conflict handling
 
 The canonical KV service stores generic JSON without interpreting value tags. Checkout now wraps new

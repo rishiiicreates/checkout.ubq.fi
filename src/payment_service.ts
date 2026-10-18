@@ -428,7 +428,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
       const invoiceEntry = await kv.get<InvoiceRecord>(invoiceKey(invoiceId));
       const invoice = invoiceEntry.value;
       if (!invoice) throw new PaymentDomainError("invoice_not_found");
-      if (invoice.paymentId && invoice.status !== "reverted") return discoveryResult(invoice);
+      if (hasCurrentPayment(invoice)) return discoveryResult(invoice);
       const state = await kv.get<DiscoveryState>(stateKey);
       const now = clock.now().getTime();
       if ((state.value?.leaseUntil ?? 0) > now) {
@@ -473,7 +473,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
               observedBlockNumber: log.blockNumber.toString(),
               observedBlockHash: log.blockHash,
             });
-            if (result.invoice.status === "reverted") continue;
+            if (!hasCurrentPayment(result.invoice)) continue;
             return { ...result, discovery: { found: true, searchedToBlock: toBlock.toString() } };
           } catch (error) {
             // Logs can precede canonical receipt visibility. Keep the retry position
@@ -517,9 +517,9 @@ export function createPaymentService(options: PaymentServiceOptions) {
   ): Promise<ClaimPaymentResult> {
     return {
       invoice: invoiceJson(invoice),
-      eventJws: invoice.paymentId ? await signedExistingEvent(invoice.id) : undefined,
+      eventJws: await signedExistingEvent(invoice),
       discovery: {
-        found: !!invoice.paymentId && invoice.status !== "reverted",
+        found: hasCurrentPayment(invoice),
         ...(searchedThrough === undefined ? {} : { searchedToBlock: searchedThrough.toString() }),
       },
     };
@@ -567,7 +567,7 @@ export function createPaymentService(options: PaymentServiceOptions) {
     if (existingLocator.value) {
       const refreshed = await refreshInvoice(invoice.id);
       if (refreshed.eventJws) return refreshed;
-      return { ...refreshed, eventJws: await signedExistingEvent(invoice.id) };
+      return { ...refreshed, eventJws: await signedExistingEvent(refreshed.invoice) };
     }
 
     const evidence = await verifyTransferBatch(rpc, invoice.chainId, {
@@ -1243,18 +1243,29 @@ export function createPaymentService(options: PaymentServiceOptions) {
     } as DeliveryEventRecord;
   }
 
-  async function signedExistingEvent(invoiceId: string): Promise<string | undefined> {
-    const invoice = await invoiceRecord(kv, invoiceId);
+  async function signedExistingEvent(
+    invoice: InvoiceRecord | InvoiceJson,
+  ): Promise<string | undefined> {
+    if (!invoice.paymentId) return undefined;
     const types: PaymentEventType[] = invoice.status === "reverted"
       ? ["payment.reverted.v1"]
       : invoice.status === "settled" || invoice.status === "finalized"
       ? ["payment.settled.v1", "payment.accepted.v1"]
-      : ["payment.accepted.v1"];
+      : invoice.status === "provisionally_paid"
+      ? ["payment.accepted.v1"]
+      : [];
     for (const type of types) {
-      const eventId = (await kv.get<string>(eventByInvoiceKey(invoiceId, type))).value;
+      const eventId = (await kv.get<string>(eventByInvoiceKey(invoice.id, type))).value;
       if (!eventId) continue;
       const event = (await kv.get<DeliveryEventRecord>(eventKey(eventId))).value;
-      if (event) return signEventForDelivery(signer, event, clock.now());
+      const occurredAt = type === "payment.reverted.v1"
+        ? invoice.revertedAt
+        : type === "payment.settled.v1"
+        ? invoice.settledAt
+        : invoice.acceptedAt;
+      if (event?.paymentId === invoice.paymentId && event.createdAt === occurredAt) {
+        return signEventForDelivery(signer, event, clock.now());
+      }
     }
     return undefined;
   }
@@ -1340,6 +1351,10 @@ export function createPaymentService(options: PaymentServiceOptions) {
       }
     });
   }
+}
+
+function hasCurrentPayment(invoice: Pick<InvoiceRecord, "paymentId" | "status">): boolean {
+  return !!invoice.paymentId && invoice.status !== "reverted";
 }
 
 function invoiceMatchesTransfer(invoice: InvoiceRecord, log: DiscoveredTransferLog): boolean {

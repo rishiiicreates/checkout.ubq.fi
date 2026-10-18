@@ -355,7 +355,11 @@ Deno.test("native duplicate keyed wakes preserve an active handler lease", async
     release.resolve();
     await queue.stop();
     assertEquals(calls, 1);
-    assertEquals((await kv.get(key)).value, null);
+    assertEquals(
+      (await kv.get<WorkRecord>(key)).value?.leaseId,
+      leased.value.leaseId,
+      "shutdown retains the unfinished lease for recovery",
+    );
   } finally {
     clearTimeout(deadline);
     release.resolve();
@@ -374,4 +378,280 @@ function fire(timers: Map<number, { callback: () => void; delay: number }>): voi
 
 function tick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+for (const boundary of ["list", "get", "lease", "handler", "completion_get", "completion_commit"]) {
+  Deno.test(`queue shutdown fences the ${boundary} continuation`, async () => {
+    const fixture = lifecycleFixture({ boundary });
+    await fixture.seed();
+    const running = fixture.queue.runDue();
+    await fixture.entered.promise;
+    const requests = fixture.store.requests;
+    let stopped = false;
+    const stopping = fixture.queue.stop().then(() => {
+      stopped = true;
+    });
+    await tick();
+    assertEquals(stopped, false, "shutdown waits for its in-flight operation");
+    fixture.release.resolve();
+    await Promise.all([running, stopping]);
+    assertEquals(
+      fixture.calls(),
+      boundary.startsWith("completion") || boundary === "handler" ? 1 : 0,
+    );
+    assertEquals(
+      fixture.store.requests,
+      requests,
+      "no later store operation starts after shutdown",
+    );
+    assertEquals(fixture.timers.size, 0);
+    await fixture.queue.runDue();
+    fixture.queue.notify();
+    assertEquals(fixture.store.requests, requests, "stopped manual drains remain inert");
+  });
+}
+
+Deno.test("queue shutdown does not arm a timer after a blocked notification scan", async () => {
+  const fixture = lifecycleFixture({ boundary: "list" });
+  await fixture.seed();
+  await fixture.queue.start();
+  await fixture.entered.promise;
+  const requests = fixture.store.requests;
+  const stopping = fixture.queue.stop();
+  fixture.release.resolve();
+  await stopping;
+  assertEquals(fixture.timers.size, 0);
+  assertEquals(fixture.calls(), 0);
+  assertEquals(fixture.store.requests, requests);
+});
+
+Deno.test("queue concurrent starts share recovery and shutdown fences pending startup", async () => {
+  const fixture = lifecycleFixture();
+  const recovery = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  let recoveries = 0;
+  const recover = () => {
+    recoveries++;
+    entered.resolve();
+    return recovery.promise;
+  };
+  const starting = fixture.queue.start(recover);
+  await entered.promise;
+  const duplicate = fixture.queue.start(recover);
+  let stopped = false;
+  const stopping = fixture.queue.stop().then(() => {
+    stopped = true;
+  });
+  await tick();
+  const stoppedBeforeRecovery = stopped;
+  recovery.resolve();
+  await Promise.all([starting, duplicate, stopping]);
+  assertEquals(stoppedBeforeRecovery, false);
+  assertEquals(recoveries, 1);
+  assertEquals(fixture.store.requests, 0);
+  assertEquals(fixture.timers.size, 0);
+  await fixture.queue.runDue();
+  assertEquals(fixture.store.requests, 0);
+});
+
+for (const boundary of ["list", "lease"]) {
+  Deno.test(`native startup shutdown fences the ${boundary} continuation`, async () => {
+    const fixture = lifecycleFixture({ boundary, native: true });
+    await fixture.seed();
+    const starting = fixture.queue.start();
+    await fixture.entered.promise;
+    const requests = fixture.store.requests;
+    let stopped = false;
+    const stopping = fixture.queue.stop().then(() => {
+      stopped = true;
+    });
+    await tick();
+    const stoppedBeforeStartup = stopped;
+    fixture.release.resolve();
+    await Promise.all([starting, stopping]);
+    assertEquals(stoppedBeforeStartup, false);
+    assertEquals(fixture.store.requests, requests);
+    assertEquals(fixture.calls(), 0);
+    fixture.listener.resolve();
+    await fixture.queue.settled();
+  });
+}
+
+Deno.test("stale timer callbacks cannot drain or replace a restarted lifecycle timer", async () => {
+  const fixture = lifecycleFixture();
+  await fixture.seed();
+  await fixture.queue.start();
+  await tick();
+  const stale = [...fixture.timers.values()][0].callback;
+  await fixture.queue.stop();
+  await fixture.queue.start();
+  await tick();
+  const requests = fixture.store.requests;
+  const current = [...fixture.timers.keys()];
+  stale();
+  await tick();
+  await fixture.queue.stop();
+  assertEquals(fixture.calls(), 0);
+  assertEquals(fixture.store.requests, requests);
+  assertEquals(current.length, 1);
+  assertEquals(fixture.timers.size, 0);
+});
+
+Deno.test("native restarts retain one listener and ignore stopped keyed wakes", async () => {
+  const fixture = lifecycleFixture({ native: true });
+  await fixture.queue.start();
+  await fixture.queue.stop();
+  const requests = fixture.store.requests;
+  await fixture.wake();
+  assertEquals(fixture.store.requests, requests);
+  await fixture.queue.start();
+  await fixture.queue.stop();
+  assertEquals(fixture.listeners(), 1);
+  fixture.listener.resolve();
+  await fixture.queue.settled();
+});
+
+Deno.test("same-turn start and stop settle without beginning recovery", async () => {
+  const fixture = lifecycleFixture();
+  let recoveries = 0;
+  const starting = fixture.queue.start(() => {
+    recoveries++;
+    return Promise.resolve();
+  });
+  const stopping = fixture.queue.stop();
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.all([starting, stopping]),
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("startup shutdown deadlocked")), 1_000);
+      }),
+    ]);
+    assertEquals(recoveries, 0);
+    assertEquals(fixture.store.requests, 0);
+  } finally {
+    clearTimeout(deadline);
+  }
+});
+
+Deno.test("native restart fences an admitted old wake and accepts new keyed wakes", async () => {
+  const fixture = lifecycleFixture({ native: true, boundary: "get" });
+  await fixture.seed();
+  await fixture.queue.start();
+  const stale = fixture.wake();
+  await fixture.entered.promise;
+  const stopping = fixture.queue.stop();
+  const restarting = fixture.queue.start();
+  fixture.release.resolve();
+  await Promise.all([stale, stopping, restarting]);
+  assertEquals(fixture.calls(), 0);
+  await fixture.wake();
+  assertEquals(fixture.calls(), 1);
+  await fixture.queue.stop();
+  assertEquals(fixture.listeners(), 1);
+  fixture.listener.resolve();
+  await fixture.queue.settled();
+});
+
+function lifecycleFixture(options: { boundary?: string; native?: boolean } = {}) {
+  const store = new JsonKvService();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const listener = Promise.withResolvers<void>();
+  let gets = 0;
+  let commits = 0;
+  let calls = 0;
+  let listeners = 0;
+  let onMessage: ((message: unknown) => Promise<void>) | undefined;
+  const client = new UbqKv({
+    url: "https://kv.example",
+    token: "offline",
+    fetchImpl: async (input, init) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      const response = await store.fetch(request);
+      if (path === "/kv/get") gets++;
+      if (path === "/kv/atomic") commits++;
+      if (
+        (options.boundary === "list" && path === "/kv/list") ||
+        (options.boundary === "get" && path === "/kv/get" && gets === 1) ||
+        (options.boundary === "completion_get" && path === "/kv/get" && gets === 2) ||
+        (options.boundary === "lease" && path === "/kv/atomic" && commits === 1) ||
+        (options.boundary === "completion_commit" && path === "/kv/atomic" && commits === 2)
+      ) {
+        entered.resolve();
+        await release.promise;
+      }
+      return response;
+    },
+  });
+  const kv = (options.native
+    ? new Proxy(client, {
+      get(target, property) {
+        if (property === "enqueue") return () => Promise.resolve();
+        if (property === "listenQueue") {
+          return (handler: (message: unknown) => Promise<void>) => {
+            listeners++;
+            onMessage = handler;
+            return listener.promise;
+          };
+        }
+        if (property === "atomic") {
+          return () => {
+            const atomic = target.atomic();
+            return Object.assign(atomic, { enqueue: () => atomic });
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    })
+    : client) as unknown as Deno.Kv;
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  let timerId = 0;
+  const queue = createWorkQueue({
+    kv,
+    clock: { now: () => new Date(0) },
+    setTimer: (callback, delay) => {
+      timers.set(++timerId, { callback, delay });
+      return timerId;
+    },
+    clearTimer: (id) => {
+      timers.delete(id);
+    },
+    handle: async () => {
+      calls++;
+      if (options.boundary === "handler") {
+        entered.resolve();
+        await release.promise;
+      }
+      return undefined;
+    },
+  });
+  return {
+    store,
+    queue,
+    timers,
+    entered,
+    release,
+    listener,
+    calls: () => calls,
+    listeners: () => listeners,
+    wake: () => onMessage?.({ type: "uos_checkout_work", key: workKey("deliver_event", "a") }),
+    seed: async () => {
+      for (const id of ["a", "b"]) {
+        await kv.set(
+          workKey("deliver_event", id),
+          {
+            type: "deliver_event",
+            id,
+            dueAt: 0,
+            attempts: 0,
+          } satisfies WorkRecord,
+        );
+      }
+      // Boundary counters exclude fixture preparation.
+      store.requests = 0;
+    },
+  };
 }

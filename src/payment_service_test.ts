@@ -602,6 +602,105 @@ Deno.test("discovery rejects nonmatching transfers and uses the coherent safe/la
   });
 });
 
+for (const replacement of [false, true]) {
+  Deno.test(`discovery uses returned payment state after a concurrent claim reorg (${replacement})`, async () => {
+    await withService(async ({ service, rpc, clock }) => {
+      const invoice = await createTestInvoice(service, `claim-reorg-${replacement}`);
+      const record = await service.getInvoiceRecord(invoice.id);
+      rpc.addTransfer(record, {
+        transactionHash: hash(110),
+        blockNumber: 100n,
+        includedAt: clock.now(),
+      });
+      if (replacement) {
+        rpc.addTransfer(record, {
+          transactionHash: hash(111),
+          blockNumber: 101n,
+          includedAt: clock.now(),
+        });
+      }
+      rpc.setHeads(102n, null, null);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      rpc.beforeLogs = () => {
+        entered.resolve();
+        return release.promise;
+      };
+      const pending = service.discoverPayment(invoice.id);
+      await entered.promise;
+      try {
+        assertEquals(
+          (await service.claimPayment(invoice.id, claim(hash(110), 100n))).invoice.status,
+          "confirming",
+        );
+        rpc.reorgTransfer(hash(110));
+      } finally {
+        release.resolve();
+      }
+      const result = await pending;
+      assertEquals(result.discovery?.found, replacement);
+      assertEquals(result.invoice.status, replacement ? "confirming" : "awaiting_payment");
+      assertEquals(!!result.invoice.paymentId, replacement);
+      assertEquals(result.eventJws, undefined);
+    });
+  });
+}
+
+Deno.test("claim and discovery replay omit prior acceptance while re-inclusion is confirming", async () => {
+  await withService(async ({ service, rpc, clock }) => {
+    const invoice = await createTestInvoice(service, "unsealed-reinclusion-replay");
+    const transactionHash = hash(112);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash,
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    assert((await service.claimPayment(invoice.id, claim(transactionHash, 100n))).eventJws);
+    rpc.reorgTransfer(transactionHash);
+    assertEquals((await service.refreshInvoice(invoice.id)).invoice.status, "reverted");
+    rpc.reincludeTransfer(transactionHash, 104n);
+    rpc.setHeads(104n, null, null);
+    const reincluded = await service.claimPayment(invoice.id, claim(transactionHash, 104n));
+    assertEquals(reincluded.invoice.status, "confirming");
+    assertEquals(reincluded.eventJws, undefined);
+    const replay = await service.claimPayment(invoice.id, claim(transactionHash, 104n));
+    assertEquals(replay.invoice.status, "confirming");
+    assertEquals(replay.eventJws, undefined);
+    const discovered = await service.discoverPayment(invoice.id);
+    assertEquals(discovered.invoice.status, "confirming");
+    assertEquals(discovered.discovery?.found, true);
+    assertEquals(discovered.eventJws, undefined);
+  });
+});
+
+Deno.test("claim replay omits historical acceptance after a confirming re-inclusion reorg", async () => {
+  await withService(async ({ service, rpc, clock }) => {
+    const invoice = await createTestInvoice(service, "repeated-reorg-replay");
+    const transactionHash = hash(113);
+    rpc.addTransfer(await service.getInvoiceRecord(invoice.id), {
+      transactionHash,
+      blockNumber: 100n,
+      includedAt: clock.now(),
+    });
+    rpc.setHeads(103n, null, null);
+    await service.claimPayment(invoice.id, claim(transactionHash, 100n));
+    rpc.reorgTransfer(transactionHash);
+    await service.refreshInvoice(invoice.id);
+    rpc.reincludeTransfer(transactionHash, 104n);
+    rpc.setHeads(104n, null, null);
+    await service.claimPayment(invoice.id, claim(transactionHash, 104n));
+    rpc.reorgTransfer(transactionHash);
+    const replay = await service.claimPayment(invoice.id, claim(transactionHash, 104n));
+    assertEquals(replay.invoice.status, "awaiting_payment");
+    assertEquals(replay.invoice.paymentId, undefined);
+    assertEquals(replay.eventJws, undefined);
+    const discovered = await service.discoverPayment(invoice.id);
+    assertEquals(discovered.discovery?.found, false);
+    assertEquals(discovered.eventJws, undefined);
+  });
+});
+
 Deno.test("discovery bounds old invoices and resumes persisted full-history coverage", async () => {
   await withService(async ({ service, rpc, clock, kv }) => {
     const invoice = await createTestInvoice(service, "bounded-discovery");
